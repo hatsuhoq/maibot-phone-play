@@ -116,6 +116,7 @@ class PhonePlayPlugin(MaiBotPlugin):
         return Persona(nickname=await self._bot_name(), personality=personality, extra=play.extra_persona)
 
     async def _call_llm(self, prompt: Any, task_name: str, model_name: str, label: str) -> str:
+        # timeout_ms 由 SDK 的 call_capability 当作等宿主回应的 RPC 超时取走，不会转发给宿主的 llm.generate
         timeout_ms = self.settings.model.llm_timeout_seconds * 1000
         try:
             result = await self.ctx.llm.generate(
@@ -345,6 +346,9 @@ class PhonePlayPlugin(MaiBotPlugin):
     async def tool_show_phone_screen(self, user_id: str = "", **kwargs: Any) -> Dict[str, Any]:
         """截图交给她，由她在回复里附上图片，图和话一起发出去，也不会重复发图。"""
         del kwargs
+        # user_id 是宿主按会话注入的；但模型若自己传了同名参数，宿主会以模型的为准。这个工具的参数里没有 user_id，
+        # 模型一般不会去填，这里只能算辅助校验；截图里可能有通知等隐私，
+        # 真正在意时保持 screenshot_for_everyone 关闭并少加管理员
         if not (self._is_admin(user_id, False) or self.settings.plugin.screenshot_for_everyone):
             return {"success": False, "error": "对方不在可以看你手机的名单里，婉拒就好"}
         try:

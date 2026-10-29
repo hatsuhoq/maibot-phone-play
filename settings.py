@@ -43,12 +43,14 @@ class DeviceSettings(PluginConfigBase):
     adb_path: str = Field(default="adb", description="adb 可执行文件路径；已加入 PATH 时填 adb 即可")
     serial: str = Field(
         default="",
-        description="设备序列号或 IP:端口（如 MuMu 的 127.0.0.1:16384）；留空时使用唯一已连接的设备",
+        description="设备序列号或 IP:端口（如 MuMu 的 127.0.0.1:16384）；留空时使用唯一已连接的设备。"
+        "只填自己的设备，别指向不可信的主机",
     )
     auto_connect: bool = Field(default=True, description="序列号是 IP:端口 时，自动执行 adb connect")
     wda_url: str = Field(
         default="http://127.0.0.1:8100",
-        description="iPhone 上 WebDriverAgent 的地址（ios_wda 用）；用 ios forward 8100 8100 转发时保持默认即可",
+        description="iPhone 上 WebDriverAgent 的地址（ios_wda 用）；用 ios forward 8100 8100 转发时保持默认即可。"
+        "只填自己的设备，别指向不可信的主机",
     )
     command_timeout_seconds: int = Field(
         default=20, ge=3, le=120, description="单条 adb 命令或 WebDriverAgent 请求的超时秒数"
