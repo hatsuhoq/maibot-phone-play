@@ -1,0 +1,37 @@
+{
+  "schema_version": 2,
+  "required_capabilities": ["custom_pages"],
+  "workspace_title": "刷会儿手机",
+  "pages": [
+    {
+      "id": "live",
+      "title": "手机实时画面",
+      "description": "实时查看手机屏幕、当前目标、内心想法和每一步操作",
+      "placement": "sidebar",
+      "icon": "puzzle",
+      "mode": "custom",
+      "entry": "web/live.html",
+      "layout": "document",
+      "queries": {
+        "status": {"api": "webui_status"},
+        "frame": {
+          "api": "webui_frame",
+          "parameters": {
+            "since": {"type": "integer", "minimum": 0}
+          }
+        }
+      },
+      "actions": {
+        "start": {
+          "api": "webui_start",
+          "parameters": {
+            "goal": {"type": "string", "max_length": 100}
+          }
+        },
+        "pause": {"api": "webui_pause"},
+        "resume": {"api": "webui_resume"},
+        "stop": {"api": "webui_stop"}
+      }
+    }
+  ]
+}

@@ -1,0 +1,250 @@
+<style>
+  body { margin: 0; padding: 20px; font: 14px/1.6 var(--maibot-font-body, system-ui, "Microsoft YaHei", sans-serif); }
+  .layout { display: grid; grid-template-columns: minmax(240px, 360px) minmax(0, 1fr); gap: 20px; align-items: start; }
+  @media (max-width: 760px) {
+    .layout { grid-template-columns: minmax(0, 1fr); }
+    body { padding: 12px; }
+    .screen-column { width: 100%; max-width: 300px; margin: 0 auto; }
+  }
+  .header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 16px; }
+  .header h1 { margin: 0; font-size: 20px; }
+  .badge-playing { background: var(--maibot-primary, #2563eb); color: var(--maibot-primary-foreground, #fff); }
+  .phone { position: relative; border: 10px solid #1d1d1f; border-radius: 28px; background: #000; overflow: hidden;
+    aspect-ratio: 9 / 19.5; display: flex; align-items: center; justify-content: center; }
+  .phone img { width: 100%; height: 100%; object-fit: contain; display: none; }
+  .phone .placeholder { color: #bbb; padding: 24px; text-align: center; font-size: 13px; }
+  .frame-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 12px; }
+  .stack { display: grid; gap: 16px; min-width: 0; }
+  .maibot-card { border: 1px solid var(--maibot-border, #8884); border-radius: var(--maibot-radius, 10px); }
+  .maibot-card-header { font-size: 15px; }
+  .now-goal { font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
+  .thought { margin-top: 10px; padding: 10px 12px; border-radius: var(--maibot-radius, 10px); background: var(--maibot-soft, #8881); overflow-wrap: anywhere; }
+  .progress { height: 6px; border-radius: 3px; background: var(--maibot-soft, #8882); overflow: hidden; margin: 10px 0 4px; }
+  .progress > div { height: 100%; width: 0; background: var(--maibot-primary, #2563eb); transition: width .3s; }
+  .controls { display: flex; flex-wrap: wrap; gap: 8px; }
+  .controls input { flex: 1 1 220px; min-width: 0; }
+  .error { color: var(--maibot-danger, #d33); margin: 8px 0 0; overflow-wrap: anywhere; }
+  .error:empty { display: none; }
+  .logs { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow-y: auto; }
+  .logs li { padding: 8px 0; border-bottom: 1px solid var(--maibot-border, #8883); overflow-wrap: anywhere; }
+  .logs li:last-child { border-bottom: none; }
+  .logs .row { display: flex; gap: 8px; align-items: baseline; }
+  .logs .time { font-family: var(--maibot-font-mono, ui-monospace, monospace); font-size: 12px; flex: none; }
+  .logs .failed .summary { color: var(--maibot-danger, #d33); }
+  .logs .detail { font-size: 12px; margin-left: 4px; }
+  .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
+  .stats .value { font-size: 20px; }
+  .history { list-style: none; margin: 0; padding: 0; }
+  .history li { padding: 6px 0; overflow-wrap: anywhere; }
+</style>
+
+<div class="header">
+  <h1 id="title">📱 手机</h1>
+  <span id="state" class="maibot-badge">连接中</span>
+  <span id="device" class="maibot-muted"></span>
+</div>
+
+<div class="layout">
+  <div class="screen-column">
+    <div class="phone">
+      <img id="screen" alt="手机当前画面">
+      <div id="placeholder" class="placeholder">正在获取画面…</div>
+    </div>
+    <div class="frame-meta maibot-muted">
+      <span id="frameTime"></span>
+      <label><input id="live" type="checkbox" checked> 实时刷新</label>
+    </div>
+    <p id="frameError" class="error" role="status"></p>
+  </div>
+
+  <div class="stack">
+    <!-- 控制区放在最上面：下面的卡片高度会随想法和记录变化，放在下面按钮会跟着上下跳 -->
+    <section class="maibot-card">
+      <div class="maibot-card-header">控制</div>
+      <div class="controls">
+        <input id="goalInput" class="maibot-input" type="text" maxlength="100" placeholder="想做的事（可留空，让她自己决定）">
+        <button id="start" class="maibot-button maibot-button-primary">开始玩</button>
+        <button id="pause" class="maibot-button">暂停</button>
+        <button id="resume" class="maibot-button">继续</button>
+        <button id="stop" class="maibot-button maibot-button-danger">停止</button>
+      </div>
+      <p id="actionError" class="error" role="alert"></p>
+      <p id="statusError" class="error" role="status"></p>
+    </section>
+
+    <section class="maibot-card">
+      <div class="maibot-card-header">现在</div>
+      <div id="goal" class="now-goal">空闲</div>
+      <div id="progressText" class="maibot-muted"></div>
+      <div class="progress"><div id="progressBar"></div></div>
+      <div id="thought" class="thought" hidden></div>
+    </section>
+
+    <section class="maibot-card">
+      <div class="maibot-card-header">操作记录</div>
+      <ul id="logs" class="logs"></ul>
+    </section>
+
+    <section class="maibot-card">
+      <div class="maibot-card-header">今天</div>
+      <div class="stats">
+        <div><div class="maibot-muted">玩了几次</div><div id="sessions" class="value maibot-number">—</div></div>
+        <div><div class="maibot-muted">操作步数</div><div id="steps" class="value maibot-number">—</div></div>
+        <div><div class="maibot-muted">自动玩</div><div id="auto" class="value">—</div></div>
+      </div>
+      <p id="lastError" class="error"></p>
+    </section>
+
+    <section class="maibot-card">
+      <div class="maibot-card-header">最近玩过</div>
+      <ul id="history" class="history"></ul>
+    </section>
+  </div>
+</div>
+
+<script>
+(() => {
+  const $ = id => document.getElementById(id);
+  // 宿主同一时间最多允许 2 个请求：轮询只占 1 个，留 1 个给按钮操作
+  const FRAME_DELAY_MS = 1000;
+  const STATUS_EVERY = 2;
+  let frameId = 0;
+  let tick = 0;
+  let busy = false;
+
+  document.body.classList.add('maibot-page');
+
+  function text(tag, content, className) {
+    const element = document.createElement(tag);
+    element.textContent = content;
+    if (className) element.className = className;
+    return element;
+  }
+
+  function renderStatus(data) {
+    const name = data.nickname || '';
+    $('title').textContent = `📱 ${name}的手机`;
+    $('state').textContent = data.state_label;
+    $('state').classList.toggle('badge-playing', data.state === 'playing');
+    $('device').textContent = data.device;
+
+    const active = data.state !== 'idle';
+    $('goal').textContent = active
+      ? (data.app ? `${data.app} · ${data.goal}` : '正在想玩什么…')
+      : '空闲';
+    $('progressText').textContent = active
+      ? `第 ${data.step}/${data.max_steps} 步 · 已玩 ${data.elapsed_minutes}/${data.max_minutes} 分钟 · ${data.trigger}`
+      : '';
+    $('progressBar').style.width = active ? `${Math.min(100, data.step / data.max_steps * 100)}%` : '0';
+    $('thought').hidden = !data.thought;
+    $('thought').textContent = data.thought ? `💭 ${data.thought}` : '';
+
+    $('start').disabled = busy || active;
+    $('pause').disabled = busy || data.state !== 'playing';
+    $('resume').disabled = busy || data.state !== 'paused';
+    $('stop').disabled = busy || !active;
+
+    const logs = $('logs');
+    logs.replaceChildren();
+    if (!data.logs.length) logs.append(text('li', '还没有操作记录', 'maibot-muted'));
+    for (const log of data.logs) {
+      const item = document.createElement('li');
+      if (!log.ok) item.className = 'failed';
+      const row = document.createElement('div');
+      row.className = 'row';
+      row.append(text('span', log.time, 'time maibot-muted'), text('span', log.summary, 'summary'));
+      if (log.action) row.append(text('span', log.action, 'detail maibot-muted'));
+      item.append(row);
+      if (log.thought) item.append(text('div', `💭 ${log.thought}`, 'detail'));
+      if (log.result) item.append(text('div', log.result, 'detail maibot-muted'));
+      logs.append(item);
+    }
+
+    $('sessions').textContent = `${data.today.sessions}/${data.today.session_limit}`;
+    $('steps').textContent = `${data.today.steps}/${data.today.step_limit}`;
+    $('auto').textContent = data.auto_play
+      ? (data.next_auto_check ? `开启 · ${data.next_auto_check}` : '开启')
+      : '关闭';
+    $('lastError').textContent = data.last_error ? `最近的错误：${data.last_error}` : '';
+
+    const history = $('history');
+    history.replaceChildren();
+    if (!data.history.length) history.append(text('li', '还没有玩过', 'maibot-muted'));
+    for (const record of data.history) {
+      const when = record.started_at.slice(5, 16).replace('T', ' ');
+      const what = record.app ? `${record.app} · ${record.goal}` : '没决定好玩什么';
+      const item = document.createElement('li');
+      item.append(text('div', `${when}　${what}`));
+      item.append(text('div', `${record.summary}（${record.steps} 步，${record.end_reason}）`, 'maibot-muted'));
+      history.append(item);
+    }
+  }
+
+  function renderFrame(data) {
+    $('frameError').textContent = data.error ? `画面获取失败：${data.error}` : '';
+    if (!data.frame_id) {
+      $('placeholder').textContent = data.error ? '没有画面' : '正在获取画面…';
+      return;
+    }
+    frameId = data.frame_id;
+    $('frameTime').textContent = `画面时间 ${data.captured_at}`;
+    // 按真实屏幕比例显示，模拟器常见 9:16，全面屏手机更窄
+    document.querySelector('.phone').style.aspectRatio = `${data.width} / ${data.height}`;
+    if (data.image) {
+      $('screen').src = data.image;
+      $('screen').style.display = 'block';
+      $('placeholder').style.display = 'none';
+    }
+  }
+
+  async function poll() {
+    for (;;) {
+      if ($('live').checked && document.visibilityState === 'visible') {
+        // 画面和状态分开捕获错误：画面每秒刷新会重写 frameError，状态错误要单独显示才不会被冲掉
+        try {
+          renderFrame(await maibot.query('frame', { since: frameId }));
+        } catch (error) {
+          $('frameError').textContent = error.message;
+        }
+        if (tick % STATUS_EVERY === 0) {
+          try {
+            renderStatus(await maibot.query('status'));
+            $('statusError').textContent = '';
+          } catch (error) {
+            $('statusError').textContent = `状态刷新失败：${error.message}`;
+          }
+        }
+        tick += 1;
+      }
+      await new Promise(resolve => setTimeout(resolve, FRAME_DELAY_MS));
+    }
+  }
+
+  async function run(name, args) {
+    if (busy) return;
+    busy = true;
+    $('actionError').textContent = '';
+    document.querySelectorAll('.controls button').forEach(button => { button.disabled = true; });
+    try {
+      await maibot.action(name, args);
+      if (name === 'start') $('goalInput').value = '';
+    } catch (error) {
+      $('actionError').textContent = error.message;
+    } finally {
+      busy = false;
+      try { renderStatus(await maibot.query('status')); } catch (error) { $('actionError').textContent = error.message; }
+    }
+  }
+
+  $('start').onclick = () => run('start', { goal: $('goalInput').value.trim() });
+  $('pause').onclick = () => run('pause', {});
+  $('resume').onclick = () => run('resume', {});
+  $('stop').onclick = () => run('stop', {});
+  $('goalInput').addEventListener('keydown', event => { if (event.key === 'Enter' && !$('start').disabled) $('start').click(); });
+
+  maibot.ready.then(async () => {
+    try { renderStatus(await maibot.query('status')); } catch (error) { $('actionError').textContent = error.message; }
+    void poll();
+  });
+})();
+</script>
