@@ -10,7 +10,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 import base64
 
-from .ui_tree import UIElement
+from .ui_tree import Bounds, UIElement
 
 _MARK_COLORS = ("#ff3b30", "#007aff", "#34c759", "#ff9500", "#af52de")
 _MIN_JPEG_QUALITY = 30
@@ -31,6 +31,11 @@ def screen_signature(image: Image.Image) -> bytes:
 def signature_distance(first: bytes, second: bytes) -> float:
     """两张缩略图逐像素差值的平均（0~255）；转圈加载、时钟跳动这类小变化通常不到 1。"""
     return sum(abs(a - b) for a, b in zip(first, second, strict=True)) / len(first)
+
+
+def region_distance(first: Image.Image, second: Image.Image, bounds: Bounds) -> float:
+    """两张同样大小的截图里同一块区域的差别，算法同 ``signature_distance``。"""
+    return signature_distance(screen_signature(first.crop(bounds)), screen_signature(second.crop(bounds)))
 
 
 def resize_to_edge(image: Image.Image, max_edge: int) -> Image.Image:

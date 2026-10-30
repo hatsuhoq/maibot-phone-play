@@ -1,7 +1,7 @@
 """解析界面树（安卓 uiautomator、iPhone WebDriverAgent），挑出可以点击或带文字的元素。"""
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 from xml.etree import ElementTree
 
 import re
@@ -47,6 +47,8 @@ _WDA_LAYER_KINDS = frozenset({"CollectionView", "Keyboard", "ScrollView", "Table
 # 应用和窗口的说明是应用名，框住整个屏幕，列出来没有意义
 _WDA_CONTAINER_KINDS = frozenset({"Application", "Window"})
 _WDA_TEXT_KINDS = frozenset({"StaticText", "Image"})
+# 重新读界面时，和原来的位置重合（交并比）到这个比例才算同一个元素
+_SAME_OVERLAP = 0.5
 
 
 @dataclass(frozen=True)
@@ -343,3 +345,30 @@ def parse_wda_xml(xml_text: str, width: int, height: int, scale: float, limit: i
     clickable = [(item.label, item.kind, item.bounds) for item in shown if item.clickable]
     labeled = [(item.label, item.kind, item.bounds) for item in shown if not item.clickable]
     return _number_elements(clickable, labeled, limit)
+
+
+def element_at(elements: Sequence[UIElement], x: int, y: int) -> Optional[UIElement]:
+    """盖住这个点的最小元素：点在列表卡片里的按钮上时是按钮，不是整张卡片；没有元素盖住时返回 None。"""
+    covering = [
+        element
+        for element in elements
+        if element.bounds[0] <= x < element.bounds[2] and element.bounds[1] <= y < element.bounds[3]
+    ]
+    return min(covering, key=lambda element: _area(element.bounds), default=None)
+
+
+def find_same(target: UIElement, elements: Sequence[UIElement]) -> Optional[UIElement]:
+    """在重新读到的元素里找 ``target``：类型、文字都一样，而且和原来的位置重合一大半。
+
+    只按文字找不够：列表滚了一屏后，另一张卡片上也有「关注」，点下去就关注错了人。
+    """
+    best: Optional[UIElement] = None
+    best_ratio = _SAME_OVERLAP
+    for element in elements:
+        if element.kind != target.kind or element.label != target.label:
+            continue
+        shared = _overlap(element.bounds, target.bounds)
+        ratio = shared / (_area(element.bounds) + _area(target.bounds) - shared)
+        if ratio >= best_ratio:
+            best, best_ratio = element, ratio
+    return best

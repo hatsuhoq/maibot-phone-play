@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence, Union
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 
 import asyncio
 import json
@@ -13,7 +13,7 @@ from phone_play.settings import PhonePlayConfig
 from phone_play.store import SessionRecord, UsageStore
 from phone_play.ui_tree import UIElement
 
-from conftest import FakeDevice, make_png
+from conftest import FakeDevice, make_png, scene_png
 
 PLAN = json.dumps({"app": "tv.danmaku.bili", "goal": "看猫猫视频", "minutes": 5}, ensure_ascii=False)
 
@@ -802,3 +802,106 @@ async def test_long_disconnect_still_ends_the_session(tmp_path):
     assert record.end_reason.startswith("出错：连不上 iPhone")
     # 等满了才放弃
     assert harness.seconds >= 45
+
+
+class ScenePhone(FakeDevice):
+    """画面按截图次数切换：第 k 次截图起是 scenes[k-1]（用完停在最后一个），界面元素跟着画面走。
+
+    每一步先截图做决定；要点的话插件点之前再截一张核对，所以第 2 张就是「模型想好时」的画面。
+    """
+
+    def __init__(self, scenes: Sequence[Tuple[bytes, Sequence[UIElement]]]) -> None:
+        super().__init__()
+        self.scenes = list(scenes)
+        self.shots = 0
+        self.ui_reads = 0
+
+    async def screenshot(self) -> bytes:
+        self.shots += 1
+        self.png, elements = self.scenes[min(self.shots, len(self.scenes)) - 1]
+        self.elements = list(elements)
+        return await super().screenshot()
+
+    async def ui_elements(self, width: int, height: int, limit: int) -> List[UIElement]:
+        self.ui_reads += 1
+        return await super().ui_elements(width, height, limit)
+
+    def taps(self) -> List[Tuple]:
+        return [call for call in self.actions() if call[0] == "tap"]
+
+
+async def test_tap_is_skipped_when_the_target_is_gone_by_the_time_of_tapping(tmp_path):
+    # 实测：她去点 B 站弹窗的「不再提醒」，等模型想好，弹窗已经自己收起，点到了底下的投稿按钮
+    popup_box, plus_box = (40, 1050, 500, 1130), (230, 1060, 310, 1140)
+    popup = UIElement(index=1, label="不再提醒", kind="Button", clickable=True, bounds=popup_box)
+    plus = UIElement(index=1, label="投稿", kind="ImageView", clickable=True, bounds=plus_box)
+    with_popup = (scene_png((popup_box, "#ffffff")), [popup])
+    without_popup = (scene_png((plus_box, "#ff6699")), [plus])
+    # 连着三次都是这样，也不算连续出错，不会因此结束
+    harness = Harness(
+        tmp_path,
+        ScenePhone([with_popup, without_popup] * 3),
+        [action(action="tap", element=1, summary="关掉弹窗")] * 3
+        + [action(action="finish", summary="弹窗总是自己没了，不玩了")],
+    )
+    record = await harness.run()
+    assert harness.device.taps() == []
+    assert record.end_reason == "自己不想玩了"
+    assert (
+        "→ 没点：点之前画面变了，「不再提醒」已经不在原来的位置了。先看看现在的画面再决定" in harness.state_texts()[1]
+    )
+    log = harness.agent.status()["logs"][-4]
+    assert log["ok"] is False and log["result"].startswith("没点：")
+
+
+async def test_tap_follows_the_same_element_when_it_moved_a_little(tmp_path):
+    # 上面的横幅加载出来，列表往下挪了一点：还是那张卡片，按它现在的位置点
+    before, after = (0, 300, 540, 500), (0, 340, 540, 540)
+    card = UIElement(index=1, label="橘猫视频", kind="LinearLayout", clickable=True, bounds=before)
+    moved = UIElement(index=1, label="橘猫视频", kind="LinearLayout", clickable=True, bounds=after)
+    harness = Harness(
+        tmp_path,
+        ScenePhone([(scene_png((before, "#ffcc00")), [card]), (scene_png((after, "#ffcc00")), [moved])]),
+        [action(action="tap", element=1, summary="点开猫猫视频"), action(action="finish")],
+    )
+    await harness.run()
+    assert harness.device.taps() == [("tap", 270, 440)]
+
+
+async def test_unchanged_target_is_tapped_without_reading_the_screen_again(tmp_path):
+    # 视频在别处播放、画面一直在变，但按钮那块没变：直接点，不多花一两秒重新读界面
+    button_box, video_box = (400, 100, 520, 160), (0, 300, 540, 600)
+    button = UIElement(index=1, label="关注", kind="Button", clickable=True, bounds=button_box)
+    scenes = [
+        (scene_png((button_box, "#ff6699"), (video_box, "#000000")), [button]),
+        (scene_png((button_box, "#ff6699"), (video_box, "#ffffff")), [button]),
+    ]
+    harness = Harness(tmp_path, ScenePhone(scenes), [action(action="tap", element=1), action(action="finish")])
+    await harness.run()
+    assert harness.device.taps() == [("tap", 460, 130)]
+    # 只有两步做决定时各读了一次
+    assert harness.device.ui_reads == 2
+
+
+async def test_coordinate_tap_on_a_playing_video_still_goes_through(tmp_path):
+    # 视频画面上没有界面元素，播放时那块一直在变；重新读界面那里还是空的，照原样点
+    video_box = (0, 100, 540, 400)
+    title = UIElement(index=1, label="视频标题", kind="TextView", clickable=False, bounds=(0, 700, 540, 760))
+    scenes = [(scene_png((video_box, "#000000")), [title]), (scene_png((video_box, "#ffffff")), [title])]
+    harness = Harness(tmp_path, ScenePhone(scenes), [action(action="tap", point=[500, 200]), action(action="finish")])
+    await harness.run()
+    assert harness.device.taps() == [("tap", 270, 240)]
+
+
+async def test_coordinate_tap_is_skipped_when_something_popped_up_there(tmp_path):
+    video_box, popup_box = (0, 100, 540, 400), (60, 150, 480, 350)
+    title = UIElement(index=1, label="视频标题", kind="TextView", clickable=False, bounds=(0, 700, 540, 760))
+    popup = UIElement(index=1, label="开通会员", kind="Button", clickable=True, bounds=popup_box)
+    scenes = [
+        (scene_png((video_box, "#000000")), [title]),
+        (scene_png((video_box, "#000000"), (popup_box, "#ffcc00")), [popup, title]),
+    ]
+    harness = Harness(tmp_path, ScenePhone(scenes), [action(action="tap", point=[500, 200]), action(action="finish")])
+    await harness.run()
+    assert harness.device.taps() == []
+    assert "那里现在是「开通会员」" in harness.state_texts()[1]

@@ -1,6 +1,6 @@
 import pytest
 
-from phone_play.ui_tree import parse_uiautomator_xml, parse_wda_xml
+from phone_play.ui_tree import UIElement, element_at, find_same, parse_uiautomator_xml, parse_wda_xml
 
 SAMPLE = """<?xml version='1.0' encoding='UTF-8' standalone='yes' ?>
 <hierarchy rotation="0">
@@ -231,3 +231,26 @@ def test_parse_wda_drops_elements_collapsed_onto_the_list_corner():
 def test_parse_wda_invalid_xml_raises():
     with pytest.raises(ValueError, match="无法解析"):
         parse_wda_xml("<XCUIElementTypeApplication", 1170, 2532, scale=3, limit=10)
+
+
+def _element(label: str, bounds, kind: str = "Button") -> UIElement:
+    return UIElement(index=1, label=label, kind=kind, clickable=True, bounds=bounds)
+
+
+def test_element_at_picks_the_smallest_element_under_the_point():
+    card = _element("橘猫视频", (0, 300, 540, 500), kind="Cell")
+    follow = _element("关注", (420, 320, 520, 370))
+    assert element_at([card, follow], 450, 340) == follow
+    assert element_at([card, follow], 100, 400) == card
+    assert element_at([card, follow], 100, 600) is None
+
+
+def test_find_same_needs_same_text_kind_and_place():
+    follow = _element("关注", (420, 320, 520, 370))
+    # 挪了一点还是它
+    assert find_same(follow, [_element("关注", (420, 335, 520, 385))]) is not None
+    # 列表滚过一屏，另一张卡片上的「关注」不是它（点下去就关注错了人）
+    assert find_same(follow, [_element("关注", (420, 920, 520, 970))]) is None
+    # 同一个位置换成了别的东西也不是它
+    assert find_same(follow, [_element("已关注", (420, 320, 520, 370))]) is None
+    assert find_same(follow, [_element("关注", (420, 320, 520, 370), kind="Other")]) is None

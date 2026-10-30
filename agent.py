@@ -19,6 +19,7 @@ from .imaging import (
     encode_jpeg,
     jpeg_data_url,
     open_image,
+    region_distance,
     screen_signature,
     signature_distance,
 )
@@ -34,7 +35,7 @@ from .prompts import (
 )
 from .settings import AllowedApp, DeviceSettings, PhonePlayConfig
 from .store import SessionRecord, UsageStore
-from .ui_tree import UIElement
+from .ui_tree import UIElement, element_at, find_same
 
 STATE_LABELS: Dict[str, str] = {"idle": "空闲", "starting": "准备中", "playing": "正在玩", "paused": "已暂停"}
 TRIGGER_LABELS: Dict[str, str] = {"auto": "自己想玩", "chat": "聊天中决定", "command": "命令", "webui": "WebUI"}
@@ -66,6 +67,10 @@ _COMMENT_FORBIDDEN = re.compile(r"https?://|www\.|\.(com|cn|net)\b|@|\d{6,}", re
 _UNCHANGED_DISTANCE = 1.5
 # 等对方操作时，缩略图差值超过这个数就算对方动过了
 _PARTNER_CHANGE_DISTANCE = 0.5
+# 点之前要点的那块和做决定时的截图比，差值低于这个数就直接点；高了才重新读界面确认（多花一两秒）
+_TARGET_CHANGE_DISTANCE = 4.0
+# 按坐标点、那里又没有界面元素时，比对点周围多大一块（屏幕宽度的比例，半边长）
+_POINT_BOX_RATIO = 0.04
 _TURN_POLL_SECONDS = 1.5
 
 VisionCall = Callable[[List[Dict[str, Any]]], Awaitable[str]]
@@ -89,6 +94,10 @@ class PlayRefused(Exception):
 
 class AgentError(RuntimeError):
     """本次游玩无法继续。"""
+
+
+class StaleTarget(Exception):
+    """点之前画面变了，要点的东西已经不在原处：这一步不点，让她看了新画面再决定。"""
 
 
 @dataclass(frozen=True)
@@ -907,7 +916,12 @@ class PhoneAgent:
             session.last_thought = action.thought
         summary = action.summary or action.describe()
         try:
-            result = await self._execute(device, action, elements, width, height, apps, config, session)
+            result = await self._execute(device, action, image, elements, apps, config, session)
+        except StaleTarget as exc:
+            # 不是她做错了，不算连续出错；画面刚截过，不用再等
+            self._log(step, summary, thought=action.thought, action=action.describe(), ok=False, result=f"没点：{exc}")
+            history.append(f"第{step}步：{summary} → 没点：点之前画面变了，{exc}。先看看现在的画面再决定")
+            return True, False, 0.0
         except (ActionError, DeviceError) as exc:
             self._log(step, summary, thought=action.thought, action=action.describe(), ok=False, result=str(exc))
             history.append(f"第{step}步：{summary} → 失败：{exc}")
@@ -932,27 +946,81 @@ class PhoneAgent:
             return True, False, 0.0
         return True, False, interval
 
+    async def _confirm_point(
+        self,
+        device: PhoneDevice,
+        action: PhoneAction,
+        image: Image.Image,
+        elements: Sequence[UIElement],
+        config: PhonePlayConfig,
+    ) -> Tuple[int, int]:
+        """求出要点的位置，并确认那里还是她看到的东西。
+
+        从截图到点下去隔着一次模型调用（实测 5~10 秒），弹窗可能已经自己收起：实测她去点 B 站弹窗的「不再提醒」，
+        弹窗先没了，点到了底下的投稿按钮。所以先截一张新图比对要点的那块，没变就直接点；变了再重新读界面，
+        同一个元素还在原处就按它现在的位置点，不在了（或者原来空着的地方冒出了别的东西）就不点。
+        读不到界面元素的画面（游戏、视频）没法确认，照原样点。
+
+        Raises:
+            ActionError: 元素编号不存在或缺少坐标时抛出。
+            StaleTarget: 要点的东西不在原处了。
+            DeviceError: 截图或读取界面失败时抛出。
+        """
+        width, height = image.size
+        x, y = resolve_point(action, elements, width, height)
+        if not elements:
+            return x, y
+        if action.element is not None:
+            target: Optional[UIElement] = next(element for element in elements if element.index == action.element)
+        else:
+            target = element_at(elements, x, y)
+        if target is not None:
+            region = target.bounds
+        else:
+            half = max(1, round(width * _POINT_BOX_RATIO))
+            region = (max(0, x - half), max(0, y - half), min(width, x + half), min(height, y + half))
+
+        current = await asyncio.to_thread(open_image, await device.screenshot())
+        if current.size != image.size:
+            raise StaleTarget("屏幕转过来了")
+        if await asyncio.to_thread(region_distance, image, current, region) < _TARGET_CHANGE_DISTANCE:
+            return x, y
+
+        now = await device.ui_elements(width, height, config.play.max_elements)
+        if target is None:
+            covering = element_at(now, x, y)
+            if covering is None:
+                return x, y
+            raise StaleTarget(f"那里现在是「{covering.label or covering.kind}」")
+        same = find_same(target, now)
+        if same is None:
+            raise StaleTarget(f"「{target.label or target.kind}」已经不在原来的位置了")
+        if action.element is None and element_at([same], x, y) is not None:
+            return x, y
+        return same.center
+
     async def _execute(
         self,
         device: PhoneDevice,
         action: PhoneAction,
+        image: Image.Image,
         elements: Sequence[UIElement],
-        width: int,
-        height: int,
         apps: Sequence[AllowedApp],
         config: PhonePlayConfig,
         session: Session,
     ) -> str:
-        """执行动作并返回结果说明。
+        """执行动作并返回结果说明；``image`` 是做决定时的截图。
 
         Raises:
             ActionError: 动作越过安全边界或参数无效时抛出。
+            StaleTarget: 点之前画面变了，要点的东西不在原处。
             DeviceError: 设备执行失败时抛出。
         """
         kind = action.kind
+        width, height = image.size
         if kind in ("like", "follow"):
             self._check_interaction(config, kind)
-            x, y = resolve_point(action, elements, width, height)
+            x, y = await self._confirm_point(device, action, image, elements, config)
             await device.tap(x, y)
             self._store.add_interaction(self._today(), kind)
             if kind == "like":
@@ -967,7 +1035,7 @@ class PhoneAgent:
                 raise ActionError("评论里不能有链接、@ 别人或联系方式")
             if len(text) > config.interaction.comment_max_length:
                 raise ActionError(f"评论太长了，最多 {config.interaction.comment_max_length} 个字")
-            x, y = resolve_point(action, elements, width, height)
+            x, y = await self._confirm_point(device, action, image, elements, config)
             await device.tap(x, y)
             # 等键盘弹出来再写
             await self._sleep(_INPUT_FOCUS_SECONDS)
@@ -983,7 +1051,7 @@ class PhoneAgent:
             session.interactions.append(f"评论「{text}」")
             return "已写好评论，还要点发送或发布才会发出去"
         if kind in ("tap", "long_press"):
-            x, y = resolve_point(action, elements, width, height)
+            x, y = await self._confirm_point(device, action, image, elements, config)
             if kind == "tap":
                 await device.tap(x, y)
                 return f"已点击 ({x}, {y})"

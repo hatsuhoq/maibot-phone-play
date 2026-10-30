@@ -2,7 +2,7 @@ from io import BytesIO
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence, Set, Tuple
 
-from PIL import Image
+from PIL import Image, ImageDraw
 
 import sys
 
@@ -16,6 +16,17 @@ from phone_play.ui_tree import UIElement  # noqa: E402
 def make_png(width: int = 540, height: int = 1200, color: str = "#336699") -> bytes:
     buffer = BytesIO()
     Image.new("RGB", (width, height), color).save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+def scene_png(*boxes: Tuple[Tuple[int, int, int, int], str]) -> bytes:
+    """在 make_png 的底色上画几个色块，当作按钮、弹窗、视频画面。"""
+    image = Image.new("RGB", (540, 1200), "#336699")
+    draw = ImageDraw.Draw(image)
+    for bounds, color in boxes:
+        draw.rectangle(bounds, fill=color)
+    buffer = BytesIO()
+    image.save(buffer, "PNG")
     return buffer.getvalue()
 
 
