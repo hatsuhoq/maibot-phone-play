@@ -6,7 +6,7 @@ import json
 import logging
 import pytest
 
-from phone_play.agent import PhoneAgent, PlayRefused, in_active_hours
+from phone_play.agent import PhoneAgent, PlayRefused, Session, in_active_hours
 from phone_play.devices import DeviceError
 from phone_play.prompts import Persona
 from phone_play.settings import PhonePlayConfig
@@ -497,9 +497,10 @@ async def test_frames_are_shared_with_webui(tmp_path):
 
 async def test_activity_text_describes_last_session(tmp_path):
     harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="看了两只猫")])
-    assert harness.agent.activity_text() == "最近没有玩过手机。"
+    assert harness.agent.activity_text() == "现在没在玩手机，最近也没有玩过。"
     await harness.run()
     text = harness.agent.activity_text()
+    assert text.startswith("现在没在玩手机。上一次玩手机是")
     assert "哔哩哔哩" in text and "看了两只猫" in text and "今天一共玩了 1 次" in text
 
 
@@ -550,6 +551,19 @@ async def test_together_waits_for_partner_without_calling_model(tmp_path):
     system = harness.vision_messages[0][0]["content"]
     assert '{"action":"wait_turn"}' in system and "这次是和对方一起玩" in system
     assert record.together is True and harness.notified == [(record, "s")]
+
+
+async def test_together_also_covers_playing_online_from_partners_own_phone(tmp_path):
+    # 实测对方在自己手机上和她组斗地主 2v2：规则只许同机轮流、不许联网匹配，她进了房间不敢开局就结束了；
+    # 每次开始又先关掉应用，房间也跟着没了
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="和对方打了一局斗地主，赢了")])
+    await harness.run(trigger="chat", together=True, origin_stream="s")
+    assert ("stop", "tv.danmaku.bili") not in harness.device.actions()
+    assert harness.device.actions()[0] == ("launch", "tv.danmaku.bili")
+    system = harness.vision_messages[0][0]["content"]
+    assert "对方用自己的手机和你联机" in system and "等开局、等匹配时，用 wait 或 wait_turn 等着，不要 finish" in system
+    assert "不要联网匹配陌生人" not in system
+    assert "也可能用自己的手机和你联机、组队" in harness.plan_prompts[0]
 
 
 async def test_wait_turn_needs_a_partner_and_gives_up_after_a_while(tmp_path):
@@ -905,3 +919,53 @@ async def test_coordinate_tap_is_skipped_when_something_popped_up_there(tmp_path
     await harness.run()
     assert harness.device.taps() == []
     assert "那里现在是「开通会员」" in harness.state_texts()[1]
+
+
+async def test_new_request_wakes_the_session_while_it_is_watching(tmp_path):
+    # 她停下来看视频时一次等 30 秒；对方在聊天里让她点准备，不能等满了才去
+    harness = Harness(tmp_path, FakeDevice(), [])
+    agent = harness.agent
+    agent._sleep = asyncio.sleep
+    agent._session = Session(
+        trigger="chat", hint="", origin_stream="s", minutes_override=0, started_at=datetime.now(), started_clock=0.0
+    )
+    nap = asyncio.create_task(agent._nap(agent._session, 30))
+    await asyncio.sleep(0.05)
+    assert not nap.done()
+    assert agent.add_request("点准备")
+    await asyncio.wait_for(nap, 1)
+    assert agent._session.requests == ["点准备"]
+
+
+async def test_chat_context_only_for_the_chat_that_started_and_not_long_after(tmp_path):
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="看了两只猫，好圆")])
+    assert harness.agent.chat_context("s") == ""
+    assert harness.agent.add_request("换一个") is False
+    await harness.run(origin_stream="s")
+    assert harness.agent.chat_context("s").startswith("【手机上的实际情况】现在没在玩手机。")
+    assert harness.agent.chat_context("other") == ""
+    harness.seconds += 31 * 60
+    assert harness.agent.chat_context("s") == ""
+
+
+async def test_new_request_leaves_time_to_carry_it_out(tmp_path):
+    # 实测「去打一把路人局」交过去 44 秒后，这次就因为玩够 5 分钟结束了
+    harness = Harness(tmp_path, FakeDevice(), [])
+    agent = harness.agent
+    agent._session = Session(
+        trigger="chat",
+        hint="",
+        origin_stream="s",
+        minutes_override=0,
+        started_at=datetime.now(),
+        started_clock=0.0,
+        max_minutes=5,
+    )
+    harness.seconds = 4.8 * 60
+    agent.add_request("去打一把路人局")
+    assert agent._session.max_minutes == 8
+    agent.add_request("再打一把", minutes=6)
+    assert agent._session.max_minutes == 11
+    # 不超过配置的单次上限
+    agent.add_request("一直打", minutes=60)
+    assert agent._session.max_minutes == 15

@@ -8,6 +8,7 @@ from PIL import Image
 from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
 
 import asyncio
+import math
 import random
 import re
 import time
@@ -72,6 +73,10 @@ _TARGET_CHANGE_DISTANCE = 4.0
 # 按坐标点、那里又没有界面元素时，比对点周围多大一块（屏幕宽度的比例，半边长）
 _POINT_BOX_RATIO = 0.04
 _TURN_POLL_SECONDS = 1.5
+# 玩完后这么久之内，发起的那个聊天每一轮还提醒她现在没在玩手机
+_RECENT_CHAT_SECONDS = 30 * 60
+# 对方在聊天里提了新要求时，这次至少还留这么多分钟给她去做
+_REQUEST_MINUTES = 3
 
 VisionCall = Callable[[List[Dict[str, Any]]], Awaitable[str]]
 TextCall = Callable[[str], Awaitable[str]]
@@ -168,6 +173,8 @@ class Session:
     repeat_count: int = 0
     # 在聊天里被叫停时她已经在接话了，不需要再发结束通知
     notify: bool = True
+    # 对方在聊天里让她在手机上做的事（点准备、退出房间……），下一步先照着做
+    requests: List[str] = field(default_factory=list)
     # 决定好玩什么（或会话提前结束）时置位，供聊天工具等待计划
     planned: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -262,6 +269,11 @@ class PhoneAgent:
         self._stop_reason = ""
         self._last_error = ""
         self._logs: Deque[StepLog] = deque(maxlen=_LOG_LIMIT)
+        # 对方在聊天里提了新要求时叫醒等待中的会话
+        self._wake = asyncio.Event()
+        # 上一次玩手机是从哪个聊天发起的、什么时候结束的
+        self._last_stream = ""
+        self._last_ended_clock = 0.0
 
         self._device: Optional[PhoneDevice] = None
         self._device_key = ""
@@ -383,19 +395,68 @@ class PhoneAgent:
             if interactions:
                 text += f"\n这次用自己的账号{'、'.join(interactions)}。"
             return text
+        # 明说现在没在玩：实测对方问「玩上了吗」，她没去玩却截了张桌面，照着「上一次玩手机是……」编了一段正在玩
         history = self._store.history
         if not history:
-            return "最近没有玩过手机。"
+            return "现在没在玩手机，最近也没有玩过。"
         last = history[-1]
         sessions_today, _ = self._store.usage(self._today())
         place = f"在{last.app}里" if last.app else ""
         text = (
-            f"上一次玩手机是 {last.started_at[5:16].replace('T', ' ')}，{place}{last.goal or '没决定好玩什么'}："
+            f"现在没在玩手机。上一次玩手机是 {last.started_at[5:16].replace('T', ' ')}，"
+            f"{place}{last.goal or '没决定好玩什么'}："
             f"{last.summary}（{last.end_reason}）。今天一共玩了 {sessions_today} 次。"
         )
         if last.interactions:
             text += f"那次用自己的账号{'、'.join(last.interactions)}。"
         return text
+
+    def add_request(self, text: str, minutes: int = 0) -> bool:
+        """把对方在聊天里的新要求交给手机上的她，下一步先照着做；没在玩时返回 False。
+
+        ``minutes`` 是聊天这边说还要玩多久；没说时至少留几分钟给她去做，都不超过配置的单次上限。
+        """
+        session = self._session
+        text = text.strip()
+        if session is None or not text:
+            return False
+        session.requests.append(text)
+        if session.max_minutes:
+            # 实测「去打一把路人局」交过去 44 秒后，这次就因为玩够 5 分钟结束了，手机上的她没来得及做
+            config = self._config()
+            limit = config.play.together_minutes if session.together else config.play.max_session_minutes
+            needed = math.ceil(self._elapsed_seconds(session) / 60 + max(minutes, _REQUEST_MINUTES))
+            session.max_minutes = min(limit, max(session.max_minutes, needed))
+        # 正在看视频、等对方时提前醒来，不用等满这一轮
+        self._wake.set()
+        return True
+
+    def chat_context(self, stream_id: str) -> str:
+        """给发起这次玩手机的聊天看的手机实际情况，每一轮都带上；没什么可说的返回空字符串。
+
+        聊天这边看不到手机，实测常照着对方的话编进展：「已经在游戏里了」「点到了，退出房间了」，手机上其实没发生；
+        对方说「不玩了」也不放下手机。正在玩时告诉她手机上在做什么、怎么把要求交给手机上的她；
+        玩完后的一段时间里提醒她现在没在玩。别的聊天、很久以前玩的不提。
+        """
+        if not stream_id:
+            return ""
+        session = self._session
+        if session is not None and session.origin_stream == stream_id:
+            # 实测「最近在：……开始经典新手场」被她说成「这不就开局了嘛」，其实下一步就因为豆子不够弹了充值
+            return (
+                f"【手机上的实际情况】{self.activity_text()}\n"
+                "手机上的操作是手机上的你自己在一步步做，聊天里看不到画面：说到手机上的事只按上面写的说，"
+                "没发生的不要说成已经做了；「最近在」是这几步点了什么、想做什么，成没成要看后面几步，"
+                "别说成已经开局、已经领到了。对方让你在手机上做什么（点准备、退出房间、接受邀请、换个视频），"
+                "用 play_phone 把要求交给手机上的你，过一会儿用 phone_activity 看做没做成再说；"
+                "对方叫你别玩了就用 stop_phone。"
+            )
+        if stream_id == self._last_stream and self._clock() - self._last_ended_clock < _RECENT_CHAT_SECONDS:
+            return (
+                f"【手机上的实际情况】{self.activity_text()}\n"
+                "要在手机上做什么，得先用 play_phone 真的拿起手机；调用之前别说自己在玩、已经进去了。"
+            )
+        return ""
 
     # ===== 控制 =====
 
@@ -632,6 +693,7 @@ class PhoneAgent:
                 self._log(session.step, "没能回到桌面", ok=False, result=str(exc))
         self._state = "idle"
         self._session = None
+        self._last_stream, self._last_ended_clock = session.origin_stream, self._clock()
         # 还没决定玩什么就结束了，让等待计划的调用方立刻拿到原因
         session.planned.set()
         self._resume.set()
@@ -714,8 +776,9 @@ class PhoneAgent:
                 result=f"计划玩 {plan.minutes} 分钟",
             )
             try:
-                if config.play.fresh_start:
-                    # 应用在后台时直接打开会回到上次停下的页面（比如上次看的视频），容易被带跑
+                # 应用在后台时直接打开会回到上次停下的页面（比如上次看的视频），容易被带跑；
+                # 一起玩时不关：上次停下的多半是和对方组好的房间，关掉就退出房间了
+                if config.play.fresh_start and not session.together:
                     await device.stop_app(plan.app.package)
                 await device.launch_app(plan.app.package)
                 break
@@ -763,7 +826,20 @@ class PhoneAgent:
                 session.end_reason = f"连续 {consecutive_errors} 步操作失败"
                 self._last_error = session.end_reason
                 return
-            await self._sleep(wait_seconds)
+            await self._nap(session, wait_seconds)
+
+    async def _nap(self, session: Session, seconds: float) -> None:
+        """等到下一步；对方在聊天里提了新要求就提前醒来。"""
+        self._wake.clear()
+        if session.requests:
+            return
+        sleeper = asyncio.ensure_future(self._sleep(seconds))
+        waker = asyncio.ensure_future(self._wake.wait())
+        try:
+            await asyncio.wait({sleeper, waker}, return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            sleeper.cancel()
+            waker.cancel()
 
     def _stop_check(self, session: Session, config: PhonePlayConfig) -> str:
         if session.step >= config.play.max_steps_per_session:
@@ -876,6 +952,9 @@ class PhoneAgent:
         model_jpeg = await asyncio.to_thread(
             encode_jpeg, model_image, config.play.model_image_max_edge, _MODEL_JPEG_QUALITY
         )
+        requests, session.requests = session.requests, []
+        # 记进操作记录，后面几步也看得到对方说过什么
+        history.extend(f"第{step}步前，对方在聊天里让你：{text}" for text in requests)
         context = DecisionContext(
             persona=persona,
             goal=session.goal,
@@ -899,6 +978,7 @@ class PhoneAgent:
             interaction=self._interaction_quota(config),
             repeated_steps=session.repeat_count if session.repeat_count >= _REPEAT_WARNING else 0,
             repeated_action=session.last_action.describe() if session.last_action else "",
+            requests=requests,
         )
 
         try:
@@ -1099,6 +1179,8 @@ class PhoneAgent:
                 return f"等了 {config.play.turn_wait_seconds} 秒，对方还没动"
             if self._elapsed_seconds(session) >= session.max_minutes * 60:
                 return "等对方的时候，这次的时间到了"
+            if session.requests:
+                return "对方在聊天里有新的要求"
             await self._sleep(_TURN_POLL_SECONDS)
             await self._resume.wait()
             image = await asyncio.to_thread(open_image, await device.screenshot())

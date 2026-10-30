@@ -1,9 +1,11 @@
 """刷会儿手机：让 Bot 用安卓手机、模拟器或 iPhone 自己刷视频、逛帖子、听歌、看小说。"""
 
+from datetime import datetime
 from typing import Any, Dict, List, Optional, cast
+from uuid import uuid4
 
-from maibot_sdk import API, Command, MaiBotPlugin, ON_BOT_CONFIG_RELOAD, Tool
-from maibot_sdk.types import ToolParameterInfo, ToolParamType
+from maibot_sdk import API, Command, HookHandler, MaiBotPlugin, ON_BOT_CONFIG_RELOAD, Tool
+from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .agent import AgentError, PhoneAgent, PlayRefused
 from .devices import DeviceError, create_device
@@ -274,15 +276,20 @@ class PhonePlayPlugin(MaiBotPlugin):
         return True, reply or "已发送手机截图", True
 
     # ===== Tool 组件 =====
+    # 宿主只把 description 发给模型，detailed_description 已经不用了：用法都要写进 description。
+    # 实测只写「拿起手机玩一会儿（刷视频、看番……）」时，对方叫她去玩手机上新装的斗地主，她嘴上说「那我试试」，
+    # 没调用 play_phone，接着编了一段「一进去全是广告」
 
     @Tool(
         "play_phone",
-        brief_description="拿起手机玩一会儿（刷视频、看番、逛帖子、听歌、看小说）",
-        detailed_description=(
-            "你自己想玩手机、无聊想打发时间，或者聊天里有人叫你去玩手机、刷视频、看看某个内容时使用。"
-            "对方想和你在这台手机上一起玩、轮流操作时，together 填 true。"
-            "会先等你想好玩什么（一般几秒）再返回，所以最好等结果出来再回对方，说说具体打算；"
-            "玩不了时会告诉你原因，照实说就好。玩完后你会回到这个聊天。正在玩时不要重复调用。"
+        description=(
+            "拿起手机玩一会儿：刷视频、看番、逛帖子、听歌、看小说、玩手机上的游戏。"
+            "你自己想玩、无聊想打发时间，或者聊天里有人叫你去手机上玩点什么、看看某个内容时使用；"
+            "调用了它才是真的拿起手机在玩，没调用就别说自己在玩、看到了什么。"
+            "对方想和你一起玩（在这台手机上轮流操作，或者用自己的手机和你联机、组队）时，together 填 true。"
+            "会等你想好玩什么（一般几秒）再返回，等结果出来再回对方、说说具体打算；玩不了时照实说原因。"
+            "玩完后你会回到这个聊天。正在玩时再调用不会重新开始，而是把 goal 当成对方的新要求交给手机上的你"
+            "（比如点准备、退出房间、接受邀请、换个视频）。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -300,7 +307,9 @@ class PhonePlayPlugin(MaiBotPlugin):
             ToolParameterInfo(
                 name="together",
                 param_type=ToolParamType.BOOLEAN,
-                description="是否和对方一起玩：对方会直接在这台手机上和你轮流操作，比如双人对战的游戏",
+                description=(
+                    "是否和对方一起玩：对方在这台手机上和你轮流操作，或者用自己的手机和你联机、组队（比如游戏里的好友房）"
+                ),
                 required=False,
             ),
         ],
@@ -311,6 +320,17 @@ class PhonePlayPlugin(MaiBotPlugin):
     ) -> Dict[str, Any]:
         """聊天中去玩手机；等她决定好玩什么再返回，方便她说出具体打算。"""
         del kwargs
+        if self.agent.state != "idle":
+            # 实测玩的时候对方在聊天里说「退出房间」「点准备」，她嘴上说做了，手机上的她根本不知道
+            if self.agent.add_request(goal, minutes):
+                return {
+                    "success": True,
+                    "content": (
+                        f"已经告诉手机上的你：{goal.strip()}。手机上的你下一步会先去做；"
+                        "做没做成要过一会儿用 phone_activity 看了再说，别直接说已经做好了。"
+                    ),
+                }
+            return {"success": True, "content": f"你已经在玩手机了。{self.agent.activity_text()}"}
         if not self.settings.play.allow_chat_trigger:
             return {"success": False, "error": "插件配置不允许在聊天中自己去玩手机"}
         try:
@@ -326,7 +346,8 @@ class PhonePlayPlugin(MaiBotPlugin):
             # 实测聊天这边不知道手机上玩到哪了，会自己编「该你了」这类进展，和手机上的实际情况对不上
             content = (
                 f"你拿起了手机，打算打开{plan.app.name}：{plan.goal}。"
-                "对方会在这台手机上和你轮流操作，轮到对方时你会等着；可以告诉对方你准备好了。"
+                "对方在这台手机上和你轮流操作时，轮到对方你会等着；对方用自己的手机联机时，你会进房间等对方、一起开局。"
+                "可以告诉对方你准备好了。"
                 "每一步都是你在手机上看着画面自己操作的，聊天里不用报坐标，也不要编造进展；"
                 "对方问起局面时用 phone_activity 看看现在的情况再说。玩完你会回到这个聊天。"
             )
@@ -336,11 +357,10 @@ class PhonePlayPlugin(MaiBotPlugin):
 
     @Tool(
         "show_phone_screen",
-        brief_description="截一张手机屏幕，可以附在回复里给对方看",
-        detailed_description=(
-            "聊天里有人想看你在手机上看什么、让你给他看看手机屏幕时使用。"
-            "会把手机当前画面的截图交给你，对方这时还看不到；要给对方看，就在回复时用 attach_pic 附上这张截图，"
-            "再顺着画面说一两句。"
+        description=(
+            "截一张手机屏幕，可以附在回复里给对方看。聊天里有人想看你在手机上看什么、让你截图给他看时使用。"
+            "截图先交给你，对方这时还看不到；要给对方看，回复时用 attach_pic 附上它，"
+            "再照着画面上真有的内容说一两句（截到的是桌面就是还没打开应用）。"
         ),
     )
     async def tool_show_phone_screen(self, user_id: str = "", **kwargs: Any) -> Dict[str, Any]:
@@ -374,10 +394,9 @@ class PhonePlayPlugin(MaiBotPlugin):
 
     @Tool(
         "phone_activity",
-        brief_description="看看自己正在或刚才在手机上做了什么",
-        detailed_description=(
-            "当聊天里有人问你在玩什么、刚才在手机上看到了什么，或者你想聊聊手机上看到的内容时使用。"
-            "返回正在玩或上一次玩手机的情况。"
+        description=(
+            "看看自己正在或刚才在手机上做了什么。聊天里有人问你在玩什么、玩上了没有、刚才在手机上看到了什么，"
+            "或者你想聊聊手机上看到的内容时使用；聊手机上的事以它返回的为准，别自己编。"
         ),
         visibility=_ALWAYS_VISIBLE,
     )
@@ -388,8 +407,7 @@ class PhonePlayPlugin(MaiBotPlugin):
 
     @Tool(
         "stop_phone",
-        brief_description="放下手机，不玩了",
-        detailed_description="有人让你别玩手机了、叫你过来聊天，或者你自己不想玩了时使用。",
+        description="放下手机，不玩了。有人让你别玩手机了、叫你过来聊天，或者你自己不想玩了时使用。",
         visibility=_ALWAYS_VISIBLE,
     )
     async def tool_stop_phone(self, **kwargs: Any) -> Dict[str, Any]:
@@ -400,6 +418,51 @@ class PhonePlayPlugin(MaiBotPlugin):
         if not stopped:
             return {"success": True, "content": "你现在本来就没在玩手机。"}
         return {"success": True, "content": f"你放下了手机。{self.agent.activity_text()}"}
+
+    # ===== Hook 组件 =====
+    # 玩手机时把手机上的实际情况放进发起那个聊天的每一轮，她聊手机上的事才有依据（见 PhoneAgent.chat_context）
+
+    @HookHandler(
+        "maisaka.planner.before_request",
+        name="phone_play_planner_context",
+        description="玩手机时把手机上的实际情况告诉聊天里的她",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def inject_planner_context(self, **kwargs: Any) -> Dict[str, Any]:
+        """追加在请求最后，不改前面的消息，聊天记录的提示词缓存照样命中。"""
+        items = kwargs.get("items")
+        text = self._agent.chat_context(str(kwargs.get("session_id") or "")) if self._agent else ""
+        if not text or not isinstance(items, list):
+            return {"action": "continue"}
+        note = {
+            "item_type": "UserMessageItem",
+            "meta": {
+                "item_id": f"phone-play-{uuid4().hex}",
+                "logical_turn_id": None,
+                "timestamp": datetime.now().isoformat(),
+            },
+            "parts": [{"type": "text", "text": text}],
+        }
+        # 宿主用 modified_kwargs 整体替换参数，要带上全部原有参数
+        return {"action": "continue", "modified_kwargs": {**kwargs, "items": [*items, note]}}
+
+    @HookHandler(
+        "maisaka.replyer.before_request",
+        name="phone_play_replyer_context",
+        description="玩手机时让写回复的她也知道手机上的实际情况",
+        mode=HookMode.BLOCKING,
+        order=HookOrder.LATE,
+        error_policy=ErrorPolicy.SKIP,
+    )
+    async def inject_replyer_context(self, **kwargs: Any) -> Dict[str, Any]:
+        """规划时只定下回复的方向，具体说什么由 replyer 写，实测「点到了，已经退出来了」这类话就是这一步编的。"""
+        extra = kwargs.get("extra_prompt")
+        text = self._agent.chat_context(str(kwargs.get("session_id") or "")) if self._agent else ""
+        if not text or not isinstance(extra, str):
+            return {"action": "continue"}
+        return {"action": "continue", "modified_kwargs": {**kwargs, "extra_prompt": f"{extra}\n{text}".strip()}}
 
     # ===== WebUI 页面 API =====
 

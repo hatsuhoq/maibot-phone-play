@@ -86,6 +86,8 @@ async def test_components_and_lifecycle(tmp_path):
             "show_phone_screen",
             "phone_activity",
             "stop_phone",
+            "phone_play_planner_context",
+            "phone_play_replyer_context",
             "webui_status",
             "webui_frame",
             "webui_start",
@@ -106,6 +108,16 @@ async def test_components_and_lifecycle(tmp_path):
         "stop_phone": "visible",
         "show_phone_screen": None,
     }
+    # 宿主只把 description 发给模型（detailed_description 已经不用了），用法都要写在这里
+    descriptions = {
+        component["name"]: component["metadata"]["description"]
+        for component in plugin.get_components()
+        if component["type"] == "TOOL"
+    }
+    assert "玩手机上的游戏" in descriptions["play_phone"]
+    assert "没调用就别说自己在玩" in descriptions["play_phone"]
+    assert "attach_pic" in descriptions["show_phone_screen"]
+    assert "别自己编" in descriptions["phone_activity"]
     await plugin.on_load()
     status = await plugin.webui_status()
     assert status["state"] == "idle" and status["nickname"] == "小睦"
@@ -187,7 +199,7 @@ async def test_tools(tmp_path):
     try:
         refused = await plugin.tool_play_phone(goal="看猫")
         assert refused["success"] is False and "不允许" in refused["error"]
-        assert (await plugin.tool_phone_activity())["content"] == "最近没有玩过手机。"
+        assert (await plugin.tool_phone_activity())["content"] == "现在没在玩手机，最近也没有玩过。"
         assert (await plugin.tool_stop_phone())["content"] == "你现在本来就没在玩手机。"
     finally:
         await plugin.on_unload()
@@ -262,9 +274,8 @@ async def test_play_phone_tool_together_mode(tmp_path, monkeypatch):
     plugin.agent._sleep = fast_sleep
     try:
         result = await plugin.tool_play_phone(goal="和对方玩双人小游戏", together=True, stream_id="stream-1")
-        assert result["content"].startswith(
-            "你拿起了手机，打算打开双人小游戏：和对方轮流玩双人小游戏。对方会在这台手机上"
-        )
+        assert result["content"].startswith("你拿起了手机，打算打开双人小游戏：和对方轮流玩双人小游戏。")
+        assert "对方用自己的手机联机时，你会进房间等对方、一起开局" in result["content"]
         # 聊天这边别自己编进展，问起时去看手机
         assert "不要编造进展" in result["content"] and "phone_activity" in result["content"]
         await asyncio.wait_for(plugin.agent._task, 5)
@@ -386,3 +397,63 @@ async def test_finish_notice_mentions_her_interactions(tmp_path):
     await plugin._notify_finished(record, "stream-1")
     _, intent = plugin.ctx.maisaka.proactive.trigger.await_args.args
     assert "用自己的账号点赞 2 次、评论「好圆」" in intent
+
+
+async def test_chat_sees_phone_state_and_passes_requests_while_playing(tmp_path, monkeypatch):
+    # 实测玩的时候她在聊天里照着对方的话编进展（「点到了，已经退出房间了」），手机上的她根本不知道；
+    # 对方说「不玩了」她也不放下手机
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    plugin = make_plugin(tmp_path)
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    deciding, gate = asyncio.Event(), asyncio.Event()
+    states: List[str] = []
+    responses = [
+        '{"action": "wait", "seconds": 30, "summary": "看睦睦的视频", "thought": "这个睦睦好可爱"}',
+        '{"action": "finish", "summary": "看了睦睦的视频，按对方说的换了一个"}',
+    ]
+
+    async def generate(prompt, **kwargs):
+        if isinstance(prompt, str):
+            return {"success": True, "response": PLAN_JSON}
+        states.append(prompt[1]["content"][0]["text"])
+        if len(states) == 1:
+            deciding.set()
+            await gate.wait()
+        return {"success": True, "response": responses.pop(0)}
+
+    plugin.ctx.llm.generate = generate
+    await plugin.on_load()
+    try:
+        await plugin.tool_play_phone(goal="看睦睦", stream_id="stream-1")
+        await asyncio.wait_for(deciding.wait(), 5)
+
+        # 发起的聊天每一轮都带上手机上的实际情况，追加在最后，不动前面的消息
+        items = [{"item_type": "UserMessageItem", "meta": {"item_id": "m1"}, "parts": []}]
+        hooked = await plugin.inject_planner_context(items=items, session_id="stream-1", item_schema_version=1)
+        new_items = hooked["modified_kwargs"]["items"]
+        assert new_items[0] == items[0] and hooked["modified_kwargs"]["item_schema_version"] == 1
+        note = new_items[-1]
+        assert note["item_type"] == "UserMessageItem" and note["meta"]["logical_turn_id"] is None
+        text = note["parts"][0]["text"]
+        assert text.startswith("【手机上的实际情况】正在用手机：哔哩哔哩") and "stop_phone" in text
+        # 列的是这几步想做什么，不代表做成了
+        assert "成没成要看后面几步" in text
+        # 写回复时也带上；别的聊天不带
+        replyer = await plugin.inject_replyer_context(extra_prompt="", session_id="stream-1")
+        assert replyer["modified_kwargs"]["extra_prompt"].startswith("【手机上的实际情况】")
+        assert await plugin.inject_planner_context(items=items, session_id="stream-2") == {"action": "continue"}
+
+        # 玩的时候再调用 play_phone：不重新开始，把要求交给手机上的她
+        result = await plugin.tool_play_phone(goal="换个视频", stream_id="stream-1")
+        assert result["content"].startswith("已经告诉手机上的你：换个视频。") and "phone_activity" in result["content"]
+        gate.set()
+        await asyncio.wait_for(plugin.agent._task, 5)
+        # 本来要看 30 秒，有了新要求马上醒来，下一步先照着做
+        assert "对方刚在聊天里让你：换个视频。这比原来的打算优先" in states[1]
+        assert "第2步前，对方在聊天里让你：换个视频" in states[1]
+
+        # 玩完后的一段时间里，提醒她现在没在玩
+        after = await plugin.inject_planner_context(items=items, session_id="stream-1")
+        assert "现在没在玩手机" in after["modified_kwargs"]["items"][-1]["parts"][0]["text"]
+    finally:
+        await plugin.on_unload()

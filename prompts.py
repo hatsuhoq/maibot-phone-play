@@ -79,6 +79,8 @@ class DecisionContext:
     # 连续做同一个操作的次数（够多了才提醒，否则是 0）和那个操作的说明
     repeated_steps: int = 0
     repeated_action: str = ""
+    # 对方刚在聊天里让她在手机上做的事
+    requests: Sequence[str] = ()
 
 
 def format_apps(apps: Sequence[AllowedApp]) -> str:
@@ -119,12 +121,10 @@ def build_plan_prompt(
         )
     if together:
         hint_text += (
-            "\n这次是和对方一起玩：对方会直接在这台手机上操作，选能两个人在同一台手机上玩的应用"
-            "（比如双人对战的游戏），goal 里写上是和对方一起玩。"
+            "\n这次是和对方一起玩：对方可能在这台手机上和你轮流操作，也可能用自己的手机和你联机、组队；"
+            "选能一起玩的应用，goal 里写上是和对方一起玩、怎么一起玩（对方说了什么模式、哪个房间就照着写）。"
         )
-        interact_text = (
-            "在手机上只是看、听、玩，不下载保存文件、不发布内容；除了和对方在这台手机上一起玩，不和别人互动。\n"
-        )
+        interact_text = "在手机上只是看、听、玩，不下载保存文件、不发布内容；除了和对方一起玩，不和别人互动。\n"
     else:
         interact_text = "在手机上只是看、听、玩，不下载保存文件、不发布内容、不和别人互动。\n"
     if interaction:
@@ -242,10 +242,15 @@ def _rules(context: DecisionContext) -> str:
             "不代表你在那个应用里，不要点它；现在在哪个应用以「当前前台」为准。"
         )
     if context.together:
+        # 实测对方在自己手机上和她组欢乐斗地主 2v2，原来的规则只有同机轮流、「不要联网匹配陌生人」，
+        # 她进了组队房间不敢开局，连着三次刚进房间就结束，玩完回桌面，房间也退了
         rules.append(
-            "这次是和对方一起玩：对方会直接在这台手机上操作。可以进入人人对战、双人这类同一台手机上两个人玩的模式，"
-            "不要联网匹配陌生人。轮到对方时不要替对方操作，用 wait_turn 等对方。"
-            "分出胜负后就用 finish 结束，summary 写清楚谁赢了。"
+            "这次是和对方一起玩，有两种：对方直接在这台手机上操作（人人对战、同机双人这类模式），"
+            "轮到对方时不要替对方操作，用 wait_turn 等对方；"
+            "或者对方用自己的手机和你联机（好友房、组队、对方发来邀请），这时进对方说的模式或房间、接受对方的邀请，和对方一起开局，需要匹配别的玩家凑满一桌也没关系，"
+            "对局里轮到你就照常出手。在房间里等对方进来、等开局、等匹配时，用 wait 或 wait_turn 等着，不要 finish；"
+            "不要丢下对方自己去和陌生人开局。打完一局、分出胜负后再决定接着玩还是 finish，summary 写清楚谁赢了；"
+            "等了好几分钟对方还没来，再结束。"
         )
     rules.append("只输出一个 JSON 对象，不要输出其它内容。")
     return "规则：\n" + "\n".join(f"{index}. {rule}" for index, rule in enumerate(rules, start=1))
@@ -336,9 +341,16 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
     quota_text = (
         f"今天还能点赞 {quota.likes} 次、评论 {quota.comments} 条、关注 {quota.follows} 个。\n" if quota else ""
     )
+    request_text = ""
+    if context.requests:
+        request_text = (
+            f"对方刚在聊天里让你：{'；'.join(context.requests)}。"
+            "这比原来的打算优先，先照着做；做不到就在 thought 里说为什么。\n"
+        )
     state_text = (
         # 目标在系统提示里离截图太远，模型容易只顾眼前画面，这里紧挨着截图再说一次
         f"这次想做的事：{context.goal}\n"
+        f"{request_text}"
         f"当前时间：{context.now:%H:%M}\n"
         f"已经玩了 {context.elapsed_minutes:.0f} 分钟（打算玩 {context.max_minutes} 分钟），"
         f"这是第 {context.step}/{context.max_steps} 步。\n"
