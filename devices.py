@@ -383,10 +383,9 @@ class WdaDevice(PhoneDevice):
         self._transport = transport
         # 复用同一个客户端：每次新建都要加载一遍证书库，要半秒多，每步操作都会慢下来
         self._client: Optional[httpx.AsyncClient] = None
-        # 会话、倍率和屏幕尺寸在 ensure_ready 里获取；会话失效后清空，下次重新建立
+        # 会话和倍率在 ensure_ready 里获取；会话失效后清空，下次重新建立
         self._session_id = ""
         self._scale = 0.0
-        self._screen_points = (0.0, 0.0)
         # WDA 查不到应用装没装，打开时发现没装的记在这里，之后不再列出
         self._missing_apps: Set[str] = set()
 
@@ -478,7 +477,7 @@ class WdaDevice(PhoneDevice):
             if not session_id:
                 raise DeviceError(f"WebDriverAgent 没有返回会话 ID：{created}")
             await self._request("POST", f"/session/{session_id}/appium/settings", {"settings": _WDA_SETTINGS})
-            self._scale, self._screen_points = _parse_screen(await self._request("GET", "/wda/screen"))
+            self._scale, _ = _parse_screen(await self._request("GET", "/wda/screen"))
             self._session_id = session_id
         await self._ensure_unlocked()
 
@@ -525,7 +524,8 @@ class WdaDevice(PhoneDevice):
             await self._session_request("POST", "/wda/keys", {"value": ["\n"]})
             return
         await self._get_scale()
-        width, height = self._screen_points
+        # 横屏的游戏（如欢乐斗地主）里屏幕宽高和建会话时不一样，每次现查；按建会话时的竖屏尺寸算，起点在屏幕外
+        _, (width, height) = _parse_screen(await self._request("GET", "/wda/screen"))
         x1, y1, x2, y2 = _BACK_SWIPE
         await self._drag(width * x1, height * y1, width * x2, height * y2, _BACK_SWIPE_MS)
 

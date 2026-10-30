@@ -44,6 +44,8 @@ class FakeWda:
         # 获得焦点的输入框里的文字；None 表示键盘没弹出来，没有获得焦点的元素
         self.focused: Optional[str] = None
         self.down = False
+        # 横屏应用里 /wda/screen 返回的宽高会对调
+        self.screen_size = {"width": 390, "height": 844}
 
     def _reply(self, value: Any, status: int = 200) -> httpx.Response:
         return httpx.Response(status, json={"value": value, "sessionId": self.session_id})
@@ -73,7 +75,7 @@ class FakeWda:
         if route == "/appium/settings":
             return self._reply(body["settings"])
         if route == "/wda/screen":
-            return self._reply({"scale": 3, "screenSize": {"width": 390, "height": 844}})
+            return self._reply({"scale": 3, "screenSize": self.screen_size})
         if route == "/wda/locked":
             return self._reply(self.locked.pop(0) if len(self.locked) > 1 else self.locked[0])
         if route == "/screenshot":
@@ -139,6 +141,18 @@ async def test_back_is_edge_swipe_and_home_enter_use_wda():
     assert fake.paths()[-1] == "/wda/homescreen"
     await device.press_key("enter")
     assert fake.bodies("/wda/keys") == [{"value": ["\n"]}]
+
+
+async def test_back_uses_current_screen_size_in_landscape_apps():
+    # 竖屏时建的会话，后来打开了横屏的欢乐斗地主：要按横屏的宽高算，不然起点 y=422 在 390 高的屏幕外
+    fake = FakeWda()
+    device = make_device(fake)
+    await device.tap(30, 60)
+    fake.screen_size = {"width": 844, "height": 390}
+    await device.press_key("back")
+    drag = fake.bodies("/wda/pressAndDragWithVelocity")[0]
+    assert drag["toX"] == pytest.approx(633)
+    assert drag["fromY"] == drag["toY"] == pytest.approx(195)
 
 
 async def test_input_text_supports_chinese_and_explains_failure():
