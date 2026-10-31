@@ -13,6 +13,13 @@
   "urls": {
     "repository": "https://github.com/hatsuhoq/maibot-phone-play"
   },
+  "display": {
+    "icon": {
+      "type": "local",
+      "value": "icon.png",
+      "fallback": "smartphone"
+    }
+  },
   "host_application": {
     "min_version": "1.3.6",
     "max_version": "1.3.99"
