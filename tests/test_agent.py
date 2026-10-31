@@ -749,6 +749,24 @@ async def test_interaction_counts_reset_daily_and_survive_restart(tmp_path):
     assert reloaded.interactions("2026-10-30") == {}
 
 
+@pytest.mark.parametrize(
+    "content", ["{坏掉的", '{"date": "2026-10-29"}', '{"date": "x", "sessions": 1, "steps": 2, "history": [1]}']
+)
+async def test_broken_usage_file_is_backed_up_instead_of_blocking_the_plugin(tmp_path, content):
+    # 插件中心审核建议：记录文件坏了不该让整个插件加载失败、要用户手动删文件
+    path = tmp_path / "usage.json"
+    path.write_text(content, encoding="utf-8")
+    store = UsageStore(path)
+    await store.load()
+    assert store.history == [] and store.usage("2026-10-31") == (0, 0)
+    backups = list(tmp_path.glob("usage.json.broken-*"))
+    assert len(backups) == 1 and backups[0].read_text(encoding="utf-8") == content
+    assert "已损坏" in store.recovered and backups[0].name in store.recovered
+    store.add_session("2026-10-31")
+    await store.save()
+    assert json.loads(path.read_text(encoding="utf-8"))["sessions"] == 1
+
+
 async def test_short_finish_summary_is_padded_with_what_she_saw(tmp_path):
     # 实测 gpt-6.1-terra 结束时只写了「结束刷抖音」，聊天里提起这次时没什么可说的
     harness = Harness(

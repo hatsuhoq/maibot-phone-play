@@ -1,6 +1,6 @@
 [project]
 name = "maibot-phone-play"
-version = "0.1.0"
+version = "0.1.2"
 description = "MaiBot 插件「刷会儿手机」：让 Bot 用安卓手机、模拟器或 iPhone 自己刷视频、逛帖子、听歌、看小说，支持 WebUI 实时观看"
 requires-python = ">=3.12"
 dependencies = [

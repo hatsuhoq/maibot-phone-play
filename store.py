@@ -1,6 +1,7 @@
 """每日额度与游玩历史的持久化。"""
 
 from dataclasses import asdict, dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
 
@@ -42,6 +43,8 @@ class UsageStore:
         # 当天点赞、评论、关注的次数
         self._interactions: Dict[str, int] = {}
         self._history: List[SessionRecord] = []
+        # 加载时发现记录文件损坏、已备份重来的说明，没出问题是空字符串
+        self.recovered = ""
 
     @property
     def history(self) -> List[SessionRecord]:
@@ -52,13 +55,17 @@ class UsageStore:
             return
         try:
             data = json.loads(self._path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as exc:
-            raise ValueError(f"使用记录文件已损坏：{self._path}（{exc.msg}），删除该文件后重试") from exc
-        self._date = str(data["date"])
-        self._sessions = int(data["sessions"])
-        self._steps = int(data["steps"])
-        self._interactions = {str(kind): int(count) for kind, count in data.get("interactions", {}).items()}
-        self._history = [SessionRecord(**item) for item in data["history"]]
+            date, sessions, steps = str(data["date"]), int(data["sessions"]), int(data["steps"])
+            interactions = {str(kind): int(count) for kind, count in data.get("interactions", {}).items()}
+            history = [SessionRecord(**item) for item in data["history"]]
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            # 一个记录文件坏了不该让整个插件加载失败：留个备份，从空记录重新开始
+            backup = self._path.with_name(f"{self._path.name}.broken-{datetime.now():%Y%m%d%H%M%S}")
+            self._path.replace(backup)
+            self.recovered = f"使用记录文件已损坏（{exc}），已备份为 {backup.name}，从空记录重新开始"
+            return
+        self._date, self._sessions, self._steps = date, sessions, steps
+        self._interactions, self._history = interactions, history
 
     def _write(self) -> None:
         self._path.parent.mkdir(parents=True, exist_ok=True)

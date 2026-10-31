@@ -2,7 +2,7 @@
   "manifest_version": 2,
   "id": "hohoko-chan.phone-play",
   "plugin_type": "game",
-  "version": "0.1.1",
+  "version": "0.1.2",
   "name": "刷会儿手机",
   "description": "让 Bot 用安卓手机、模拟器或 iPhone 自己刷视频、逛帖子、听歌、看小说，按人设和兴趣挑内容；支持 WebUI 实时观看和 /手机截图 命令。",
   "author": {

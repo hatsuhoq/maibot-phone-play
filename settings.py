@@ -40,7 +40,11 @@ class DeviceSettings(PluginConfigBase):
         default="adb",
         description="设备类型：adb=安卓真机或模拟器；ios_wda=iPhone（通过 WebDriverAgent 控制）",
     )
-    adb_path: str = Field(default="adb", description="adb 可执行文件路径；已加入 PATH 时填 adb 即可")
+    adb_path: str = Field(
+        default="adb",
+        description="adb 可执行文件路径，只填 adb 程序本身（如 D:\\platform-tools\\adb.exe）；"
+        "已加入 PATH 时填 adb 即可",
+    )
     serial: str = Field(
         default="",
         description="设备序列号或 IP:端口（如 MuMu 的 127.0.0.1:16384）；留空时使用唯一已连接的设备。"

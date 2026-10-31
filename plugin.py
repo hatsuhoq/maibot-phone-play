@@ -70,6 +70,8 @@ class PhonePlayPlugin(MaiBotPlugin):
         """创建会话管理器并启动自动玩调度。"""
         store = UsageStore(self.ctx.paths.data_dir / "usage.json")
         await store.load()
+        if store.recovered:
+            self.ctx.logger.warning(store.recovered)
         self._agent = PhoneAgent(
             config=lambda: self.settings,
             device_factory=create_device,
