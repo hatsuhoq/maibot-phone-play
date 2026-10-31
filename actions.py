@@ -34,7 +34,9 @@ ACTION_KINDS = (
 TAP_KINDS = ("tap", "long_press", "like", "follow")
 SWIPE_DIRECTIONS = ("up", "down", "left", "right")
 COORDINATE_SCALE = 1000.0
-MAX_WAIT_SECONDS = 30.0
+# 在游戏房间里等人、等开局时一次可以等这么久；超过 PLAIN_WAIT_SECONDS 的等待期间会截图比对，画面大变就提前醒来
+MAX_WAIT_SECONDS = 120.0
+PLAIN_WAIT_SECONDS = 30.0
 
 _ACTION_LABELS: Dict[str, str] = {
     "tap": "点击",

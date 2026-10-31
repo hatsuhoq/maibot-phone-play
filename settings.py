@@ -97,6 +97,10 @@ class AllowedApp(PluginConfigBase):
     )
     name: str = Field(default="", description="显示名称，例如 哔哩哔哩")
     note: str = Field(default="", description="给 Bot 看的用途说明，例如 刷视频、看番")
+    keep_open: bool = Field(
+        default=False,
+        description="玩完不回桌面，下次打开也不先关掉、接着上次的画面。适合联机游戏：回桌面、关掉会退出房间，重新打开要加载很久",
+    )
 
 
 def _default_allowed_apps() -> List[AllowedApp]:

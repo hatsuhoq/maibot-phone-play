@@ -13,7 +13,15 @@ import random
 import re
 import time
 
-from .actions import ActionError, PhoneAction, find_app, parse_action, resolve_point, swipe_points
+from .actions import (
+    PLAIN_WAIT_SECONDS,
+    ActionError,
+    PhoneAction,
+    find_app,
+    parse_action,
+    resolve_point,
+    swipe_points,
+)
 from .devices import AppNotInstalledError, DeviceError, KeyName, PhoneDevice
 from .imaging import (
     draw_element_marks,
@@ -77,6 +85,12 @@ _TURN_POLL_SECONDS = 1.5
 _RECENT_CHAT_SECONDS = 30 * 60
 # 对方在聊天里提了新要求时，这次至少还留这么多分钟给她去做
 _REQUEST_MINUTES = 3
+# 上次玩的应用在这么久之内又打开，就接着上次的画面，不先关掉
+_RESUME_SECONDS = 15 * 60
+# 长等待期间每隔几秒截图比对一次；和等待开始时的缩略图差值超过这个数就算画面大变，提前醒来。
+# 实测欢乐斗地主好友房里人物待机动画最多约 1.1，有人进房间约 2.7，开局（房间换成牌桌）约 19，对局里有人出牌 2~10
+_WAIT_POLL_SECONDS = 3.0
+_WAKE_CHANGE_DISTANCE = 2.0
 
 VisionCall = Callable[[List[Dict[str, Any]]], Awaitable[str]]
 TextCall = Callable[[str], Awaitable[str]]
@@ -271,8 +285,9 @@ class PhoneAgent:
         self._logs: Deque[StepLog] = deque(maxlen=_LOG_LIMIT)
         # 对方在聊天里提了新要求时叫醒等待中的会话
         self._wake = asyncio.Event()
-        # 上一次玩手机是从哪个聊天发起的、什么时候结束的
+        # 上一次玩手机是从哪个聊天发起的、玩的哪个应用、什么时候结束的
         self._last_stream = ""
+        self._last_package = ""
         self._last_ended_clock = 0.0
 
         self._device: Optional[PhoneDevice] = None
@@ -686,7 +701,8 @@ class PhoneAgent:
         summary = summary or "；".join(_recent_unique(session.summaries, 3)) or "没做什么"
         failed = end_reason.startswith(("出错", "意外错误", "连续"))
         self._log(session.step, f"结束：{end_reason}", ok=not failed, result=summary if app else "")
-        if app is not None and self._config().play.go_home_after:
+        # 回桌面是为了视频别一直放着；联机游戏回桌面会退出房间，别人进来发现她走了
+        if app is not None and self._config().play.go_home_after and not app.keep_open:
             try:
                 await self._get_device().press_key("home")
             except DeviceError as exc:
@@ -694,6 +710,7 @@ class PhoneAgent:
         self._state = "idle"
         self._session = None
         self._last_stream, self._last_ended_clock = session.origin_stream, self._clock()
+        self._last_package = app.package if app else ""
         # 还没决定玩什么就结束了，让等待计划的调用方立刻拿到原因
         session.planned.set()
         self._resume.set()
@@ -776,9 +793,7 @@ class PhoneAgent:
                 result=f"计划玩 {plan.minutes} 分钟",
             )
             try:
-                # 应用在后台时直接打开会回到上次停下的页面（比如上次看的视频），容易被带跑；
-                # 一起玩时不关：上次停下的多半是和对方组好的房间，关掉就退出房间了
-                if config.play.fresh_start and not session.together:
+                if config.play.fresh_start and not self._resumes(session, plan.app):
                     await device.stop_app(plan.app.package)
                 await device.launch_app(plan.app.package)
                 break
@@ -826,13 +841,47 @@ class PhoneAgent:
                 session.end_reason = f"连续 {consecutive_errors} 步操作失败"
                 self._last_error = session.end_reason
                 return
-            await self._nap(session, wait_seconds)
+            # 在房间里等人、等开局这种长等待，期间截图比对，有人进来、开局了就提前醒来
+            await self._nap(session, wait_seconds, device if wait_seconds > PLAIN_WAIT_SECONDS else None)
 
-    async def _nap(self, session: Session, seconds: float) -> None:
-        """等到下一步；对方在聊天里提了新要求就提前醒来。"""
+    def _resumes(self, session: Session, app: AllowedApp) -> bool:
+        """这次打开应用时接着上次的画面，不先关掉。
+
+        平时先关掉：应用在后台时直接打开会回到上次停下的页面（比如上次看的视频），容易被带跑。
+        但一起玩时上次停下的多半是和对方组好的房间；标了 keep_open 的游戏关掉会退出房间、重新加载要一分钟；
+        刚玩过的同一个应用多半是接着玩（实测群友一喊「回房间」她就重开一次，每次都冷启动）。
+        """
+        if session.together or app.keep_open:
+            return True
+        return app.package == self._last_package and self._clock() - self._last_ended_clock < _RESUME_SECONDS
+
+    async def _nap(self, session: Session, seconds: float, device: Optional[PhoneDevice] = None) -> None:
+        """等到下一步；对方在聊天里提了新要求就提前醒来。
+
+        给了 ``device`` 时每隔几秒截图比对，画面大变（有人进房间、开局了）也提前醒来；等待期间不调用模型。
+        """
         self._wake.clear()
         if session.requests:
             return
+        if device is None:
+            await self._sleep_or_wake(seconds)
+            return
+        try:
+            baseline = await self._screen_signature(device)
+            waited = 0.0
+            while waited < seconds:
+                interval = min(_WAIT_POLL_SECONDS, seconds - waited)
+                if await self._sleep_or_wake(interval):
+                    return
+                waited += interval
+                if signature_distance(await self._screen_signature(device), baseline) > _WAKE_CHANGE_DISTANCE:
+                    return
+        except DeviceError:
+            # 截不了图就不等了，下一步会按断开处理
+            return
+
+    async def _sleep_or_wake(self, seconds: float) -> bool:
+        """睡一会儿；被聊天里的新要求叫醒时返回 True。"""
         sleeper = asyncio.ensure_future(self._sleep(seconds))
         waker = asyncio.ensure_future(self._wake.wait())
         try:
@@ -840,6 +889,13 @@ class PhoneAgent:
         finally:
             sleeper.cancel()
             waker.cancel()
+        return self._wake.is_set()
+
+    async def _screen_signature(self, device: PhoneDevice) -> bytes:
+        image = await asyncio.to_thread(open_image, await device.screenshot())
+        # 长等待时 WebUI 的画面也跟着刷新
+        await self._publish_frame(image, self._config())
+        return await asyncio.to_thread(screen_signature, image)
 
     def _stop_check(self, session: Session, config: PhonePlayConfig) -> str:
         if session.step >= config.play.max_steps_per_session:

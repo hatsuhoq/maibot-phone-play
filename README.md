@@ -135,6 +135,19 @@ iPhone 通过 [WebDriverAgent](https://github.com/appium/WebDriverAgent)（WDA�
 
    > WDA 在手机的 Wi-Fi 上也开着同样的端口（`/status` 里的 `ios.ip`），**没有密码**，同一个局域网里的人都能控制这台手机。只在信任的网络里用，不玩的时候关掉 `ios runwda`。
 
+   **（可选）不用数据线**：go-ios 只能通过 USB 建隧道，一拔线 `ios runwda` 就会退出、WDA 跟着关掉。[pymobiledevice3](https://github.com/doronz88/pymobiledevice3) 能通过 Wi-Fi 建立同样的连接，而且不需要管理员权限（`--userspace`）：
+
+   ```bash
+   uv venv pmd3 --python 3.12
+   uv pip install --python pmd3/Scripts/python.exe pymobiledevice3
+   # 插着线执行一次：允许已配对的电脑通过 Wi-Fi 连接（相当于 iTunes 的「通过 Wi-Fi 同步」，以后关掉换成 off）
+   pmd3/Scripts/pymobiledevice3 lockdown wifi-connections on
+   # 之后拔掉线也行：通过 Wi-Fi 找到手机、启动 WDA（--udid 填 ios list 里的编号，<id> 同上）
+   pmd3/Scripts/pymobiledevice3 developer dvt xcuitest <id> --userspace --mobdev2 --udid <udid>
+   ```
+
+   这时 WDA 只在手机的 Wi-Fi 地址上（`pmd3/Scripts/pymobiledevice3 bonjour mobdev2` 能看到 `ip`），`device.wda_url` 填 `http://手机IP:8100`；或者在电脑上把 `127.0.0.1:8100` 转发到手机 IP，插件配置就不用改。手机重启后开发者镜像会掉，用 `mounter mount-personalized` 加上 go-ios 下载好的镜像（`devimages` 里的 `.dmg`、`.trustcache`、`BuildManifest.plist`）重新挂上。手机 IP 可能会变，最好在路由器里给它固定一个，或者关掉这个 Wi-Fi 的「私有无线局域网地址」。实测拔线后截图、读界面、点击的速度和插着线时一样（截图约 0.15 秒）。
+
 8. **插件配置**：`device.backend` 改成 `ios_wda`，`device.wda_url` 保持默认 `http://127.0.0.1:8100`。`safety.allowed_apps` 里的 `package` 要换成 iPhone 的 Bundle ID（和安卓包名不一样），以 `ios apps` 的输出为准，常见的有：
 
    | 应用 | Bundle ID |
@@ -173,14 +186,16 @@ iPhone 通过 [WebDriverAgent](https://github.com/appium/WebDriverAgent)（WDA�
 
 ### 和她一起玩
 
-同一台手机上两个人轮流玩的游戏（双人对战这类），可以和她一起玩：
+两种一起玩的方式都行，先把游戏加进 `safety.allowed_apps`，备注里写清楚怎么玩：
 
-1. 把游戏加进 `safety.allowed_apps`，备注里写清楚怎么玩。
-2. 跟她说「来手机上一起玩 xx」。轮到你时她会用 `wait_turn` 等你。
-3. 你在手机（或模拟器窗口）上操作。等你的时候插件每 1.5 秒截一次图比对，**不调用模型**；画面变了才轮到她看、做下一步。
-4. 玩完她会放下手机，回到聊天里聊这次。`play.turn_wait_seconds`（默认 180 秒）没等到你操作时，她会自己决定接着等还是结束；一起玩最多 `play.together_minutes`（默认 30 分钟）。
+- **同一台手机上轮流玩**（双人对战这类）：跟她说「来手机上一起玩 xx」。轮到你时她会用 `wait_turn` 等你，你在手机（或模拟器窗口）上操作；等你的时候插件每 1.5 秒截一次图比对，**不调用模型**，画面变了才轮到她看、做下一步。`play.turn_wait_seconds`（默认 180 秒）没等到你操作时，她会自己决定接着等还是结束。
+- **各用各的手机联机**（好友房、组队，比如欢乐斗地主 2v2）：跟她说「来斗地主 2v2，我拉你」。她会进你说的房间、接受邀请，和你一起开局；在房间里等人、等开局时不会结束。
 
-聊天这边的她不知道手机上玩到哪了，所以开始时会提醒她别在聊天里编造进展，被问起时用 `phone_activity` 看看现在的情况。
+一起玩最多 `play.together_minutes`（默认 30 分钟）。联机游戏建议在应用里加上 `keep_open = true`：玩完不回桌面（回桌面会退出房间），下次打开也不先关掉，接着上次的房间，不用重新加载。不标的应用在上次结束后 15 分钟内再打开，也会接着上次的画面。
+
+在房间里等人时她可以一次等 60~120 秒，等待期间每 3 秒截图比对、**不调用模型**，有人进来、开局了（画面大变）或聊天里有新要求就提前醒来；看视频这类 30 秒以内的等待不比对。
+
+**聊天这边**：手机是插件里另一个「她」在一步步操作，聊天里的她看不到画面。玩手机期间，发起的那个聊天每一轮都会带上手机上的实际情况（在玩什么、最近几步、想法），她聊手机上的事以这个为准；你在聊天里让她做什么（点准备、退出房间、接受邀请），她会用 `play_phone` 转给手机上的她，下一步优先照做；你叫她别玩了，她会用 `stop_phone` 放下手机。
 
 ### 聊天命令（精确控制）
 

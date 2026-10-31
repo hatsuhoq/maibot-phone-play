@@ -9,7 +9,7 @@ import pytest
 from phone_play.agent import PhoneAgent, PlayRefused, Session, in_active_hours
 from phone_play.devices import DeviceError
 from phone_play.prompts import Persona
-from phone_play.settings import PhonePlayConfig
+from phone_play.settings import AllowedApp, PhonePlayConfig
 from phone_play.store import SessionRecord, UsageStore
 from phone_play.ui_tree import UIElement
 
@@ -969,3 +969,44 @@ async def test_new_request_leaves_time_to_carry_it_out(tmp_path):
     # 不超过配置的单次上限
     agent.add_request("一直打", minutes=60)
     assert agent._session.max_minutes == 15
+
+
+async def test_keep_open_apps_are_not_closed_or_left_for_the_home_screen(tmp_path):
+    # 联机游戏回桌面会退出房间、关掉要重新加载一分钟（实测群友进好友房时她已经走了）
+    config = PhonePlayConfig()
+    config.safety.allowed_apps = [AllowedApp(package="tv.danmaku.bili", name="哔哩哔哩", keep_open=True)]
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="在房间里等了一会儿")], config=config)
+    await harness.run()
+    assert harness.device.actions() == [("launch", "tv.danmaku.bili")]
+
+
+async def test_reopening_the_same_app_soon_resumes_where_she_left(tmp_path):
+    # 实测群友一喊「回房间」她就重开一次，每次都先关掉游戏、冷启动
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="看了一会儿猫猫视频")] * 3)
+    await harness.run()
+    assert harness.device.actions()[0] == ("stop", "tv.danmaku.bili")
+    harness.device.calls.clear()
+    harness.seconds += 5 * 60
+    await harness.run()
+    assert harness.device.actions()[0] == ("launch", "tv.danmaku.bili")
+    harness.device.calls.clear()
+    harness.seconds += 16 * 60
+    await harness.run()
+    assert harness.device.actions()[0] == ("stop", "tv.danmaku.bili")
+
+
+@pytest.mark.parametrize("changes_at,woke_early", [(5, True), (None, False)])
+async def test_long_wait_watches_the_screen_without_calling_the_model(tmp_path, changes_at, woke_early):
+    # 在房间里等人时一次等 2 分钟，省下每 30 秒一次的识图调用；有人进来、开局了（画面大变）就提前醒来
+    still, changed = (make_png(), []), (make_png(color="#cc3366"), [])
+    scenes = [still] * (changes_at - 1) + [changed] if changes_at else [still]
+    harness = Harness(
+        tmp_path,
+        ScenePhone(scenes),
+        [action(action="wait", seconds=120, summary="等人进房间"), action(action="finish", summary="等到人开局了")],
+    )
+    await harness.run()
+    assert len(harness.vision_messages) == 2
+    # 开头打开应用后等 3 秒；没变化时等满 120 秒，画面变了第三次比对（9 秒）就醒
+    assert harness.seconds == (3 + 9 if woke_early else 3 + 120)
+    assert "在联机游戏的房间里（好友房、组队房间）等别人进来" in harness.vision_messages[0][0]["content"]

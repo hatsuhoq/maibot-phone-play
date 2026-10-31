@@ -59,7 +59,7 @@ def test_parse_interaction_actions():
 
 
 def test_wait_seconds_are_clamped():
-    assert parse_action('{"action":"wait","seconds":120}').seconds == 30
+    assert parse_action('{"action":"wait","seconds":300}').seconds == 120
     assert parse_action('{"action":"wait"}').seconds == 1
 
 
