@@ -81,6 +81,8 @@ class DecisionContext:
     repeated_action: str = ""
     # 对方刚在聊天里让她在手机上做的事
     requests: Sequence[str] = ()
+    # 这次之前已经交给她的要求（最近几条），操作记录一长就会被挤掉
+    earlier_requests: Sequence[str] = ()
 
 
 def format_apps(apps: Sequence[AllowedApp]) -> str:
@@ -203,8 +205,9 @@ def _rules(context: DecisionContext) -> str:
         text_rule = "不要输入任何文字。"
     if context.interaction is None:
         boundary = (
-            "只使用下面列出的应用。不要进入设置、应用商店；不要付款、充值、下单；不要发评论、弹幕、私信；"
-            "不要关注别人、加好友，除了点赞不做其它互动；不要登录、注册或修改账号。"
+            # 没开互动时 like 动作会被拦下，提示词也别再说能点赞（之前写着「除了点赞不做其它互动」）
+            "只使用下面列出的应用。不要进入设置、应用商店；不要付款、充值、下单；不要点赞，不要发评论、弹幕、私信；"
+            "不要关注别人、加好友；不要登录、注册或修改账号。"
         )
     else:
         boundary = (
@@ -225,8 +228,6 @@ def _rules(context: DecisionContext) -> str:
         "找到喜欢的视频、歌曲、文章，用 wait 停下来看一会儿；"
         "点开后发现不感兴趣（带货、广告、营销号、和你的兴趣不沾边的），别硬看：短视频直接划走，长视频、笔记、文章返回列表换一个。"
         "玩够了或想结束时用 finish。",
-        "点赞要克制，真喜欢才点。同一条视频只点一次：点过的爱心会变红，再点就取消了；"
-        "最近的操作里刚给这条点过赞，就接着看或者换下一条，不要再点。",
         "分清短视频和长视频：短视频是竖着占满整个屏幕、一条接一条的（抖音、B 站竖屏视频），上滑就是下一条；"
         "长视频是点开后上面播放器、下面简介和评论的页面（B 站点开的普通视频大多是这种），"
         "上滑只会翻简介和评论，不会换视频。长视频想看就用 wait 多看一会儿；"
@@ -239,6 +240,11 @@ def _rules(context: DecisionContext) -> str:
     ]
     if context.interaction is not None:
         rules.append(_interaction_rule(context.interaction))
+        if context.interaction.likes:
+            rules.append(
+                "点赞要克制，真喜欢才点。同一条视频只点一次：点过的爱心会变红，再点就取消了；"
+                "最近的操作里刚给这条点过赞，就接着看或者换下一条，不要再点。"
+            )
     if context.ios:
         rules.append(
             "iPhone 从别的应用跳过来时，屏幕左上角时间下面会出现「◀ 应用名」，那是回到上一个应用的快捷按钮，"
@@ -347,8 +353,10 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
         f"今天还能点赞 {quota.likes} 次、评论 {quota.comments} 条、关注 {quota.follows} 个。\n" if quota else ""
     )
     request_text = ""
+    if context.earlier_requests:
+        request_text = f"对方这次在聊天里提过：{'；'.join(context.earlier_requests)}。还没做完的接着做。\n"
     if context.requests:
-        request_text = (
+        request_text += (
             f"对方刚在聊天里让你：{'；'.join(context.requests)}。"
             "这比原来的打算优先，先照着做；做不到就在 thought 里说为什么。\n"
         )

@@ -7,6 +7,7 @@ from typing import Any, Dict, List, Tuple
 
 import asyncio
 import json
+import threading
 
 _HISTORY_LIMIT = 30
 
@@ -45,6 +46,11 @@ class UsageStore:
         self._history: List[SessionRecord] = []
         # 加载时发现记录文件损坏、已备份重来的说明，没出问题是空字符串
         self.recovered = ""
+        # 每步都会保存。写文件的线程停不下来：保存被取消（叫停时）后它还在写，
+        # 所以按序号排先后，线程里加锁一次只写一个，旧的快照晚到也不会盖掉新的
+        self._write_lock = threading.Lock()
+        self._saved_version = 0
+        self._written_version = 0
 
     @property
     def history(self) -> List[SessionRecord]:
@@ -67,24 +73,32 @@ class UsageStore:
         self._date, self._sessions, self._steps = date, sessions, steps
         self._interactions, self._history = interactions, history
 
-    def _write(self) -> None:
-        self._path.parent.mkdir(parents=True, exist_ok=True)
-        payload = {
+    def _snapshot(self) -> Dict[str, Any]:
+        return {
             "date": self._date,
             "sessions": self._sessions,
             "steps": self._steps,
-            "interactions": self._interactions,
+            "interactions": dict(self._interactions),
             "history": [record.to_dict() for record in self._history],
         }
-        temp_path = self._path.with_suffix(".tmp")
-        temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-        temp_path.replace(self._path)
+
+    def _write(self, version: int, payload: Dict[str, Any]) -> None:
+        with self._write_lock:
+            if version <= self._written_version:
+                return
+            self._path.parent.mkdir(parents=True, exist_ok=True)
+            temp_path = self._path.with_suffix(".tmp")
+            temp_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+            temp_path.replace(self._path)
+            self._written_version = version
 
     async def load(self) -> None:
         await asyncio.to_thread(self._read)
 
     async def save(self) -> None:
-        await asyncio.to_thread(self._write)
+        # 快照在事件循环里取，线程里不碰正在变的数据
+        self._saved_version += 1
+        await asyncio.to_thread(self._write, self._saved_version, self._snapshot())
 
     def _roll(self, today: str) -> None:
         if self._date != today:

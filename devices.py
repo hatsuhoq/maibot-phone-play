@@ -338,7 +338,8 @@ class AdbDevice(PhoneDevice):
             raise DeviceError(f"读取界面元素失败：{output.strip() or '没有输出'}")
         xml_text = (await self._adb("exec-out", "cat", _UI_DUMP_PATH)).decode("utf-8", errors="replace")
         try:
-            return parse_uiautomator_xml(xml_text, width, height, limit)
+            # 复杂界面的 XML 解析要几十毫秒，放进线程，别卡住宿主的事件循环
+            return await asyncio.to_thread(parse_uiautomator_xml, xml_text, width, height, limit)
         except ValueError as exc:
             raise DeviceError(str(exc)) from exc
 
@@ -582,7 +583,7 @@ class WdaDevice(PhoneDevice):
         if not isinstance(xml_text, str):
             raise DeviceError("WebDriverAgent 返回的界面树无效")
         try:
-            return parse_wda_xml(xml_text, width, height, scale, limit)
+            return await asyncio.to_thread(parse_wda_xml, xml_text, width, height, scale, limit)
         except ValueError as exc:
             raise DeviceError(str(exc)) from exc
 

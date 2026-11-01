@@ -5,6 +5,8 @@ import asyncio
 import json
 import logging
 import pytest
+import threading
+import time
 
 from phone_play.agent import PhoneAgent, PlayRefused, Session, in_active_hours
 from phone_play.devices import DeviceError
@@ -186,8 +188,8 @@ async def test_long_videos_are_not_swiped_like_short_videos(tmp_path):
     # 滑动说明和示例都不再暗示上滑就是下一个视频
     assert "看下一条、往下翻" not in system_text
     assert '"summary":"刷下一个视频"' not in system_text
-    # 实测她在抖音上对同一条视频连点四次赞，点一次赞、再点一次又取消了
-    assert "同一条视频只点一次" in system_text
+    # 没开互动时不能点赞，也不教她怎么点赞（之前写着「除了点赞不做其它互动」）
+    assert "不要点赞" in system_text and "同一条视频只点一次" not in system_text
     # 实测 B 站弹出求好评的框时，她连着四步去点弹窗后面的搜索框
     assert "后面的东西都点不到" in system_text
 
@@ -662,6 +664,8 @@ async def test_she_can_like_comment_and_follow_on_her_own_account(tmp_path):
     assert "不发布内容、不和别人互动" not in harness.plan_prompts[0]
     assert '"action":"comment"' in system_text and '"action":"follow"' in system_text
     assert "不要发评论" not in system_text
+    # 实测她在抖音上对同一条视频连点四次赞，点一次赞、再点一次又取消了
+    assert "同一条视频只点一次" in system_text
     # 额度紧挨着截图说，每用一次就少一次
     states = harness.state_texts()
     assert "今天还能点赞 30 次、评论 5 条、关注 3 个" in states[0]
@@ -1028,3 +1032,211 @@ async def test_long_wait_watches_the_screen_without_calling_the_model(tmp_path, 
     # 开头打开应用后等 3 秒；没变化时等满 120 秒，画面变了第三次比对（9 秒）就醒
     assert harness.seconds == (3 + 9 if woke_early else 3 + 120)
     assert "在联机游戏的房间里（好友房、组队房间）等别人进来" in harness.vision_messages[0][0]["content"]
+
+
+class SlowHomePhone(FakeDevice):
+    """回桌面要等一会儿（真机上是一次网络请求）。"""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.going_home = asyncio.Event()
+
+    async def press_key(self, key) -> None:
+        if key == "home":
+            self.going_home.set()
+            await asyncio.sleep(0.2)
+        await super().press_key(key)
+
+
+async def test_stopping_while_she_is_wrapping_up_does_not_get_stuck(tmp_path):
+    # 实测她自己结束、正在回桌面时聊天里正好叫停，状态一直停在「正在玩」，再也开始不了
+    harness = Harness(tmp_path, SlowHomePhone(), [action(action="finish", summary="看完了，回桌面歇会儿")] * 2)
+    await harness.agent.start(trigger="command")
+    await asyncio.wait_for(harness.device.going_home.wait(), 5)
+    assert await harness.agent.stop("在聊天中放下了手机") is True
+    assert harness.agent.state == "idle" and harness.agent._session is None
+    assert ("key", "home") in harness.device.actions()
+    await harness.agent.start(trigger="command")
+    await harness.wait_done()
+
+
+async def test_switching_to_a_keep_open_game_counts_at_the_end(tmp_path):
+    # 先开普通应用、再切去联机游戏进了房间：结束时按游戏算，不回桌面（回桌面会退出房间）
+    config = PhonePlayConfig()
+    config.safety.allowed_apps = [
+        AllowedApp(package="tv.danmaku.bili", name="哔哩哔哩"),
+        AllowedApp(package="com.xingin.xhs", name="斗地主", keep_open=True),
+    ]
+    device = FakeDevice(foregrounds=["tv.danmaku.bili"])
+    device.default_foreground = "com.xingin.xhs"
+    harness = Harness(
+        tmp_path,
+        device,
+        [action(action="launch", app="com.xingin.xhs"), action(action="finish", summary="在房间里等人，先这样")],
+        config=config,
+    )
+    await harness.run()
+    assert ("key", "home") not in harness.device.actions()
+    assert harness.agent._last_package == "com.xingin.xhs"
+
+
+async def test_action_is_skipped_if_the_foreground_left_allowed_apps_while_deciding(tmp_path):
+    # 模型想的这几秒里广告跳到了别的应用：做之前再看一次前台，不在白名单里就不做
+    harness = Harness(
+        tmp_path,
+        FakeDevice(foregrounds=["tv.danmaku.bili", "com.android.settings"]),
+        [action(action="swipe", direction="up", summary="刷下一个"), action(action="finish")],
+    )
+    await harness.run()
+    assert not any(call[0] == "swipe" for call in harness.device.actions())
+    assert "做之前前台变成了 com.android.settings" in harness.state_texts()[1]
+
+
+async def test_comment_needs_text_input_allowed(tmp_path):
+    config = interaction_config()
+    config.safety.allow_text_input = False
+    harness = Harness(
+        tmp_path,
+        FakeDevice(elements=interaction_elements(), input_focus=True),
+        [action(action="comment", element=3, text="好圆"), action(action="finish")],
+        config=config,
+    )
+    await harness.run()
+    assert harness.device.typed == ""
+    assert "配置不允许输入文字，不能写评论" in harness.state_texts()[1]
+    # 关了文字输入就不教她评论
+    assert '"action":"comment"' not in harness.vision_messages[0][0]["content"]
+
+
+async def test_usage_is_saved_while_playing_not_only_at_the_end(tmp_path):
+    # 之前次数、步数只在结束时保存，玩到一半宿主崩溃就丢了
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="看了一会儿猫猫视频")])
+    seen: List[Dict[str, Any]] = []
+    original = harness.vision
+
+    async def vision(messages):
+        seen.append(json.loads((tmp_path / "usage.json").read_text(encoding="utf-8")))
+        return await original(messages)
+
+    harness.agent._vision = vision
+    await harness.run()
+    assert seen[0]["sessions"] == 1 and seen[0]["steps"] == 1
+
+
+async def test_changing_device_config_mid_session_ends_it(tmp_path):
+    # 接着玩会操作旧手机、截图和回桌面却发给新手机
+    harness = Harness(tmp_path, FakeDevice(), [action(action="wait", seconds=5), action(action="finish")])
+    original = harness.vision
+
+    async def vision(messages):
+        harness.config.device.serial = "127.0.0.1:5555"
+        return await original(messages)
+
+    harness.agent._vision = vision
+    record = await harness.run()
+    assert record.end_reason == "设备配置改了，这次先停下"
+    assert len(harness.vision_messages) == 1
+
+
+async def test_earlier_requests_stay_visible_after_history_scrolls(tmp_path):
+    # 「退出房间，再打一局」这种要求，操作记录一长就被挤掉了
+    config = PhonePlayConfig()
+    config.play.history_steps = 1
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [action(action="wait", seconds=1)] * 3 + [action(action="finish")],
+        config=config,
+    )
+    original = harness.vision
+
+    async def vision(messages):
+        if len(harness.vision_messages) == 0:
+            harness.agent.add_request("退出房间，再打一局")
+        return await original(messages)
+
+    harness.agent._vision = vision
+    await harness.run()
+    assert "对方刚在聊天里让你：退出房间，再打一局" in harness.state_texts()[1]
+    assert "对方这次在聊天里提过：退出房间，再打一局。还没做完的接着做" in harness.state_texts()[3]
+
+
+async def test_cancelled_save_never_overwrites_newer_data(tmp_path):
+    # 叫停时保存被取消，写文件的线程却停不下来；它晚写完时不能把后面存的新记录盖回旧的
+    path = tmp_path / "usage.json"
+    store = UsageStore(path)
+    started, release = threading.Event(), threading.Event()
+    original = store._write
+
+    def slow_first_write(version: int, payload: Dict[str, Any]) -> None:
+        if version == 1:
+            started.set()
+            release.wait(5)
+        original(version, payload)
+
+    store._write = slow_first_write
+    store.add_session("2026-11-01")
+    first = asyncio.create_task(store.save())
+    await asyncio.to_thread(started.wait, 5)
+    first.cancel()
+    await asyncio.wait({first})
+    store.add_session("2026-11-01")
+    store.add_step("2026-11-01")
+    await store.save()
+    release.set()
+    await asyncio.sleep(0.2)
+    data = json.loads(path.read_text(encoding="utf-8"))
+    assert (data["sessions"], data["steps"]) == (2, 1)
+
+
+@pytest.mark.parametrize(
+    "foregrounds,default,swiped", [(["tv.danmaku.bili", ""], "tv.danmaku.bili", False), ([], "", True)]
+)
+async def test_unknown_foreground_right_before_acting(tmp_path, foregrounds, default, swiped):
+    # 刚才认得出、做之前认不出（切应用、系统界面）就先不做；一直认不出的设备照常做，不然玩不了
+    device = FakeDevice(foregrounds=foregrounds)
+    device.default_foreground = default
+    harness = Harness(tmp_path, device, [action(action="swipe", direction="up"), action(action="finish")])
+    await harness.run()
+    assert any(call[0] == "swipe" for call in harness.device.actions()) is swiped
+    assert ("做之前看不出现在在哪个应用" in harness.state_texts()[1]) is not swiped
+
+
+class HangingPhone(FakeDevice):
+    """断开后连接请求一直不返回（真机上要等到请求超时）。"""
+
+    async def ensure_ready(self) -> None:
+        await asyncio.Event().wait()
+
+
+async def test_reconnect_wait_is_bounded_even_if_a_request_hangs(tmp_path, monkeypatch):
+    import phone_play.agent as agent_module
+
+    monkeypatch.setattr(agent_module, "_RECONNECT_SECONDS", 1.0)
+    monkeypatch.setattr(agent_module, "_RECONNECT_INTERVAL", 0.4)
+    harness = Harness(tmp_path, HangingPhone(), [])
+    started = time.perf_counter()
+    assert await asyncio.wait_for(harness.agent._wait_for_device(harness.device), 5) is False
+    assert time.perf_counter() - started < 2
+
+
+async def test_status_and_chat_follow_the_app_she_switched_to(tmp_path):
+    # 切到别的应用后，聊天里的近况、WebUI 也要跟着换，不然又在说没在发生的事
+    device = FakeDevice(foregrounds=["tv.danmaku.bili"])
+    device.default_foreground = "com.xingin.xhs"
+    harness = Harness(
+        tmp_path,
+        device,
+        [action(action="launch", app="com.xingin.xhs", summary="去逛小红书"), action(action="finish")],
+    )
+    seen: List[str] = []
+    original = harness.vision
+
+    async def vision(messages):
+        seen.append(harness.agent.status()["app"] + "|" + harness.agent.activity_text())
+        return await original(messages)
+
+    harness.agent._vision = vision
+    await harness.run()
+    assert seen[0].startswith("哔哩哔哩|正在用手机：哔哩哔哩")
+    assert seen[1].startswith("小红书|正在用手机：小红书")
