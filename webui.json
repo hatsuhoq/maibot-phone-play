@@ -1,6 +1,8 @@
 {
   "schema_version": 2,
-  "required_capabilities": ["custom_pages"],
+  "required_capabilities": [
+    "custom_pages"
+  ],
   "workspace_title": "刷会儿手机",
   "pages": [
     {
@@ -13,24 +15,77 @@
       "entry": "web/live.html",
       "layout": "document",
       "queries": {
-        "status": {"api": "webui_status"},
+        "status": {
+          "api": "webui_status"
+        },
         "frame": {
           "api": "webui_frame",
           "parameters": {
-            "since": {"type": "integer", "minimum": 0}
+            "since": {
+              "type": "integer",
+              "minimum": 0
+            }
           }
+        },
+        "diagnostic": {
+          "api": "webui_diagnostic",
+          "parameters": {
+            "id": {
+              "type": "string",
+              "max_length": 32
+            }
+          }
+        },
+        "memory": {
+          "api": "webui_memory"
         }
       },
       "actions": {
         "start": {
           "api": "webui_start",
           "parameters": {
-            "goal": {"type": "string", "max_length": 100}
+            "goal": {
+              "type": "string",
+              "max_length": 100
+            }
           }
         },
-        "pause": {"api": "webui_pause"},
-        "resume": {"api": "webui_resume"},
-        "stop": {"api": "webui_stop"}
+        "pause": {
+          "api": "webui_pause"
+        },
+        "resume": {
+          "api": "webui_resume"
+        },
+        "stop": {
+          "api": "webui_stop"
+        },
+        "takeover": {
+          "api": "webui_takeover"
+        },
+        "release": {
+          "api": "webui_release"
+        },
+        "clear_diagnostics": {
+          "api": "webui_clear_diagnostics"
+        },
+        "memory_delete": {
+          "api": "webui_memory_delete",
+          "parameters": {
+            "id": {
+              "type": "string",
+              "max_length": 32
+            }
+          }
+        },
+        "memory_clear": {
+          "api": "webui_memory_clear",
+          "parameters": {
+            "kind": {
+              "type": "string",
+              "max_length": 16
+            }
+          }
+        }
       }
     }
   ]

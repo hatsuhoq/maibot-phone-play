@@ -7,9 +7,11 @@ from uuid import uuid4
 from maibot_sdk import API, Command, HookHandler, MaiBotPlugin, ON_BOT_CONFIG_RELOAD, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
-from .agent import AgentError, PhoneAgent, PlayRefused
+from .agent import AgentError, ModelReply, PhoneAgent, PlayRefused
 from .devices import DeviceError, create_device
-from .imaging import to_base64
+from .diagnostics import DiagnosticStore
+from .memory import MemoryStore
+from .imaging import jpeg_data_url, to_base64
 from .prompts import Persona
 from .settings import PhonePlayConfig
 from .store import SessionRecord, UsageStore
@@ -20,10 +22,11 @@ _HELP_TEXT = (
     "/手机截图 — 发送当前手机画面\n"
     "/手机 开始 [想做的事] — 去玩手机，例如 /手机 开始 刷B站看猫猫；不写则自己决定\n"
     "/手机 暂停 · /手机 继续 · /手机 停止\n"
+    "/手机 接管 — 你来操作手机，她马上停手、自动玩也不会抢；/手机 交还 — 交还给她，她看看现在的画面再接着玩\n"
     "实时观看：WebUI 侧边栏「插件扩展」里的「手机实时画面」"
 )
 # /手机、/手机截图、/手机 开始 刷B站 都能匹配；/手机号码 这类普通消息不会被拦截
-_COMMAND_PATTERN = r"^/手机\s*(?P<sub>截图|状态|开始|停止|暂停|继续|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
+_COMMAND_PATTERN = r"^/手机\s*(?P<sub>截图|状态|开始|停止|暂停|继续|接管|交还|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
 # 聊天中叫她去玩手机时，等她决定好玩什么再回话，这样她能说出具体打算
 _PLAN_WAIT_SECONDS = 30.0
 # Maisaka 默认把插件工具放进 tool_search 后面，实测她要先搜一轮才会去玩，对方得催一句。
@@ -38,8 +41,12 @@ def _finish_reason_text(end_reason: str) -> str:
     if end_reason.startswith(("出错", "意外错误", "连续")):
         # 技术细节在 WebUI 的操作记录里，给她看只会被编成别的情况
         return "手机出了点状况，没法接着玩了"
-    if end_reason.startswith(("玩够", "达到", "今天的操作步数")):
+    if end_reason.startswith(("玩够", "达到", "今天的操作步数", "这次的模型调用", "今天的模型调用")):
         return "玩到差不多该放下的时候了"
+    if end_reason.startswith("卡住了"):
+        return "在手机上卡住了，怎么点都没反应，就先放下了"
+    if end_reason.startswith("暂停或接管"):
+        return "中途停下来太久，这次就先不玩了"
     return "被叫停了"
 
 
@@ -52,6 +59,8 @@ class PhonePlayPlugin(MaiBotPlugin):
     def __init__(self) -> None:
         super().__init__()
         self._agent: Optional[PhoneAgent] = None
+        self._diagnostics: Optional[DiagnosticStore] = None
+        self._memory: Optional[MemoryStore] = None
         self._bot_nickname = ""
 
     @property
@@ -72,6 +81,13 @@ class PhonePlayPlugin(MaiBotPlugin):
         await store.load()
         if store.recovered:
             self.ctx.logger.warning(store.recovered)
+        # 失败步骤的诊断画面：只留最近 30 条、3 天内的，加载时顺手清掉过期的
+        self._diagnostics = DiagnosticStore(self.ctx.paths.data_dir / "diagnostics")
+        await self._diagnostics.prune()
+        self._memory = MemoryStore(self.ctx.paths.data_dir / "memory.json")
+        await self._memory.load()
+        if self._memory.recovered:
+            self.ctx.logger.warning(self._memory.recovered)
         self._agent = PhoneAgent(
             config=lambda: self.settings,
             device_factory=create_device,
@@ -81,6 +97,8 @@ class PhonePlayPlugin(MaiBotPlugin):
             store=store,
             notifier=self._notify_finished,
             logger=self.ctx.logger,
+            diagnostics=self._diagnostics,
+            memory=self._memory,
         )
         self._agent.restart_auto_play()
 
@@ -119,7 +137,7 @@ class PhonePlayPlugin(MaiBotPlugin):
             personality = str(await self.ctx.config.get("personality.personality", ""))
         return Persona(nickname=await self._bot_name(), personality=personality, extra=play.extra_persona)
 
-    async def _call_llm(self, prompt: Any, task_name: str, model_name: str, label: str) -> str:
+    async def _call_llm(self, prompt: Any, task_name: str, model_name: str, label: str) -> ModelReply:
         # timeout_ms 由 SDK 的 call_capability 当作等宿主回应的 RPC 超时取走，不会转发给宿主的 llm.generate
         timeout_ms = self.settings.model.llm_timeout_seconds * 1000
         try:
@@ -134,13 +152,22 @@ class PhonePlayPlugin(MaiBotPlugin):
         text = str(result.get("response") or "").strip()
         if not text:
             raise AgentError(f"{label}没有返回内容")
-        return text
+        # 宿主的 token 字段默认是 0：拿不到真实用量时为 0，按「未提供」处理，不估算
+        total = int(result.get("total_tokens") or 0)
+        if total <= 0:
+            return ModelReply(text)
+        return ModelReply(
+            text,
+            prompt_tokens=int(result.get("prompt_tokens") or 0),
+            completion_tokens=int(result.get("completion_tokens") or 0),
+            total_tokens=total,
+        )
 
-    async def _call_vision(self, messages: List[Dict[str, Any]]) -> str:
+    async def _call_vision(self, messages: List[Dict[str, Any]]) -> ModelReply:
         model = self.settings.model
         return await self._call_llm(messages, model.vision_task, model.vision_model, "视觉模型")
 
-    async def _call_planner(self, prompt: str) -> str:
+    async def _call_planner(self, prompt: str) -> ModelReply:
         model = self.settings.model
         return await self._call_llm(prompt, model.planner_task, model.planner_model, "文本模型")
 
@@ -154,13 +181,13 @@ class PhonePlayPlugin(MaiBotPlugin):
             name = await self._bot_name()
             extra = f"\n互动：{interactions}" if interactions else ""
             await self.ctx.send.text(
-                f"📱 {name}放下手机了：{record.app} · {record.goal}\n"
+                f"📱 {name}放下手机了：{record.places_text()} · {record.goal}\n"
                 f"{record.summary}（{record.steps} 步，{record.end_reason}）{extra}",
                 stream_id,
             )
             return
 
-        place = f"和对方一起在{record.app}里" if record.together else f"在{record.app}里"
+        place = f"和对方一起在{record.places_text()}里" if record.together else f"在{record.places_text()}里"
         did = f"用自己的账号{interactions}。" if interactions else ""
         intent = (
             f"你刚放下手机。这次{place}{record.goal}，{_finish_reason_text(record.end_reason)}。"
@@ -246,6 +273,8 @@ class PhonePlayPlugin(MaiBotPlugin):
                 plan = await self.agent.wait_for_plan(_PLAN_WAIT_SECONDS)
             except PlayRefused as exc:
                 return f"现在不能玩手机：{exc}"
+            if plan is None and self.agent.connecting:
+                return f"手机暂时连不上，正在重试；连上了{name}会接着玩。WebUI 的「手机实时画面」能看到重连进度。"
             what = f"打开{plan.app.name}，{plan.goal}（大概 {plan.minutes} 分钟）" if plan else "还在想玩什么"
             return f"好，{name}去玩手机了：{what}。用 /手机截图 或 WebUI 的「手机实时画面」可以看她在做什么。"
         if sub == "停止":
@@ -253,6 +282,14 @@ class PhonePlayPlugin(MaiBotPlugin):
             return f"已经让{name}放下手机了" if stopped else f"{name}现在没在玩手机"
         if sub == "暂停":
             return "已暂停，当前这一步做完后停下" if self.agent.pause() else "现在没有在玩，无法暂停"
+        if sub == "接管":
+            if not self.agent.takeover():
+                return "你已经在操作手机了"
+            return f"好，手机交给你：{name}马上停手，自动玩也不会抢回来。用完发 /手机 交还"
+        if sub == "交还":
+            if not self.agent.release():
+                return f"手机本来就在{name}手里"
+            return f"已交还给{name}" + ("，她看看现在的画面再接着玩" if self.agent.state != "idle" else "")
         # 命令正则只允许上面这些子命令，剩下的就是「继续」
         if self.agent.resume():
             return "继续玩"
@@ -343,6 +380,8 @@ class PhonePlayPlugin(MaiBotPlugin):
         except PlayRefused as exc:
             return {"success": False, "error": f"这次玩不了手机：{exc.chat_text}"}
         if plan is None:
+            if self.agent.connecting:
+                return {"success": True, "content": "手机暂时连不上，正在重试，连上了会接着玩；别说已经在玩了。"}
             return {"success": True, "content": "你拿起了手机，还在想玩什么。"}
         if together:
             # 实测聊天这边不知道手机上玩到哪了，会自己编「该你了」这类进展，和手机上的实际情况对不上
@@ -356,6 +395,33 @@ class PhonePlayPlugin(MaiBotPlugin):
         else:
             content = f"你拿起了手机，打算打开{plan.app.name}：{plan.goal}（大概玩 {plan.minutes} 分钟）。"
         return {"success": True, "content": content}
+
+    @Tool(
+        "remember_for_phone",
+        description=(
+            "记住对方亲口说的、和你玩手机有关的兴趣或要求，下次玩手机时会想起来。"
+            "比如对方说「我喜欢看种田小说」「下次接着看那本《XX》」时使用；"
+            "只记对方明确说的话，不要记你自己猜的，也不要记手机画面上看到的（那些手机上的你会自己记）。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="note",
+                param_type=ToolParamType.STRING,
+                description="对方说的兴趣或要求，用一句话写清楚，例如「对方喜欢看种田小说」",
+                required=True,
+            )
+        ],
+    )
+    async def tool_remember_for_phone(self, note: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """把对方亲口说的兴趣记进内容记忆，来源标成「对方说过」。"""
+        del kwargs
+        if self._memory is None:
+            return {"success": False, "error": "插件还没加载完"}
+        if not note.strip():
+            return {"success": False, "error": "没有要记的内容"}
+        item = self._memory.remember_interest(note, datetime.now())
+        await self._memory.save()
+        return {"success": True, "content": f"记住了：{item.title}。下次玩手机时会想起来。"}
 
     @Tool(
         "show_phone_screen",
@@ -496,6 +562,61 @@ class PhonePlayPlugin(MaiBotPlugin):
         if not self.agent.pause():
             raise ValueError("现在没有在玩，无法暂停")
         return {"paused": True}
+
+    @API("webui_diagnostic", description="WebUI：查看一条失败诊断", version="1")
+    async def webui_diagnostic(self, id: str = "") -> Dict[str, Any]:
+        store = self._diagnostics
+        if store is None:
+            raise ValueError("插件还没加载完")
+        entry = next((item for item in await store.entries() if item["id"] == id), None)
+        image = await store.image(id) if entry else None
+        if entry is None or image is None:
+            raise ValueError("这条诊断已经过期或被清理了")
+        return {"entry": entry, "image": jpeg_data_url(image)}
+
+    @API("webui_clear_diagnostics", description="WebUI：清理失败诊断", version="1")
+    async def webui_clear_diagnostics(self) -> Dict[str, Any]:
+        if self._diagnostics is None:
+            raise ValueError("插件还没加载完")
+        return {"cleared": await self._diagnostics.clear()}
+
+    @API("webui_memory", description="WebUI：查看内容记忆", version="1")
+    async def webui_memory(self) -> Dict[str, Any]:
+        if self._memory is None:
+            raise ValueError("插件还没加载完")
+        return {"items": [item.to_dict() for item in self._memory.items()]}
+
+    @API("webui_memory_delete", description="WebUI：删除一条内容记忆", version="1")
+    async def webui_memory_delete(self, id: str = "") -> Dict[str, Any]:
+        if self._memory is None:
+            raise ValueError("插件还没加载完")
+        if not self._memory.delete(id):
+            raise ValueError("这条记忆已经不在了")
+        await self._memory.save()
+        return {"deleted": id}
+
+    @API("webui_memory_clear", description="WebUI：清空内容记忆", version="1")
+    async def webui_memory_clear(self, kind: str = "") -> Dict[str, Any]:
+        """全部删掉；``kind`` 是 watched 时只清空看过的视频。"""
+        if self._memory is None:
+            raise ValueError("插件还没加载完")
+        if kind not in ("", "watched"):
+            raise ValueError(f"不认识的记忆类型：{kind}")
+        cleared = self._memory.clear(kind)
+        await self._memory.save()
+        return {"cleared": cleared}
+
+    @API("webui_takeover", description="WebUI：人工接管手机", version="1")
+    async def webui_takeover(self) -> Dict[str, Any]:
+        if not self.agent.takeover():
+            raise ValueError("你已经在操作手机了")
+        return {"controller": "user"}
+
+    @API("webui_release", description="WebUI：交还手机控制", version="1")
+    async def webui_release(self) -> Dict[str, Any]:
+        if not self.agent.release():
+            raise ValueError("手机本来就在她手里")
+        return {"controller": "bot"}
 
     @API("webui_resume", description="WebUI：继续玩手机", version="1")
     async def webui_resume(self) -> Dict[str, Any]:

@@ -9,6 +9,8 @@
   .header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 16px; }
   .header h1 { margin: 0; font-size: 20px; }
   .badge-playing { background: var(--maibot-primary, #2563eb); color: var(--maibot-primary-foreground, #fff); }
+  .badge-user { background: #f59e0b; color: #fff; }
+  .badge-bad { background: var(--maibot-danger, #d33); color: #fff; }
   .phone { position: relative; border: 10px solid #1d1d1f; border-radius: 28px; background: #000; overflow: hidden;
     aspect-ratio: 9 / 19.5; display: flex; align-items: center; justify-content: center; }
   .phone img { width: 100%; height: 100%; object-fit: contain; display: none; }
@@ -16,31 +18,42 @@
   .frame-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 12px; }
   .stack { display: grid; gap: 16px; min-width: 0; }
   .maibot-card { border: 1px solid var(--maibot-border, #8884); border-radius: var(--maibot-radius, 10px); }
-  .maibot-card-header { font-size: 15px; }
+  .maibot-card-header { font-size: 15px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .now-goal { font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
   .thought { margin-top: 10px; padding: 10px 12px; border-radius: var(--maibot-radius, 10px); background: var(--maibot-soft, #8881); overflow-wrap: anywhere; }
   .progress { height: 6px; border-radius: 3px; background: var(--maibot-soft, #8882); overflow: hidden; margin: 10px 0 4px; }
   .progress > div { height: 100%; width: 0; background: var(--maibot-primary, #2563eb); transition: width .3s; }
   .controls { display: flex; flex-wrap: wrap; gap: 8px; }
   .controls input { flex: 1 1 220px; min-width: 0; }
+  .control-note { margin: 8px 0 0; font-size: 12px; }
   .error { color: var(--maibot-danger, #d33); margin: 8px 0 0; overflow-wrap: anywhere; }
   .error:empty { display: none; }
-  .logs { list-style: none; margin: 0; padding: 0; max-height: 420px; overflow-y: auto; }
+  .hint { margin: 6px 0 0; font-size: 12px; overflow-wrap: anywhere; }
+  .hint:empty { display: none; }
+  .logs { list-style: none; margin: 0; padding: 0; max-height: 460px; overflow-y: auto; }
   .logs li { padding: 8px 0; border-bottom: 1px solid var(--maibot-border, #8883); overflow-wrap: anywhere; }
   .logs li:last-child { border-bottom: none; }
-  .logs .row { display: flex; gap: 8px; align-items: baseline; }
+  .logs .row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
   .logs .time { font-family: var(--maibot-font-mono, ui-monospace, monospace); font-size: 12px; flex: none; }
   .logs .failed .summary { color: var(--maibot-danger, #d33); }
   .logs .detail { font-size: 12px; margin-left: 4px; }
+  .diagnostic { margin-top: 8px; padding: 8px; border-radius: var(--maibot-radius, 10px); background: var(--maibot-soft, #8881); font-size: 12px; }
+  .diagnostic img { max-width: 220px; width: 100%; display: block; margin-bottom: 6px; border-radius: 6px; }
+  .small-button { font-size: 12px; padding: 1px 8px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
   .stats .value { font-size: 20px; }
-  .history { list-style: none; margin: 0; padding: 0; }
-  .history li { padding: 6px 0; overflow-wrap: anywhere; }
+  .meta-line { font-size: 12px; margin-top: 6px; overflow-wrap: anywhere; }
+  .history, .memory { list-style: none; margin: 0; padding: 0; }
+  .history li, .memory li { padding: 6px 0; overflow-wrap: anywhere; }
+  .memory li { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
+  .watched-box { margin-top: 10px; }
+  .watched-box summary { cursor: pointer; }
 </style>
 
 <div class="header">
   <h1 id="title">📱 手机</h1>
   <span id="state" class="maibot-badge">连接中</span>
+  <span id="controller" class="maibot-badge"></span>
   <span id="device" class="maibot-muted"></span>
 </div>
 
@@ -68,20 +81,40 @@
         <button id="resume" class="maibot-button">继续</button>
         <button id="stop" class="maibot-button maibot-button-danger">停止</button>
       </div>
+      <div class="controls" style="margin-top: 8px">
+        <button id="takeover" class="maibot-button">我来操作</button>
+        <button id="release" class="maibot-button">交还控制</button>
+      </div>
+      <p id="controlNote" class="control-note maibot-muted"></p>
       <p id="actionError" class="error" role="alert"></p>
       <p id="statusError" class="error" role="status"></p>
     </section>
 
     <section class="maibot-card">
-      <div class="maibot-card-header">现在</div>
-      <div id="goal" class="now-goal">空闲</div>
-      <div id="progressText" class="maibot-muted"></div>
-      <div class="progress"><div id="progressBar"></div></div>
-      <div id="thought" class="thought" hidden></div>
+      <div class="maibot-card-header">
+        <span>连接</span>
+        <span id="connection" class="maibot-badge">—</span>
+      </div>
+      <div id="connectionMeta" class="meta-line maibot-muted"></div>
+      <p id="connectionError" class="error"></p>
+      <p id="connectionHint" class="hint maibot-muted"></p>
     </section>
 
     <section class="maibot-card">
-      <div class="maibot-card-header">操作记录</div>
+      <div class="maibot-card-header">现在</div>
+      <div id="goal" class="now-goal">空闲</div>
+      <div id="visited" class="meta-line maibot-muted"></div>
+      <div id="progressText" class="maibot-muted"></div>
+      <div class="progress"><div id="progressBar"></div></div>
+      <div id="thought" class="thought" hidden></div>
+      <div id="sessionStats" class="meta-line maibot-muted"></div>
+    </section>
+
+    <section class="maibot-card">
+      <div class="maibot-card-header">
+        <span>操作记录</span>
+        <button id="clearDiagnostics" class="maibot-button small-button">清理诊断</button>
+      </div>
       <ul id="logs" class="logs"></ul>
     </section>
 
@@ -90,6 +123,7 @@
       <div class="stats">
         <div><div class="maibot-muted">玩了几次</div><div id="sessions" class="value maibot-number">—</div></div>
         <div><div class="maibot-muted">操作步数</div><div id="steps" class="value maibot-number">—</div></div>
+        <div><div class="maibot-muted">模型调用</div><div id="calls" class="value maibot-number">—</div></div>
         <div><div class="maibot-muted">自动玩</div><div id="auto" class="value">—</div></div>
       </div>
       <p id="lastError" class="error"></p>
@@ -99,18 +133,37 @@
       <div class="maibot-card-header">最近玩过</div>
       <ul id="history" class="history"></ul>
     </section>
+
+    <section class="maibot-card">
+      <div class="maibot-card-header">
+        <span>她记得的</span>
+        <span>
+          <button id="refreshMemory" class="maibot-button small-button">刷新</button>
+          <button id="clearMemory" class="maibot-button small-button">全部删除</button>
+        </span>
+      </div>
+      <ul id="memory" class="memory"></ul>
+      <details class="watched-box">
+        <summary>看过的视频<span id="watchedCount"></span></summary>
+        <p class="meta-line maibot-muted">30 天内看过的不会再点开，刷到了会直接划走；想让她重新看可以删掉。</p>
+        <button id="clearWatched" class="maibot-button small-button">清空看过的视频</button>
+        <ul id="watched" class="memory"></ul>
+      </details>
+    </section>
   </div>
 </div>
 
 <script>
 (() => {
   const $ = id => document.getElementById(id);
-  // 宿主同一时间最多允许 2 个请求：轮询只占 1 个，留 1 个给按钮操作
+  // 宿主同一时间最多允许 2 个请求：轮询只占 1 个，按钮、看诊断、刷新记忆共用另 1 个（busy 时不发）
   const FRAME_DELAY_MS = 1000;
   const STATUS_EVERY = 2;
   let frameId = 0;
   let tick = 0;
   let busy = false;
+  let lastStatus = null;
+  const openDiagnostics = new Map();
 
   document.body.classList.add('maibot-page');
 
@@ -121,28 +174,125 @@
     return element;
   }
 
+  function minutes(seconds) {
+    return `约 ${Math.max(1, Math.round(seconds / 60))} 分钟`;
+  }
+
+  function statsText(stats) {
+    if (!stats) return '';
+    const calls = stats.calls;
+    const tokens = stats.tokens.total === null
+      ? 'token 未提供'
+      : `${stats.tokens.total} token${stats.tokens.missing ? `（${stats.tokens.missing} 次未提供）` : ''}`;
+    const seconds = stats.seconds;
+    return `模型调用 ${calls.planner + calls.vision} 次（规划 ${calls.planner}、看屏幕 ${calls.vision}`
+      + `${calls.failed ? `，失败 ${calls.failed}` : ''}）· ${tokens} · 耗时：截图 ${seconds.screenshot}s、`
+      + `读界面 ${seconds.ui}s、模型 ${seconds.model}s、执行 ${seconds.action}s`;
+  }
+
+  function placesText(record) {
+    if (!record.apps || record.apps.length <= 1) return record.app;
+    return record.apps.map(item => `${item.name}（${minutes(item.seconds)}）`).join('、');
+  }
+
+  function setButtons(data) {
+    const active = data.state !== 'idle';
+    const user = data.controller === 'user';
+    $('start').disabled = busy || active || user;
+    $('pause').disabled = busy || data.state !== 'playing';
+    $('resume').disabled = busy || data.state !== 'paused';
+    $('stop').disabled = busy || !active;
+    $('takeover').disabled = busy || user;
+    $('release').disabled = busy || !user;
+    $('clearDiagnostics').disabled = busy;
+    $('refreshMemory').disabled = busy;
+    $('clearMemory').disabled = busy;
+    $('clearWatched').disabled = busy;
+  }
+
+  function renderConnection(connection) {
+    $('connection').textContent = connection.label;
+    $('connection').classList.toggle('badge-playing', connection.state === 'ok');
+    $('connection').classList.toggle('badge-bad', ['failed', 'needs_unlock', 'needs_action', 'config'].includes(connection.state));
+    const parts = [];
+    if (connection.last_ok_at) parts.push(`最近一次连上：${connection.last_ok_at}`);
+    if (connection.state === 'reconnecting') {
+      parts.push(`第 ${connection.attempt} 次没连上，还会再试 ${connection.remaining_seconds} 秒`);
+    }
+    $('connectionMeta').textContent = parts.join(' · ');
+    $('connectionError').textContent = connection.error;
+    $('connectionHint').textContent = connection.hint;
+  }
+
+  function renderDiagnostic(box, data) {
+    box.replaceChildren();
+    const image = document.createElement('img');
+    image.src = data.image;
+    image.alt = '失败时的画面';
+    box.append(image);
+    const entry = data.entry;
+    const lines = [
+      `第 ${entry.step} 步 · ${entry.app || '未知应用'} · ${entry.created_at.replace('T', ' ')}`,
+      entry.action ? `计划：${entry.summary ? `${entry.summary}（${entry.action}）` : entry.action}` : '计划：这一步没有可执行的动作',
+      entry.target ? `目标：${entry.target}` : '',
+      `结果：${entry.result}`,
+    ];
+    for (const line of lines.filter(Boolean)) box.append(text('div', line));
+  }
+
+  async function toggleDiagnostic(id, box) {
+    if (openDiagnostics.has(id)) {
+      openDiagnostics.delete(id);
+      box.hidden = true;
+      return;
+    }
+    if (busy) return;
+    busy = true;
+    try {
+      const data = await maibot.query('diagnostic', { id });
+      openDiagnostics.set(id, data);
+      renderDiagnostic(box, data);
+      box.hidden = false;
+    } catch (error) {
+      $('actionError').textContent = error.message;
+    } finally {
+      busy = false;
+      if (lastStatus) setButtons(lastStatus);
+    }
+  }
+
   function renderStatus(data) {
+    lastStatus = data;
     const name = data.nickname || '';
     $('title').textContent = `📱 ${name}的手机`;
     $('state').textContent = data.state_label;
     $('state').classList.toggle('badge-playing', data.state === 'playing');
+    $('controller').textContent = data.controller_label;
+    $('controller').classList.toggle('badge-user', data.controller === 'user');
     $('device').textContent = data.device;
+    $('controlNote').textContent = data.controller === 'user'
+      ? '你在操作：她不会发任何操作，自动玩也不会开始；用完点「交还控制」，她会看看现在的画面再接着玩。'
+      : '想自己用手机时点「我来操作」，她会马上停手；和「暂停」不同，正在想的这一步也会作废。';
+    renderConnection(data.connection);
 
     const active = data.state !== 'idle';
     $('goal').textContent = active
       ? (data.app ? `${data.app} · ${data.goal}` : '正在想玩什么…')
       : '空闲';
+    const others = (data.visited || []).filter(item => item !== data.app && item !== data.start_app);
+    const moved = [];
+    if (data.page) moved.push(`在${data.page}`);
+    if (data.start_app && data.start_app !== data.app) moved.push(`从${data.start_app}开始`);
+    if (others.length) moved.push(`中途去过${others.join('、')}`);
+    $('visited').textContent = active ? moved.join('，') : '';
     $('progressText').textContent = active
       ? `第 ${data.step}/${data.max_steps} 步 · 已玩 ${data.elapsed_minutes}/${data.max_minutes} 分钟 · ${data.trigger}`
       : '';
     $('progressBar').style.width = active ? `${Math.min(100, data.step / data.max_steps * 100)}%` : '0';
     $('thought').hidden = !data.thought;
     $('thought').textContent = data.thought ? `💭 ${data.thought}` : '';
-
-    $('start').disabled = busy || active;
-    $('pause').disabled = busy || data.state !== 'playing';
-    $('resume').disabled = busy || data.state !== 'paused';
-    $('stop').disabled = busy || !active;
+    $('sessionStats').textContent = active ? statsText(data.session_stats) : '';
+    setButtons(data);
 
     const logs = $('logs');
     logs.replaceChildren();
@@ -157,11 +307,21 @@
       item.append(row);
       if (log.thought) item.append(text('div', `💭 ${log.thought}`, 'detail'));
       if (log.result) item.append(text('div', log.result, 'detail maibot-muted'));
+      if (log.diagnostic) {
+        const button = text('button', '查看当时的画面', 'maibot-button small-button');
+        const box = document.createElement('div');
+        box.className = 'diagnostic';
+        box.hidden = !openDiagnostics.has(log.diagnostic);
+        if (openDiagnostics.has(log.diagnostic)) renderDiagnostic(box, openDiagnostics.get(log.diagnostic));
+        button.onclick = () => toggleDiagnostic(log.diagnostic, box);
+        item.append(button, box);
+      }
       logs.append(item);
     }
 
     $('sessions').textContent = `${data.today.sessions}/${data.today.session_limit}`;
     $('steps').textContent = `${data.today.steps}/${data.today.step_limit}`;
+    $('calls').textContent = `${data.model_calls.today}/${data.model_calls.daily_limit}`;
     $('auto').textContent = data.auto_play
       ? (data.next_auto_check ? `开启 · ${data.next_auto_check}` : '开启')
       : '关闭';
@@ -172,12 +332,56 @@
     if (!data.history.length) history.append(text('li', '还没有玩过', 'maibot-muted'));
     for (const record of data.history) {
       const when = record.started_at.slice(5, 16).replace('T', ' ');
-      const what = record.app ? `${record.app} · ${record.goal}` : '没决定好玩什么';
+      const what = record.app ? `${placesText(record)} · ${record.goal}` : '没决定好玩什么';
       const item = document.createElement('li');
       item.append(text('div', `${when}　${what}`));
       item.append(text('div', `${record.summary}（${record.steps} 步，${record.end_reason}）`, 'maibot-muted'));
+      const stats = statsText(record.stats && record.stats.calls ? record.stats : null);
+      if (stats) item.append(text('div', stats, 'meta-line maibot-muted'));
       history.append(item);
     }
+  }
+
+  const VIDEO_FORMS = { short: '短视频', long: '长视频' };
+
+  function memoryRow(memory) {
+    const item = document.createElement('li');
+    const work = `${memory.app ? `${memory.app}：` : ''}《${memory.title}》${memory.detail ? ` ${memory.detail}` : ''}`;
+    const label = memory.kind === 'content' || memory.kind === 'watched'
+      ? work
+      : memory.kind === 'unfinished'
+        ? `上次没做完：${memory.title}${memory.detail ? `（${memory.detail}）` : ''}`
+        : memory.title;
+    const meta = [memory.source_label];
+    if (memory.kind === 'watched') {
+      if (memory.form) meta.push(VIDEO_FORMS[memory.form] || memory.form);
+      if (memory.seconds) meta.push(memory.seconds < 60 ? `看了 ${memory.seconds} 秒` : `看了约 ${Math.round(memory.seconds / 60)} 分钟`);
+    }
+    meta.push(memory.updated_at.replace('T', ' '));
+    const body = document.createElement('div');
+    body.append(text('div', label), text('div', meta.join(' · '), 'meta-line maibot-muted'));
+    const remove = text('button', '删除', 'maibot-button small-button');
+    remove.onclick = () => run('memory_delete', { id: memory.id }, true);
+    item.append(body, remove);
+    return item;
+  }
+
+  function renderMemory(items) {
+    const watched = items.filter(memory => memory.kind === 'watched');
+    const others = items.filter(memory => memory.kind !== 'watched');
+    const list = $('memory');
+    list.replaceChildren();
+    if (!others.length) list.append(text('li', '还没有记住什么', 'maibot-muted'));
+    for (const memory of others) list.append(memoryRow(memory));
+    $('watchedCount').textContent = `（${watched.length}）`;
+    const watchedList = $('watched');
+    watchedList.replaceChildren();
+    if (!watched.length) watchedList.append(text('li', '还没有记下看过的视频', 'maibot-muted'));
+    for (const memory of watched) watchedList.append(memoryRow(memory));
+  }
+
+  async function loadMemory() {
+    renderMemory((await maibot.query('memory')).items);
   }
 
   function renderFrame(data) {
@@ -220,19 +424,23 @@
     }
   }
 
-  async function run(name, args) {
+  async function run(name, args, reloadMemory) {
     if (busy) return;
     busy = true;
     $('actionError').textContent = '';
-    document.querySelectorAll('.controls button').forEach(button => { button.disabled = true; });
+    if (lastStatus) setButtons(lastStatus);
     try {
       await maibot.action(name, args);
       if (name === 'start') $('goalInput').value = '';
+      if (name === 'clear_diagnostics') openDiagnostics.clear();
+      if (reloadMemory) await loadMemory();
+      // 刷新状态也算在这一个名额里，等它回来再放开按钮，免得和轮询加起来超过 2 个
+      renderStatus(await maibot.query('status'));
     } catch (error) {
       $('actionError').textContent = error.message;
     } finally {
       busy = false;
-      try { renderStatus(await maibot.query('status')); } catch (error) { $('actionError').textContent = error.message; }
+      if (lastStatus) setButtons(lastStatus);
     }
   }
 
@@ -240,10 +448,28 @@
   $('pause').onclick = () => run('pause', {});
   $('resume').onclick = () => run('resume', {});
   $('stop').onclick = () => run('stop', {});
+  $('takeover').onclick = () => run('takeover', {});
+  $('release').onclick = () => run('release', {});
+  $('clearDiagnostics').onclick = () => run('clear_diagnostics', {});
+  $('clearMemory').onclick = () => { if (confirm('删除她记得的全部内容（包括看过的视频）？')) run('memory_clear', {}, true); };
+  $('clearWatched').onclick = () => { if (confirm('清空看过的视频？之后她可能会重新点开这些视频。')) run('memory_clear', { kind: 'watched' }, true); };
+  $('refreshMemory').onclick = async () => {
+    if (busy) return;
+    busy = true;
+    try { await loadMemory(); } catch (error) { $('actionError').textContent = error.message; } finally {
+      busy = false;
+      if (lastStatus) setButtons(lastStatus);
+    }
+  };
   $('goalInput').addEventListener('keydown', event => { if (event.key === 'Enter' && !$('start').disabled) $('start').click(); });
 
   maibot.ready.then(async () => {
-    try { renderStatus(await maibot.query('status')); } catch (error) { $('actionError').textContent = error.message; }
+    try {
+      renderStatus(await maibot.query('status'));
+      await loadMemory();
+    } catch (error) {
+      $('actionError').textContent = error.message;
+    }
     void poll();
   });
 })();

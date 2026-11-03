@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime
 from typing import Any, List
 from unittest.mock import AsyncMock
 
@@ -10,6 +11,7 @@ import pytest
 from maibot_sdk.context import PluginContext, PluginPaths
 
 from phone_play import plugin as plugin_module
+from phone_play.actions import Seen
 from phone_play.agent import PlayRefused
 from phone_play.plugin import _COMMAND_PATTERN, create_plugin
 from phone_play.settings import AllowedApp, PhonePlayConfig
@@ -62,6 +64,8 @@ def make_plugin(tmp_path, **overrides: Any):
         ("/手机 开始 刷B站看猫猫", "开始", "刷B站看猫猫"),
         ("/手机开始", "开始", None),
         ("/手机 停止 ", "停止", None),
+        ("/手机 接管", "接管", None),
+        ("/手机 交还", "交还", None),
         ("/手机 乱说", None, "乱说"),
     ],
 )
@@ -84,6 +88,7 @@ async def test_components_and_lifecycle(tmp_path):
             "phone",
             "play_phone",
             "show_phone_screen",
+            "remember_for_phone",
             "phone_activity",
             "stop_phone",
             "phone_play_planner_context",
@@ -94,6 +99,13 @@ async def test_components_and_lifecycle(tmp_path):
             "webui_stop",
             "webui_pause",
             "webui_resume",
+            "webui_takeover",
+            "webui_release",
+            "webui_diagnostic",
+            "webui_clear_diagnostics",
+            "webui_memory",
+            "webui_memory_delete",
+            "webui_memory_clear",
         ]
     )
     # 去玩、问近况、叫停一直在她的工具列表里，不用先 tool_search；看屏幕按需搜索
@@ -107,6 +119,7 @@ async def test_components_and_lifecycle(tmp_path):
         "phone_activity": "visible",
         "stop_phone": "visible",
         "show_phone_screen": None,
+        "remember_for_phone": None,
     }
     # 宿主只把 description 发给模型（detailed_description 已经不用了），用法都要写在这里
     descriptions = {
@@ -375,13 +388,21 @@ async def test_natural_finish_notice_failure_is_raised(tmp_path):
         await plugin._notify_finished(record, "stream-1")
 
 
-async def test_webui_actions_raise_readable_errors(tmp_path):
+async def test_webui_actions_raise_readable_errors(tmp_path, monkeypatch):
+    import phone_play.agent as agent_module
+
+    # 连接放在会话里重试；这里把截止时间调短，连不上很快就结束
+    monkeypatch.setattr(agent_module, "_START_CONNECT_SECONDS", 5.0)
     # 指向没有服务的端口，不管本机有没有真的在跑 WebDriverAgent
     plugin = make_plugin(tmp_path, device={"backend": "ios_wda", "wda_url": "http://127.0.0.1:9"})
     await plugin.on_load()
     try:
-        with pytest.raises(ValueError, match="连不上 iPhone"):
-            await plugin.webui_start(goal="")
+        assert await plugin.webui_start(goal="") == {"started": True}
+        await asyncio.wait_for(plugin.agent._task, 10)
+        status = await plugin.webui_status()
+        assert "连不上 iPhone" in status["last_error"] and status["today"]["sessions"] == 0
+        # 无线、有线都提示到，不再只让人查数据线
+        assert status["connection"]["state"] == "failed" and "pymobiledevice3" in status["connection"]["hint"]
         with pytest.raises(ValueError, match="无法暂停"):
             await plugin.webui_pause()
         assert (await plugin.webui_stop()) == {"stopped": False}
@@ -455,5 +476,151 @@ async def test_chat_sees_phone_state_and_passes_requests_while_playing(tmp_path,
         # 玩完后的一段时间里，提醒她现在没在玩
         after = await plugin.inject_planner_context(items=items, session_id="stream-1")
         assert "现在没在玩手机" in after["modified_kwargs"]["items"][-1]["parts"][0]["text"]
+    finally:
+        await plugin.on_unload()
+
+
+async def test_takeover_and_release_from_commands_and_webui(tmp_path):
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        reply = await plugin._run_command("接管", "", "stream-1", "10001", False)
+        assert reply.startswith("好，手机交给你") and plugin.agent.controller == "user"
+        assert await plugin._run_command("接管", "", "stream-1", "10001", False) == "你已经在操作手机了"
+        status = await plugin.webui_status()
+        assert status["controller"] == "user" and status["controller_label"] == "你在操作"
+        with pytest.raises(ValueError, match="已经在操作"):
+            await plugin.webui_takeover()
+        assert await plugin.webui_release() == {"controller": "bot"}
+        with pytest.raises(ValueError, match="本来就在她手里"):
+            await plugin.webui_release()
+        assert await plugin.webui_takeover() == {"controller": "user"}
+        assert (await plugin._run_command("交还", "", "stream-1", "10001", False)).startswith("已交还给")
+        # 不是管理员不能接管
+        assert "只有管理员" in await plugin._run_command("接管", "", "stream-1", "20002", False)
+    finally:
+        await plugin.on_unload()
+
+
+async def test_failed_step_diagnostic_can_be_viewed_and_cleared(tmp_path, monkeypatch):
+    # 点之前目标没了（StaleTarget）：留一份诊断，WebUI 里能看当时的画面、计划动作和失败原因
+    from conftest import scene_png
+    from phone_play.ui_tree import UIElement
+
+    popup = UIElement(index=1, label="不再提醒", kind="Button", clickable=True, bounds=(40, 1050, 500, 1130))
+    plus = UIElement(index=1, label="投稿", kind="ImageView", clickable=True, bounds=(230, 1060, 310, 1140))
+
+    class Phone(FakeDevice):
+        def __init__(self) -> None:
+            super().__init__()
+            self.shots = 0
+
+        async def screenshot(self) -> bytes:
+            self.shots += 1
+            if self.shots == 1:
+                self.png, self.elements = scene_png(((40, 1050, 500, 1130), "#ffffff")), [popup]
+            else:
+                self.png, self.elements = scene_png(((230, 1060, 310, 1140), "#ff6699")), [plus]
+            return await super().screenshot()
+
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: Phone())
+    plugin = make_plugin(tmp_path)
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    wire_llm(plugin, ['{"action": "tap", "element": 1, "summary": "关掉弹窗"}', '{"action": "finish"}'])
+    await plugin.on_load()
+    plugin.agent._sleep = fast_sleep
+    try:
+        await plugin.webui_start(goal="")
+        await asyncio.wait_for(plugin.agent._task, 5)
+        logs = (await plugin.webui_status())["logs"]
+        failed = next(log for log in logs if log["diagnostic"])
+        detail = await plugin.webui_diagnostic(id=failed["diagnostic"])
+        assert detail["image"].startswith("data:image/jpeg;base64,")
+        entry = detail["entry"]
+        assert entry["action"] == "点击 [1]" and "不再提醒" in entry["target"]
+        assert entry["result"].startswith("没点：「不再提醒」已经不在原来的位置了")
+        assert await plugin.webui_clear_diagnostics() == {"cleared": 1}
+        with pytest.raises(ValueError, match="过期或被清理"):
+            await plugin.webui_diagnostic(id=failed["diagnostic"])
+    finally:
+        await plugin.on_unload()
+
+
+async def test_host_token_usage_reaches_the_session_stats(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    plugin = make_plugin(tmp_path)
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+
+    async def generate(prompt, **kwargs):
+        if isinstance(prompt, str):
+            # 宿主拿不到用量时 token 字段是 0：按未提供处理
+            return {"success": True, "response": PLAN_JSON, "total_tokens": 0}
+        return {
+            "success": True,
+            "response": '{"action": "finish", "summary": "看了两个睦睦的视频，挺开心"}',
+            "prompt_tokens": 3500,
+            "completion_tokens": 80,
+            "total_tokens": 3580,
+        }
+
+    plugin.ctx.llm.generate = generate
+    await plugin.on_load()
+    plugin.agent._sleep = fast_sleep
+    try:
+        await plugin.webui_start(goal="")
+        await asyncio.wait_for(plugin.agent._task, 5)
+        stats = plugin.agent.status()["history"][0]["stats"]
+        assert stats["tokens"] == {"total": 3580, "prompt": 3500, "completion": 80, "missing": 1}
+        assert (await plugin.webui_status())["model_calls"]["today"] == 2
+    finally:
+        await plugin.on_unload()
+
+
+async def test_memory_can_be_added_from_chat_viewed_and_deleted(tmp_path):
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        result = await plugin.tool_remember_for_phone(note="  对方喜欢看 种田小说 ")
+        assert result["content"].startswith("记住了：对方喜欢看 种田小说")
+        items = (await plugin.webui_memory())["items"]
+        assert [(item["kind"], item["source"], item["source_label"]) for item in items] == [
+            ("interest", "user", "对方说过")
+        ]
+        assert await plugin.webui_memory_delete(id=items[0]["id"]) == {"deleted": items[0]["id"]}
+        with pytest.raises(ValueError, match="已经不在"):
+            await plugin.webui_memory_delete(id=items[0]["id"])
+        await plugin.tool_remember_for_phone(note="下次接着看田园小当家")
+        assert await plugin.webui_memory_clear() == {"cleared": 1}
+        assert (await plugin.tool_remember_for_phone(note=" "))["success"] is False
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.parametrize(
+    "end_reason,expected",
+    [
+        ("卡住了：最近 6 步一直在两个画面之间来回切换", "卡住了"),
+        ("这次的模型调用预算用完了（120 次）", "差不多该放下"),
+        ("今天的模型调用预算用完了（1000 次）", "差不多该放下"),
+        ("暂停或接管太久，这次先结束", "停下来太久"),
+        ("被停止", "被叫停了"),
+    ],
+)
+def test_new_end_reasons_get_a_natural_explanation(end_reason, expected):
+    assert expected in plugin_module._finish_reason_text(end_reason)
+
+
+async def test_watched_videos_can_be_cleared_without_forgetting_the_rest(tmp_path):
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        await plugin.tool_remember_for_phone(note="对方喜欢看种田小说")
+        plugin._memory.remember_watched(Seen("video", "迷途之子!!!!!"), "哔哩哔哩", "long", datetime.now())
+        items = (await plugin.webui_memory())["items"]
+        assert sorted((item["kind"], item["form"]) for item in items) == [("interest", ""), ("watched", "long")]
+        assert await plugin.webui_memory_clear(kind="watched") == {"cleared": 1}
+        assert [item["kind"] for item in (await plugin.webui_memory())["items"]] == ["interest"]
+        with pytest.raises(ValueError, match="不认识的记忆类型"):
+            await plugin.webui_memory_clear(kind="everything")
     finally:
         await plugin.on_unload()

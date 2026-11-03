@@ -37,6 +37,9 @@ COORDINATE_SCALE = 1000.0
 # 在游戏房间里等人、等开局时一次可以等这么久；超过 PLAIN_WAIT_SECONDS 的等待期间会截图比对，画面大变就提前醒来
 MAX_WAIT_SECONDS = 120.0
 PLAIN_WAIT_SECONDS = 30.0
+# 看视频时 wait 带上 video：短视频一条一般一两分钟以内，一次最多看这么久，看完再划下一条
+VIDEO_KINDS: Dict[str, str] = {"short": "短视频", "long": "长视频"}
+SHORT_VIDEO_MAX_SECONDS = 60.0
 
 _ACTION_LABELS: Dict[str, str] = {
     "tap": "点击",
@@ -64,6 +67,23 @@ class ActionError(ValueError):
     """动作无法执行；消息会写进操作记录并反馈给模型。"""
 
 
+# 她能记下的内容类型
+SEEN_MEDIA: Dict[str, str] = {"novel": "小说", "video": "视频", "music": "歌"}
+# B 站视频标题最长 80 个字；实测 40 字的上限把「剧场版「BanG Dream! …」」这类标题整个丢掉了
+_SEEN_TITLE_LIMIT = 80
+_SEEN_DETAIL_LIMIT = 30
+
+
+@dataclass(frozen=True)
+class Seen:
+    """她正在看、读、听的内容：画面上清楚写着名字、模型也确认看清了才有，猜的不算。"""
+
+    media: str
+    title: str
+    # 画面上明确写着的章节、集数，没有就是空
+    detail: str = ""
+
+
 @dataclass(frozen=True)
 class PhoneAction:
     """一步手机操作。"""
@@ -78,6 +98,9 @@ class PhoneAction:
     text: str = ""
     app: str = ""
     seconds: float = 0.0
+    seen: Optional[Seen] = None
+    # wait 时在看的视频：short、long，或空（不是在看视频）
+    video: str = ""
 
     def describe(self) -> str:
         label = _ACTION_LABELS[self.kind]
@@ -93,7 +116,7 @@ class PhoneAction:
         if self.kind == "launch":
             return f"打开 {self.app}"
         if self.kind == "wait":
-            return f"看 {self.seconds:g} 秒"
+            return f"看{VIDEO_KINDS.get(self.video, '')} {self.seconds:g} 秒"
         return label
 
 
@@ -181,8 +204,13 @@ def parse_action(response: str) -> PhoneAction:
     if kind == "launch" and not app:
         raise ActionError("launch 需要 app")
     seconds = _optional_number(data, "seconds") or 0.0
+    video = ""
     if kind == "wait":
-        seconds = min(max(seconds, 1.0), MAX_WAIT_SECONDS)
+        video = str(data.get("video") or "").strip().lower()
+        if video and video not in VIDEO_KINDS:
+            raise ActionError("wait 的 video 只能是 short（短视频）或 long（长视频）")
+        limit = SHORT_VIDEO_MAX_SECONDS if video == "short" else MAX_WAIT_SECONDS
+        seconds = min(max(seconds, 1.0), limit)
 
     return PhoneAction(
         kind=kind,
@@ -195,7 +223,21 @@ def parse_action(response: str) -> PhoneAction:
         text=text,
         app=app,
         seconds=seconds,
+        seen=_parse_seen(data.get("seen")),
+        video=video,
     )
+
+
+def _parse_seen(raw: Any) -> Optional[Seen]:
+    """取出她看到的内容名字；没说确定（certain 不是 true）、类型不对、名字太长都当作没有，不当成事实记下。"""
+    if not isinstance(raw, dict) or raw.get("certain") is not True:
+        return None
+    media = str(raw.get("type", "")).strip().lower()
+    title = " ".join(str(raw.get("title", "")).split())
+    detail = " ".join(str(raw.get("detail", "")).split())
+    if media not in SEEN_MEDIA or not 0 < len(title) <= _SEEN_TITLE_LIMIT or len(detail) > _SEEN_DETAIL_LIMIT:
+        return None
+    return Seen(media=media, title=title, detail=detail)
 
 
 def to_pixels(x: float, y: float, width: int, height: int) -> Tuple[int, int]:

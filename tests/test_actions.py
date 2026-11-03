@@ -88,3 +88,35 @@ def test_find_app_by_package_or_name():
     assert find_app(apps, "TV.DANMAKU.BILI") is apps[0]
     assert find_app(apps, "哔哩哔哩") is apps[0]
     assert find_app(apps, "com.tencent.mm") is None
+
+
+def test_seen_is_kept_only_when_the_model_is_certain():
+    seen = '{"type":"novel","title":"田园小当家","detail":"第12章","certain":true}'
+    parsed = parse_action('{"action":"wait","seconds":20,"seen":' + seen + "}")
+    assert parsed.seen is not None and (parsed.seen.media, parsed.seen.title, parsed.seen.detail) == (
+        "novel",
+        "田园小当家",
+        "第12章",
+    )
+    # 没说确定、类型不认识、名字太长：都当作没看清，不记
+    for bad in [
+        '{"type":"novel","title":"田园小当家"}',
+        '{"type":"novel","title":"田园小当家","certain":false}',
+        '{"type":"game","title":"斗地主","certain":true}',
+        '{"type":"video","title":"' + "很" * 81 + '","certain":true}',
+        '"田园小当家"',
+    ]:
+        assert parse_action('{"action":"wait","seconds":20,"seen":' + bad + "}").seen is None
+
+
+def test_wait_can_say_it_is_watching_a_short_or_long_video():
+    short = parse_action('{"action":"wait","seconds":90,"video":"short"}')
+    assert (short.video, short.seconds, short.describe()) == ("short", 60, "看短视频 60 秒")
+    long = parse_action('{"action":"wait","seconds":300,"video":"LONG"}')
+    assert (long.video, long.seconds, long.describe()) == ("long", 120, "看长视频 120 秒")
+    plain = parse_action('{"action":"wait","seconds":5}')
+    assert (plain.video, plain.describe()) == ("", "看 5 秒")
+    # 别的动作带着 video 不管它
+    assert parse_action('{"action":"swipe","direction":"up","video":"short"}').video == ""
+    with pytest.raises(ActionError, match="short（短视频）或 long"):
+        parse_action('{"action":"wait","seconds":5,"video":"movie"}')

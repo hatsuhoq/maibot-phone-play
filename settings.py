@@ -101,10 +101,53 @@ class AllowedApp(PluginConfigBase):
     )
     name: str = Field(default="", description="显示名称，例如 哔哩哔哩")
     note: str = Field(default="", description="给 Bot 看的用途说明，例如 刷视频、看番")
+    # 下面这些都可以留默认值，按全局设置走；配置文件写不了空值，所以用 0、default 表示「跟随全局」
+    step_interval_seconds: float = Field(
+        default=0,
+        ge=0,
+        le=60,
+        description="在这个应用里每步操作后等几秒；0 表示用全局的 play.step_interval_seconds（最少 0.5 秒）",
+    )
+    max_minutes: int = Field(
+        default=0,
+        ge=0,
+        le=240,
+        description="这个应用一次最多玩几分钟；0 表示用全局上限。填了也不会超过全局的 max_session_minutes"
+        "（一起玩时是 together_minutes）",
+    )
+    reopen_on_start: Literal["default", "yes", "no"] = Field(
+        default="default",
+        description="打开时先关掉、从首页开始吗：default 按全局 fresh_start（15 分钟内再开同一个应用会接着上次）；"
+        "yes 总是重新打开；no 总是接着上次的画面（联机游戏关掉会退出房间、重新加载）",
+    )
+    go_home_after: Literal["default", "yes", "no"] = Field(
+        default="default",
+        description="玩完回桌面吗：default 按全局 go_home_after；yes 回；no 留在这个应用（联机游戏回桌面会退出房间）。"
+        "按结束时实际在用的应用算",
+    )
     keep_open: bool = Field(
         default=False,
-        description="玩完不回桌面，下次打开也不先关掉、接着上次的画面。适合联机游戏：回桌面、关掉会退出房间，重新打开要加载很久",
+        description="旧选项，相当于 reopen_on_start=no 加 go_home_after=no；单独设置了那两项时以那两项为准",
     )
+
+    @field_validator("step_interval_seconds")
+    @classmethod
+    def validate_step_interval(cls, value: float) -> float:
+        if 0 < value < 0.5:
+            raise ValueError("step_interval_seconds 填 0（跟随全局）或者 0.5 到 60 之间的秒数")
+        return value
+
+    def reopens(self, default: bool) -> bool:
+        """打开时要不要先关掉；``default`` 是这个应用没单独设置时的结果。"""
+        if self.reopen_on_start != "default":
+            return self.reopen_on_start == "yes"
+        return False if self.keep_open else default
+
+    def goes_home(self, default: bool) -> bool:
+        """玩完要不要回桌面；``default`` 是全局的 go_home_after。"""
+        if self.go_home_after != "default":
+            return self.go_home_after == "yes"
+        return False if self.keep_open else default
 
 
 def _default_allowed_apps() -> List[AllowedApp]:
@@ -181,6 +224,15 @@ class PlaySettings(PluginConfigBase):
     )
     daily_session_limit: int = Field(default=8, ge=1, le=200, description="每天最多玩几次")
     daily_step_limit: int = Field(default=600, ge=1, le=20000, description="每天最多操作多少步（每步一次识图调用）")
+    max_model_calls_per_session: int = Field(
+        default=120,
+        ge=1,
+        le=2000,
+        description="一次最多调用几次模型：决定玩什么和每步看屏幕都算，失败的也算（宿主内部的自动重试看不到，不算）；用完就结束这次",
+    )
+    daily_model_call_limit: int = Field(
+        default=1000, ge=1, le=50000, description="每天最多调用几次模型，口径同上；用完今天就不再玩"
+    )
     max_consecutive_errors: int = Field(default=3, ge=1, le=20, description="连续出错多少次后结束本次游玩")
     allow_chat_trigger: bool = Field(
         default=True, description="是否允许 Bot 在聊天中自己决定去玩手机（play_phone 工具）"
@@ -189,6 +241,10 @@ class PlaySettings(PluginConfigBase):
         default=True, description="每次开始玩时先关掉应用再打开，从应用首页开始，不接着上次停下的页面"
     )
     go_home_after: bool = Field(default=True, description="玩完后回到桌面，视频不会在后台一直播放")
+    skip_watched_videos: bool = Field(
+        default=True,
+        description="记住 30 天内看过的视频，不再点开、刷到了直接划走；对方在聊天里点名要看的不拦",
+    )
     finish_notice: Literal["natural", "template", "off"] = Field(
         default="natural",
         description="玩完后在发起的聊天里怎么说：natural=让她用自己的语气随口聊两句（也可能不说）；"

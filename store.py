@@ -1,6 +1,6 @@
 """每日额度与游玩历史的持久化。"""
 
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Dict, List, Tuple
@@ -28,9 +28,27 @@ class SessionRecord:
     together: bool = False
     # 这次用自己的账号做的互动，例如「评论「这只猫好圆」」；旧记录没有这个字段
     interactions: List[str] = field(default_factory=list)
+    # app 是起始应用；apps 是这次实际去过的应用和大致停留秒数 [{"name", "package", "seconds"}]，
+    # last_app 是结束时在用的。旧记录没有这两个字段，按只用了起始应用处理
+    apps: List[Dict[str, Any]] = field(default_factory=list)
+    last_app: str = ""
+    # 这次的模型调用次数、token（宿主给出的才算）和各环节耗时，见 agent 的 SessionStats；旧记录没有
+    stats: Dict[str, Any] = field(default_factory=dict)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
+
+    @classmethod
+    def from_dict(cls, data: Dict[str, Any]) -> "SessionRecord":
+        """读旧版本、新版本写的记录：缺的字段用默认值，不认识的字段忽略，不当成文件损坏。"""
+        names = {item.name for item in fields(cls)}
+        return cls(**{key: value for key, value in data.items() if key in names})
+
+    def places_text(self) -> str:
+        """这次在哪些应用里玩的，例如「欢乐斗地主（约 3 分钟）、哔哩哔哩（约 1 分钟）」；只去了一个就只写名字。"""
+        if len(self.apps) <= 1:
+            return self.app
+        return "、".join(f"{item['name']}（约 {max(1, round(item['seconds'] / 60))} 分钟）" for item in self.apps)
 
 
 class UsageStore:
@@ -43,6 +61,8 @@ class UsageStore:
         self._steps = 0
         # 当天点赞、评论、关注的次数
         self._interactions: Dict[str, int] = {}
+        # 当天调用模型的次数（失败的也算）
+        self._model_calls = 0
         self._history: List[SessionRecord] = []
         # 加载时发现记录文件损坏、已备份重来的说明，没出问题是空字符串
         self.recovered = ""
@@ -63,7 +83,8 @@ class UsageStore:
             data = json.loads(self._path.read_text(encoding="utf-8"))
             date, sessions, steps = str(data["date"]), int(data["sessions"]), int(data["steps"])
             interactions = {str(kind): int(count) for kind, count in data.get("interactions", {}).items()}
-            history = [SessionRecord(**item) for item in data["history"]]
+            model_calls = int(data.get("model_calls", 0))
+            history = [SessionRecord.from_dict(item) for item in data["history"]]
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             # 一个记录文件坏了不该让整个插件加载失败：留个备份，从空记录重新开始
             backup = self._path.with_name(f"{self._path.name}.broken-{datetime.now():%Y%m%d%H%M%S}")
@@ -72,6 +93,7 @@ class UsageStore:
             return
         self._date, self._sessions, self._steps = date, sessions, steps
         self._interactions, self._history = interactions, history
+        self._model_calls = model_calls
 
     def _snapshot(self) -> Dict[str, Any]:
         return {
@@ -79,6 +101,7 @@ class UsageStore:
             "sessions": self._sessions,
             "steps": self._steps,
             "interactions": dict(self._interactions),
+            "model_calls": self._model_calls,
             "history": [record.to_dict() for record in self._history],
         }
 
@@ -106,6 +129,7 @@ class UsageStore:
             self._sessions = 0
             self._steps = 0
             self._interactions = {}
+            self._model_calls = 0
 
     def usage(self, today: str) -> Tuple[int, int]:
         """返回今天的（游玩次数，操作步数）。"""
@@ -128,6 +152,14 @@ class UsageStore:
     def add_interaction(self, today: str, kind: str) -> None:
         self._roll(today)
         self._interactions[kind] = self._interactions.get(kind, 0) + 1
+
+    def model_calls(self, today: str) -> int:
+        self._roll(today)
+        return self._model_calls
+
+    def add_model_call(self, today: str) -> None:
+        self._roll(today)
+        self._model_calls += 1
 
     def add_record(self, record: SessionRecord) -> None:
         self._history = [*self._history, record][-_HISTORY_LIMIT:]

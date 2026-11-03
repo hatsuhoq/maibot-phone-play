@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from .actions import extract_json_object, find_app
+from .pages import BILI_DETAIL, BILI_PLAYER, BILIBILI_PACKAGES
 from .settings import AllowedApp
 from .store import SessionRecord
 from .ui_tree import UIElement
@@ -83,6 +84,44 @@ class DecisionContext:
     requests: Sequence[str] = ()
     # 这次之前已经交给她的要求（最近几条），操作记录一长就会被挤掉
     earlier_requests: Sequence[str] = ()
+    # 这个应用里最近看过的视频标题，刷到了别再看
+    watched: Sequence[str] = ()
+    # 正在看的视频和已经看了多久，例如「《春日影》（长视频），已经看了约 3 分钟」
+    watching: str = ""
+    # 当前应用专门的说明（比如 B 站的播放器是什么样的）
+    app_tips: str = ""
+    # 看过的视频不再看（play.skip_watched_videos）
+    skip_watched: bool = True
+
+
+# 实测 iPhone 上的 B 站（2026 年 11 月）：首页推荐点开的进竖屏播放器，搜索结果点开的进视频详情页，两种页面操作不一样
+_BILIBILI_TIPS = (
+    "B 站：首页、搜索结果里视频卡片的右下角写着时长，卡片上标着「最近看过」的是看过的。"
+    "首页推荐点开的视频进竖屏播放器（上滑换下一个推荐）；搜索结果、相关推荐、UP 主主页点开的进视频详情页"
+    "（上面播放器、下面简介和评论，上滑不换视频）。插件认出是哪种页面时会告诉你。别点全屏按钮，手机会转成横屏。"
+)
+_BILIBILI_PAGE_TIPS: Dict[str, str] = {
+    BILI_PLAYER: (
+        "现在是 B 站的竖屏播放器（从首页推荐点开的样子）：竖着占满屏幕的是短视频，横着放在中间、上下黑边的是长视频；"
+        "上滑就是下一个推荐视频（长视频也一样），想接着看就别上滑；右下角「详情页」进去能看简介、分集和评论。"
+        "看的时候在 seen 里写上画面上的标题（插件读得到时会自己记）。"
+    ),
+    BILI_DETAIL: (
+        "现在是 B 站的视频详情页（从搜索结果、相关推荐、UP 主主页点开的样子）：最上面是播放器，视频在那里播；"
+        "下面是简介和评论（「简介」「评论」两个标签切换），简介里有标题、点赞投币那一排、分集（共几集时可以点下一集）"
+        "和更下面的相关推荐。这里上滑只会翻简介、评论和相关推荐，不会换视频，视频也不会停；"
+        "看视频就用带 video 的 wait 停下来看（横屏的是长视频）。"
+        "想换一个：返回搜索结果点下一个，或者点下面相关推荐里的。"
+        "这个页面的标题插件会自己记下。"
+    ),
+}
+
+
+def app_tips(package: str, page: str = "") -> str:
+    """当前应用、当前页面专门的说明；没有就是空字符串。"""
+    if package not in BILIBILI_PACKAGES:
+        return ""
+    return _BILIBILI_PAGE_TIPS.get(page, _BILIBILI_TIPS)
 
 
 def format_apps(apps: Sequence[AllowedApp]) -> str:
@@ -104,12 +143,23 @@ def build_plan_prompt(
     max_minutes: int,
     together: bool = False,
     interaction: bool = False,
+    memories: Sequence[str] = (),
 ) -> str:
-    """让文本模型决定这次打开哪个应用、做什么、玩多久；``interaction`` 表示开启了用她自己的账号互动。"""
+    """让文本模型决定这次打开哪个应用、做什么、玩多久。
+
+    ``interaction`` 表示开启了用她自己的账号互动；``memories`` 是她记得的内容（看过的、对方说过的、上次没做完的）。
+    """
     recent_text = "\n".join(
-        f"- {record.started_at[5:16].replace('T', ' ')} {record.app}：{record.goal}（{record.summary}）"
+        f"- {record.started_at[5:16].replace('T', ' ')} {record.places_text()}：{record.goal}（{record.summary}）"
         for record in recent
     )
+    memory_text = ""
+    if memories:
+        memory_text = (
+            "你记得的（「画面上看到的」是你从手机画面认出来的，「对方说过」是对方亲口说的）：\n"
+            + "\n".join(f"- {line}" for line in memories)
+            + "\n想接着上次看、接着做的话就照这些挑；不想也可以按兴趣来。\n\n"
+        )
     if hint:
         hint_text = (
             f"这次想做的事：{hint}\n"
@@ -142,6 +192,7 @@ def build_plan_prompt(
         f"现在是 {now:%Y-%m-%d %H:%M}（{_WEEKDAYS[now.weekday()]}），你有一点空闲，打算拿起手机玩一会儿。\n"
         f"手机上可以打开的应用：\n{format_apps(apps)}\n\n"
         f"最近玩过：\n{recent_text or '（还没玩过）'}\n\n"
+        f"{memory_text}"
         f"{hint_text}\n"
         f"{interact_text}"
         f"请决定这次打开哪个应用、想做什么、玩多久（1~{max_minutes} 分钟）。\n"
@@ -225,13 +276,23 @@ def _rules(context: DecisionContext) -> str:
         "一直记着这次想做的事。当前画面和它无关时（比如还停在别的视频、别的搜索结果里），"
         "先返回或回到应用首页，去搜索或找相关内容，不要被眼前的画面带跑。",
         "按自己的兴趣挑内容：首页、推荐里没有感兴趣的，就用搜索找你想看的。"
-        "找到喜欢的视频、歌曲、文章，用 wait 停下来看一会儿；"
+        "找到喜欢的歌曲、文章，用 wait 停下来看一会儿；"
         "点开后发现不感兴趣（带货、广告、营销号、和你的兴趣不沾边的），别硬看：短视频直接划走，长视频、笔记、文章返回列表换一个。"
         "玩够了或想结束时用 finish。",
-        "分清短视频和长视频：短视频是竖着占满整个屏幕、一条接一条的（抖音、B 站竖屏视频），上滑就是下一条；"
-        "长视频是点开后上面播放器、下面简介和评论的页面（B 站点开的普通视频大多是这种），"
-        "上滑只会翻简介和评论，不会换视频。长视频想看就用 wait 多看一会儿；"
+        "看视频分短视频和长视频，wait 要带上 video。"
+        "短视频（竖屏、一两分钟以内，一条接一条）：一眼看出不感兴趣就直接上滑，不用等；"
+        '感兴趣就用 {"action":"wait","seconds":20,"video":"short"} 看完它'
+        "（一次 10~40 秒，按视频长短定），看完上滑看下一条。"
+        "长视频（横屏、几分钟以上）：先用 video 为 long 的 wait 看 20~30 秒，判断喜不喜欢，不喜欢就上滑或返回换一个；"
+        "喜欢就一次看 60~120 秒、一段一段接着看，不用每隔几秒就看一眼；"
+        "十几分钟以上的长视频看到喜欢的部分、看够几分钟就可以换。"
+        "看视频的时候画面一直在变，插件不会因为画面变了叫醒你，看完你定的时间才会再问你。"
+        "长视频如果是点开后上面播放器、下面简介和评论的页面，上滑只会翻简介和评论，不会换视频；"
         "不想看了就返回到视频列表（首页、搜索结果）点别的，或者点下面推荐的视频。",
+        "看视频时在 seen 里写上画面上的视频标题，插件会记下你看过哪些"
+        + (
+            "；看过的视频不要再点开，刷到了就直接划走，除非对方在聊天里点名要你再看。" if context.skip_watched else "。"
+        ),
         "留意最近的操作：同一件事已经做了两三次、画面却没有变化，就换个做法，或者去看别的内容。"
         "一直黑屏或转圈加载时不要干等：往上划到下一个、返回再进或换个入口，实在不行就结束。",
         # 实测和群友打斗地主好友房，她觉得「没等到人」就结束，群友一喊又重开，一上午十一次斗地主有八次这样
@@ -304,9 +365,12 @@ _IOS_BACK_GUIDE = (
 _APP_GUIDE = (
     '{"action":"home"}：回到桌面\n'
     '{"action":"launch","app":"包名"}：打开应用\n'
-    '{"action":"wait","seconds":20}：停下来看一会儿（1~120 秒。看视频一次 20~30 秒，不用每隔几秒就看一眼；'
-    "在游戏房间里等人进来、等开局、等匹配时可以一次等 60~120 秒，有人进来、开局了或聊天里有新要求会提前叫醒你；"
-    "轮到你操作、有倒计时的时候别等这么久）\n"
+    '{"action":"wait","seconds":20}：停下来看一会儿（1~120 秒）。'
+    "在游戏房间里等人进来、等开局、等匹配时可以一次等 60~120 秒，"
+    "有人进来、开局了或聊天里有新要求会提前叫醒你；轮到你操作、有倒计时的时候别等这么久\n"
+    '{"action":"wait","seconds":20,"video":"short"}：看视频。'
+    "video 写 short（短视频，一次最多 60 秒）或 long（长视频，最多 120 秒），"
+    "看的时候画面变了不会叫醒你，聊天里有新要求或跳到了别的应用才会\n"
 )
 _WAIT_TURN_GUIDE = '{"action":"wait_turn"}：等对方操作（对方操作完、画面变了才继续，等待时不用你做什么）\n'
 _ACTION_OUTRO = (
@@ -315,6 +379,10 @@ _ACTION_OUTRO = (
     "每个 JSON 还必须包含：\n"
     '"thought"：你此刻真实的内心想法，一句话，用你自己的口吻；\n'
     '"summary"：这一步在做什么，十个字左右，例如「点开猫猫视频」（finish 除外，见上）。\n'
+    '可以加 "seen"：正在看、读、听的内容在画面上清楚写着名字时（书名、视频标题、歌名）才写，下次能接着看；'
+    "看视频的 wait 能看清标题就都带上，插件靠它记住看过哪些视频，"
+    '例如 {"type":"novel","title":"画面上原样的书名","detail":"第12章","certain":true}；'
+    "type 是 novel、video、music 之一，detail 只写画面上明确写着的章节或集数，没有就不写；看不清、靠猜的不要写。\n"
     '示例：{"thought":"这只橘猫好圆，点开看看","summary":"点开猫猫视频","action":"tap","element":5}'
 )
 
@@ -352,6 +420,14 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
     quota_text = (
         f"今天还能点赞 {quota.likes} 次、评论 {quota.comments} 条、关注 {quota.follows} 个。\n" if quota else ""
     )
+    video_text = ""
+    if context.app_tips:
+        video_text += f"{context.app_tips}\n"
+    if context.watching:
+        video_text += f"正在看：{context.watching}\n"
+    if context.watched:
+        titles = "、".join(f"《{title}》" for title in context.watched)
+        video_text += f"这个应用里你最近看过这些视频，再刷到就直接划走，列表里看到也别点开：{titles}\n"
     request_text = ""
     if context.earlier_requests:
         request_text = f"对方这次在聊天里提过：{'；'.join(context.earlier_requests)}。还没做完的接着做。\n"
@@ -368,6 +444,7 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
         f"已经玩了 {context.elapsed_minutes:.0f} 分钟（打算玩 {context.max_minutes} 分钟），"
         f"这是第 {context.step}/{context.max_steps} 步。\n"
         f"当前前台：{context.foreground or '无法判断'}\n"
+        f"{video_text}"
         f"{unchanged_text}"
         f"{quota_text}"
         f"最近的操作：\n{history_text}\n\n"

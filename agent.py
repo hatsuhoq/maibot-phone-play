@@ -1,28 +1,34 @@
 """玩手机的核心循环：决定玩什么 → 看屏幕 → 做决定 → 执行动作。"""
 
-from collections import deque
-from dataclasses import asdict, dataclass, field
+from collections import Counter, deque
+from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from logging import Logger
 from PIL import Image
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple
+from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import asyncio
 import math
 import random
 import re
 import time
+import weakref
 
 from .actions import (
     PLAIN_WAIT_SECONDS,
+    VIDEO_KINDS,
     ActionError,
     PhoneAction,
+    Seen,
     find_app,
     parse_action,
     resolve_point,
     swipe_points,
 )
 from .devices import AppNotInstalledError, DeviceError, KeyName, PhoneDevice
+from .diagnostics import DiagnosticStore, Mark
+from .memory import MemoryItem, MemoryStore, normalize_title
+from .pages import BILI_DETAIL, BILI_PLAYER, BILIBILI_PACKAGES, PAGE_LABELS, detect_page, marked_watched, page_title
 from .imaging import (
     draw_element_marks,
     encode_jpeg,
@@ -38,6 +44,7 @@ from .prompts import (
     Persona,
     Plan,
     PlanDeclined,
+    app_tips,
     build_decision_messages,
     build_plan_prompt,
     parse_plan,
@@ -47,6 +54,16 @@ from .store import SessionRecord, UsageStore
 from .ui_tree import UIElement, element_at, find_same
 
 STATE_LABELS: Dict[str, str] = {"idle": "空闲", "starting": "准备中", "playing": "正在玩", "paused": "已暂停"}
+CONTROLLER_LABELS: Dict[str, str] = {"bot": "她在操作", "user": "你在操作"}
+CONNECTION_LABELS: Dict[str, str] = {
+    "unknown": "还没连过",
+    "ok": "连接正常",
+    "reconnecting": "重连中",
+    "needs_unlock": "需要解锁",
+    "needs_action": "需要在手机上操作",
+    "config": "配置有误",
+    "failed": "连接失败",
+}
 TRIGGER_LABELS: Dict[str, str] = {"auto": "自己想玩", "chat": "聊天中决定", "command": "命令", "webui": "WebUI"}
 
 _LOG_LIMIT = 60
@@ -63,12 +80,29 @@ _REPEAT_KINDS = frozenset({"tap", "long_press", "like", "follow", "comment", "ty
 _REPEAT_DISTANCE = 25
 # 同一个操作连续做到这么多次，下一步提醒她换个做法
 _REPEAT_WARNING = 3
+# 卡住检测（只看操作和结果，不只看截图像不像）：
+# 连续这么多次点同一个地方、画面一直没变；最近这么多步在两个画面之间来回；最近 8 步里同一种失败出现这么多次
+_STUCK_SAME_TAPS = 5
+_STUCK_PING_PONG = 6
+_STUCK_SAME_FAILURE = 4
+_STUCK_TRACE = 8
+# 判断「又回到同一个画面」「换了一个画面」的缩略图差值
+_SAME_SCREEN_DISTANCE = 3.0
+_OTHER_SCREEN_DISTANCE = 10.0
+# 在页面之间跳转的操作；看视频的等待、刷短视频的滑动、输入文字都不算
+_NAVIGATION_KINDS = frozenset({"tap", "long_press", "back", "launch", "enter"})
+# 只看单纯的点击、长按：评论每次写的不一样，点赞、关注点两次会取消，都不算「点同一个地方」
+_TAP_KINDS = frozenset({"tap", "long_press"})
 _PIXEL_POINT = re.compile(r"\s*\(\d+, \d+\)")
 # 结束时写的总结短于这么多字，就用她看的时候的想法补上
 _SHORT_SUMMARY = 12
 # 玩到一半手机断开时，每隔几秒试一次，最多等多久
 _RECONNECT_INTERVAL = 5.0
 _RECONNECT_SECONDS = 45.0
+# 开始玩时手机暂时连不上（WDA 刚重启、Wi-Fi 抖了一下）最多等这么久；要比聊天里等计划的 30 秒短
+_START_CONNECT_SECONDS = 20.0
+# 暂停、人工接管不算进这次的游玩时长，但从开始到结束最多比计划多这么久，免得忘了交还一直挂着
+_PAUSE_ALLOWANCE_MINUTES = 30
 _PIXEL_SWIPE = re.compile(r"已从 \(\d+, \d+\) 滑到 \(\d+, \d+\)")
 # 评论以她的账号公开发出：链接、@、长串数字（电话、QQ 号）一律不让发，不靠模型自觉
 _COMMENT_FORBIDDEN = re.compile(r"https?://|www\.|\.(com|cn|net)\b|@|\d{6,}", re.IGNORECASE)
@@ -94,10 +128,29 @@ _RESUME_SECONDS = 15 * 60
 # 长等待期间每隔几秒截图比对一次；和等待开始时的缩略图差值超过这个数就算画面大变，提前醒来。
 # 实测欢乐斗地主好友房里人物待机动画最多约 1.1，有人进房间约 2.7，开局（房间换成牌桌）约 19，对局里有人出牌 2~10
 _WAIT_POLL_SECONDS = 3.0
+# 看视频时隔这么久看一眼前台：点到广告跳去了别的应用就提前醒来（画面一直在变，不按画面比对）
+_VIDEO_POLL_SECONDS = 5.0
+# 每一步告诉她这个应用里最近看过的视频，最多这么多个
+_WATCHED_SHOWN = 30
+# 列给她看时每个标题只留前面这么多字，认得出就够了，三十个长标题每步都带上太占 token
+_WATCHED_TITLE_SHOWN = 30
+# 盖住大半个屏幕的元素（比如 B 站播放器整屏的那一格）不是视频卡片，它的文字不拿来比对看没看过
+_CARD_MAX_SCREEN_RATIO = 0.5
 _WAKE_CHANGE_DISTANCE = 2.0
 
-VisionCall = Callable[[List[Dict[str, Any]]], Awaitable[str]]
-TextCall = Callable[[str], Awaitable[str]]
+
+@dataclass(frozen=True)
+class ModelReply:
+    """模型的回答和宿主给出的 token 用量；宿主没给（或给的是 0）时用量为 None，不拿估算冒充。"""
+
+    text: str
+    prompt_tokens: Optional[int] = None
+    completion_tokens: Optional[int] = None
+    total_tokens: Optional[int] = None
+
+
+VisionCall = Callable[[List[Dict[str, Any]]], Awaitable[Union[str, ModelReply]]]
+TextCall = Callable[[str], Awaitable[Union[str, ModelReply]]]
 PersonaProvider = Callable[[], Awaitable[Persona]]
 FinishNotifier = Callable[[SessionRecord, str], Awaitable[None]]
 DeviceFactory = Callable[[DeviceSettings], PhoneDevice]
@@ -123,6 +176,66 @@ class StaleTarget(Exception):
     """点之前画面变了，要点的东西已经不在原处：这一步不点，让她看了新画面再决定。"""
 
 
+class ControlTaken(Exception):
+    """做决定期间对方接管了手机：已经想好的动作作废，交还后按新画面重新决定。"""
+
+
+class SessionEnd(Exception):
+    """按规则有序结束这次（调用预算用完、卡住了），不是出错。"""
+
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
+@dataclass
+class SessionStats:
+    """一次玩手机的模型调用和各环节耗时。调用次数每次尝试算一次（失败的也算），token 只累计宿主给出的。"""
+
+    planner_calls: int = 0
+    vision_calls: int = 0
+    failed_calls: int = 0
+    calls_with_usage: int = 0
+    prompt_tokens: int = 0
+    completion_tokens: int = 0
+    total_tokens: int = 0
+    seconds: Dict[str, float] = field(
+        default_factory=lambda: {"screenshot": 0.0, "ui": 0.0, "model": 0.0, "action": 0.0}
+    )
+
+    @property
+    def calls(self) -> int:
+        return self.planner_calls + self.vision_calls
+
+    def to_dict(self) -> Dict[str, Any]:
+        missing = self.calls - self.calls_with_usage
+        return {
+            "calls": {"planner": self.planner_calls, "vision": self.vision_calls, "failed": self.failed_calls},
+            # 一次都没给就是 None，WebUI 显示「未提供」；部分给了就同时说明有几次没给
+            "tokens": {
+                "total": self.total_tokens if self.calls_with_usage else None,
+                "prompt": self.prompt_tokens if self.calls_with_usage else None,
+                "completion": self.completion_tokens if self.calls_with_usage else None,
+                "missing": missing,
+            },
+            "seconds": {name: round(value, 1) for name, value in self.seconds.items()},
+        }
+
+
+@dataclass
+class ConnectionStatus:
+    """给 WebUI 看的手机连接状态。"""
+
+    # unknown 还没连过、ok 正常、reconnecting 重连中、needs_unlock 要手动解锁、needs_action 要在手机上点允许、
+    # config 配置有误、failed 等到截止时间也没连上
+    state: str = "unknown"
+    last_ok_at: Optional[datetime] = None
+    attempt: int = 0
+    # 这一轮重连的截止时刻（_clock 的值），0 表示没在重连
+    deadline: float = 0.0
+    error: str = ""
+
+
 @dataclass(frozen=True)
 class StepLog:
     """WebUI 和状态里展示的一条操作记录。"""
@@ -134,6 +247,8 @@ class StepLog:
     action: str
     ok: bool
     result: str
+    # 失败步骤的诊断记录编号，WebUI 里点开能看当时的画面
+    diagnostic: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -148,6 +263,16 @@ class Frame:
     width: int
     height: int
     captured_at: datetime
+
+
+@dataclass
+class Visit:
+    """这次去过的一个应用和大致停留的秒数（从切进去到切走，按墙钟算）。"""
+
+    app: AllowedApp
+    seconds: float = 0.0
+    # 正在这个应用里时是切进来的时刻，切走后为 None
+    since: Optional[float] = None
 
 
 @dataclass
@@ -198,10 +323,40 @@ class Session:
     # 这次操作的设备和它的配置：玩到一半改了设备配置，截图、回桌面也还发给这台，下一步前结束这次
     device: Optional[PhoneDevice] = None
     device_key: str = ""
-    # 现在实际在用的应用：她可能中途切到别的应用，keep_open、下次接着玩都按它算
+    # 现在实际在用的应用：她可能中途切到别的应用，结束回不回桌面、下次接着玩、操作节奏都按它算
     current: Optional[AllowedApp] = None
+    # 这次去过的应用，按第一次去的先后；app 是起始应用，current 是现在的应用
+    visits: List[Visit] = field(default_factory=list)
     # 已经在收尾（回桌面、保存记录）：这时再叫停只等它做完，不再取消
     finishing: bool = False
+    # 每次人工接管加一：发出模型调用时记下，返回时对不上就说明中途被接管过，那个决定作废
+    control_epoch: int = 0
+    # 刚交还控制：下一步先把之前的画面比对、重复操作记录清掉，按新画面重新决定
+    handed_back: bool = False
+    # 最近一次失败的原因，连续失败结束时告诉用户卡在哪
+    last_failure: str = ""
+    # 已经提醒过这台手机给不出前台应用
+    foreground_noted: bool = False
+    stats: SessionStats = field(default_factory=SessionStats)
+    # 最近几步的（这一步开始时的画面，做了什么操作，失败的话是什么失败），用来发现卡住了
+    trace: Deque[Tuple[bytes, str, str]] = field(default_factory=lambda: deque(maxlen=_STUCK_TRACE))
+    # 这一步的等待是不是在看视频（short、long），_play 按它决定怎么等
+    wait_video: str = ""
+    # 认出来的页面（见 pages.detect_page），比如 B 站竖屏播放器、视频详情页
+    page: str = ""
+    # 最近认出来的视频（内容记忆里那一条的编号和标题）：点开评论再回来接着看它不算重看
+    video_item: str = ""
+    video_title: str = ""
+    # 连着看的这一段：上一步也是看视频才算接着看；中间点了、滑了、返回了就是新的一段。
+    # 实测换到下一个视频后她没写标题，时长全记到了上一个视频头上，所以没认出标题时 watch_item 是空的
+    watching: bool = False
+    watch_item: str = ""
+    watch_title: str = ""
+    watch_form: str = ""
+    watch_seconds: float = 0.0
+    # 这一步做的操作和失败，_play 收进 trace 后清空
+    step_kind: str = ""
+    step_failure: str = ""
     # 决定好玩什么（或会话提前结束）时置位，供聊天工具等待计划
     planned: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -247,6 +402,95 @@ def _same_action(previous: Optional[PhoneAction], action: PhoneAction) -> bool:
     return action.text == previous.text
 
 
+def _foreground_unknown_text(support: str) -> str:
+    if support == "supported":
+        return "看不出现在在哪个应用（这台手机之前能认出来，这次暂时没认出，等认出来再接着操作）"
+    return "看不出现在在哪个应用（还没确认这台手机能不能识别前台，认出来之前不操作）"
+
+
+def _connection_hint(state: str, device: DeviceSettings) -> str:
+    """连不上时告诉用户该去查什么；无线、有线的 iPhone 都要照顾到，不再一律让人查数据线。"""
+    if state == "needs_unlock":
+        return "请手动解锁手机；手机设了锁屏密码时，WebDriverAgent 自己解不开，最好把自动锁定改成「永不」。"
+    if state == "needs_action":
+        return "请按上面的提示在手机上操作（比如允许 USB 调试），弄好后再开始。"
+    if state == "config":
+        return "请检查插件配置里的设备设置。"
+    if state not in ("reconnecting", "failed"):
+        return ""
+    if device.backend == "ios_wda":
+        return (
+            "无线连接：确认 iPhone 和电脑连着同一个 Wi-Fi、启动 WDA 的 pymobiledevice3 和端口转发还在运行；"
+            "有线连接：确认数据线连好、ios runwda 和 ios forward 还在运行（用脚本启动的就看脚本窗口）。"
+            f"浏览器打开 {device.wda_url}/status 能看到 ready 就是通的。插件不会替你重启它们。"
+        )
+    return "确认模拟器已启动或手机已连好：adb devices 里能看到它；无线调试时确认还在同一个网络、端口没变。"
+
+
+def _watching_text(session: Session) -> str:
+    """正在看的视频和看了多久；没在看视频（或还没看）时是空字符串。"""
+    if not session.watching or session.watch_seconds < 1:
+        return ""
+    seconds = round(session.watch_seconds)
+    spent = f"已经看了 {seconds} 秒" if seconds < 60 else f"已经看了约 {round(seconds / 60)} 分钟"
+    form = VIDEO_KINDS.get(session.watch_form, "视频")
+    if not session.watch_title:
+        return f"这个{form}（没写标题），{spent}"
+    return f"《{session.watch_title}》（{form}），{spent}"
+
+
+def _page_note(page: str, action: PhoneAction) -> str:
+    """按页面说明这一步滑动的结果：详情页里滑是在翻简介和评论，竖屏播放器里滑是换视频。"""
+    if action.kind != "swipe" or action.direction not in ("up", "down"):
+        return ""
+    if page == BILI_DETAIL:
+        return "（在详情页上下滑只是在翻简介、评论和相关推荐，视频没换，还在上面接着播）"
+    if page == BILI_PLAYER:
+        return "（换到了下一个推荐视频）" if action.direction == "up" else "（回到了上一个视频）"
+    return ""
+
+
+def _is_detail_tab(action: PhoneAction, elements: Sequence[UIElement]) -> bool:
+    """点的是详情页的「简介」「评论」标签。"""
+    if action.kind != "tap" or action.element is None:
+        return False
+    element = next((item for item in elements if item.index == action.element), None)
+    return element is not None and (element.label == "简介" or element.label.startswith("评论"))
+
+
+def _card(action: PhoneAction, elements: Sequence[UIElement], width: int, height: int) -> Optional[UIElement]:
+    """要点的那张卡片：点的是没有文字的按钮时看盖住它的卡片；只看能点的元素，整屏那么大的不算卡片。"""
+    try:
+        x, y = resolve_point(action, elements, width, height)
+    except ActionError:
+        return None
+    screen = width * height
+    cards = [
+        element
+        for element in elements
+        if element.label
+        and element.clickable
+        and element.bounds[0] <= x < element.bounds[2]
+        and element.bounds[1] <= y < element.bounds[3]
+        and (element.bounds[2] - element.bounds[0]) * (element.bounds[3] - element.bounds[1])
+        < screen * _CARD_MAX_SCREEN_RATIO
+    ]
+    card = min(
+        cards,
+        key=lambda element: (element.bounds[2] - element.bounds[0]) * (element.bounds[3] - element.bounds[1]),
+        default=None,
+    )
+    return card
+
+
+def _ago(then: datetime, now: datetime) -> str:
+    """「刚才」「今天」「3 天前」。"""
+    days = (now.date() - then.date()).days
+    if days <= 0:
+        return "刚才" if (now - then).total_seconds() < 3600 else "今天"
+    return "昨天" if days == 1 else f"{days} 天前"
+
+
 def _app_name(session: Optional[Session]) -> str:
     """她现在实际在用的应用；中途切到了别的应用，WebUI 和聊天里也跟着换，不然又是在说没在发生的事。"""
     if session is None:
@@ -279,8 +523,12 @@ class PhoneAgent:
         now: Callable[[], datetime] = datetime.now,
         sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
         rng: Callable[[], float] = random.random,
+        diagnostics: Optional[DiagnosticStore] = None,
+        memory: Optional[MemoryStore] = None,
     ) -> None:
         self._config = config
+        self._diagnostics = diagnostics
+        self._memory = memory
         self._device_factory = device_factory
         self._vision = vision
         self._planner = planner
@@ -310,6 +558,12 @@ class PhoneAgent:
         self._last_stream = ""
         self._last_package = ""
         self._last_ended_clock = 0.0
+        # 谁在操作手机：bot 她自己，user 人工接管中（她不发任何操作，自动玩也不会抢回来）
+        self._controller = "bot"
+        self._connection = ConnectionStatus()
+        # 每个设备连接识别前台的能力：supported 认出来过，unsupported 设备明确给不出，没有记录就是还不确定。
+        # 跟着设备对象走：改了设备配置、换了连接，就重新判断
+        self._foreground_support: "weakref.WeakKeyDictionary[PhoneDevice, str]" = weakref.WeakKeyDictionary()
 
         self._device: Optional[PhoneDevice] = None
         self._device_key = ""
@@ -349,9 +603,22 @@ class PhoneAgent:
                 f"今天的操作步数（{config.play.daily_step_limit} 步）已经用完",
                 chat_text="今天玩手机的时间用完了，今天不能再玩",
             )
+        if self._store.model_calls(self._today()) >= config.play.daily_model_call_limit:
+            raise PlayRefused(
+                f"今天的模型调用预算（{config.play.daily_model_call_limit} 次）已经用完",
+                chat_text="今天玩手机的时间用完了，今天不能再玩",
+            )
 
     def _log(
-        self, step: int, summary: str, *, thought: str = "", action: str = "", ok: bool = True, result: str = ""
+        self,
+        step: int,
+        summary: str,
+        *,
+        thought: str = "",
+        action: str = "",
+        ok: bool = True,
+        result: str = "",
+        diagnostic: str = "",
     ) -> None:
         self._logs.append(
             StepLog(
@@ -362,8 +629,51 @@ class PhoneAgent:
                 action=action,
                 ok=ok,
                 result=result,
+                diagnostic=diagnostic,
             )
         )
+
+    async def _record_failure(
+        self,
+        session: Session,
+        step: int,
+        image: Image.Image,
+        action: Optional[PhoneAction],
+        elements: Sequence[UIElement],
+        result: str,
+    ) -> str:
+        """失败步骤存一份诊断：当时的画面（标出要点的位置或滑动方向）、计划动作和目标、结果；没开诊断时返回空串。"""
+        if self._diagnostics is None:
+            return ""
+        mark: Optional[Mark] = None
+        target = ""
+        if action is not None and action.kind in ("tap", "long_press", "like", "follow", "comment"):
+            try:
+                x, y = resolve_point(action, elements, *image.size)
+            except ActionError as exc:
+                target = f"目标无效：{exc}"
+            else:
+                mark = (x, y)
+                element = next((item for item in elements if item.index == action.element), None)
+                target = f"{element.describe()} ({x}, {y})" if element else f"({x}, {y})"
+        elif action is not None and action.kind == "swipe":
+            mark = swipe_points(action, *image.size)
+            target = f"从 ({mark[0]}, {mark[1]}) 滑到 ({mark[2]}, {mark[3]})"
+        current = session.current or session.app
+        info = {
+            "step": step,
+            "app": current.name if current else "",
+            "goal": session.goal,
+            "summary": action.summary if action is not None else "",
+            "action": action.describe() if action is not None else "",
+            "target": target,
+            "result": result,
+        }
+        try:
+            return await self._diagnostics.add(image, mark, info)
+        except OSError as exc:
+            self._logger.warning(f"保存诊断记录失败：{exc}")
+            return ""
 
     def _get_device(self) -> PhoneDevice:
         """返回当前配置对应的设备；设备配置变化后重新创建。"""
@@ -391,6 +701,9 @@ class PhoneAgent:
             "state_label": STATE_LABELS[self._state],
             "trigger": TRIGGER_LABELS[session.trigger] if session else "",
             "app": _app_name(session),
+            "start_app": session.app.name if session and session.app else "",
+            "visited": [visit.app.name for visit in session.visits] if session else [],
+            "page": PAGE_LABELS.get(session.page, "") if session else "",
             "goal": session.goal if session else "",
             "thought": session.last_thought if session else "",
             "step": session.step if session else 0,
@@ -408,6 +721,15 @@ class PhoneAgent:
             "history": [record.to_dict() for record in reversed(self._store.history[-8:])],
             "last_error": self._last_error,
             "device": self._device.description if self._device else "",
+            "controller": self._controller,
+            "controller_label": CONTROLLER_LABELS[self._controller],
+            "connection": self._connection_payload(config),
+            "session_stats": session.stats.to_dict() if session else None,
+            "model_calls": {
+                "today": self._store.model_calls(self._today()),
+                "daily_limit": config.play.daily_model_call_limit,
+                "session_limit": config.play.max_model_calls_per_session,
+            },
             "auto_play": config.auto_play.enabled,
             "next_auto_check": next_check,
         }
@@ -420,8 +742,10 @@ class PhoneAgent:
                 return "正在拿起手机，还在想玩什么。"
             recent = "；".join(_recent_unique(session.summaries, 5)) or "刚打开"
             prefix = "（暂停中）" if self._state == "paused" else ""
+            others = [visit.app.name for visit in session.visits if visit.app.name != _app_name(session)]
+            visited = f"（这次还去过{'、'.join(others)}）" if others else ""
             text = (
-                f"{prefix}正在用手机：{_app_name(session)}，想{session.goal}。"
+                f"{prefix}正在用手机：{_app_name(session)}{visited}，想{session.goal}。"
                 f"已经玩了 {self._elapsed_seconds(session) / 60:.0f} 分钟，最近在：{recent}。"
             )
             thoughts = "；".join(_recent_unique(session.thoughts, 3))
@@ -437,7 +761,7 @@ class PhoneAgent:
             return "现在没在玩手机，最近也没有玩过。"
         last = history[-1]
         sessions_today, _ = self._store.usage(self._today())
-        place = f"在{last.app}里" if last.app else ""
+        place = f"在{last.places_text()}里" if last.app else ""
         text = (
             f"现在没在玩手机。上一次玩手机是 {last.started_at[5:16].replace('T', ' ')}，"
             f"{place}{last.goal or '没决定好玩什么'}："
@@ -460,7 +784,7 @@ class PhoneAgent:
         if session.max_minutes:
             # 实测「去打一把路人局」交过去 44 秒后，这次就因为玩够 5 分钟结束了，手机上的她没来得及做
             config = self._config()
-            limit = config.play.together_minutes if session.together else config.play.max_session_minutes
+            limit = self._minutes_limit(session, session.current or session.app, config)
             needed = math.ceil(self._elapsed_seconds(session) / 60 + max(minutes, _REQUEST_MINUTES))
             session.max_minutes = min(limit, max(session.max_minutes, needed))
         # 正在看视频、等对方时提前醒来，不用等满这一轮
@@ -499,9 +823,10 @@ class PhoneAgent:
     async def start(
         self, *, trigger: str, hint: str = "", origin_stream: str = "", minutes: int = 0, together: bool = False
     ) -> None:
-        """确认手机能用后，在后台开始一次玩手机。
+        """在后台开始一次玩手机。
 
-        手机连不上、没有能玩的应用时直接拒绝，不算作玩了一次。
+        连接手机放在会话里：暂时连不上会在限定时间内重试，期间可以叫停，WebUI 能看到重连进度；
+        连不上、没有能玩的应用时会话直接结束，原因由 ``wait_for_plan`` 抛出，不算作玩了一次。
 
         Args:
             trigger: 触发来源，见 ``TRIGGER_LABELS``。
@@ -511,9 +836,13 @@ class PhoneAgent:
             together: 是否和对方在这台手机上一起玩（对方直接在手机上操作，她轮到对方时等着）。
 
         Raises:
-            PlayRefused: 已经在玩、额度用完、手机连不上或没有能玩的应用时抛出。
+            PlayRefused: 已经在玩、正在人工接管、额度用完时抛出。
         """
         async with self._start_lock:
+            if self._controller == "user":
+                raise PlayRefused(
+                    "你正在操作手机（人工接管中），先交还控制再让她玩", chat_text="对方正在用这台手机，现在不能玩"
+                )
             if self._state != "idle":
                 goal = self._session.goal if self._session else ""
                 raise PlayRefused(
@@ -521,21 +850,7 @@ class PhoneAgent:
                 )
             config = self._config()
             self._check_limits(config)
-            try:
-                device = self._get_device()
-                await device.ensure_ready()
-                installed = await device.installed_packages([app.package for app in config.safety.allowed_apps])
-            except DeviceError as exc:
-                self._last_error = str(exc)
-                self._logger.warning(f"手机连不上，这次没玩成：{exc}")
-                raise PlayRefused(str(exc), chat_text="手机连不上，可能没开机或者没连好") from exc
-            apps = [app for app in config.safety.allowed_apps if app.package in installed]
-            if not apps:
-                raise PlayRefused(
-                    "白名单里的应用都没有安装在手机上，请先安装，或修改插件配置的 allowed_apps",
-                    chat_text="手机上没有你能玩的应用",
-                )
-
+            device = self._get_device()
             session = Session(
                 trigger=trigger,
                 hint=hint.strip(),
@@ -543,7 +858,6 @@ class PhoneAgent:
                 minutes_override=max(0, minutes),
                 started_at=self._now(),
                 started_clock=self._clock(),
-                apps=apps,
                 together=together,
                 device=device,
                 device_key=self._device_key,
@@ -555,8 +869,12 @@ class PhoneAgent:
             self._resume.set()
             self._logs.clear()
             self._log(0, f"拿起手机（{TRIGGER_LABELS[trigger]}）", result=session.hint)
-            self._log(0, f"已连接 {device.description}")
             self._task = asyncio.create_task(self._run(session), name="phone_play_session")
+
+    @property
+    def connecting(self) -> bool:
+        """开始玩时手机暂时连不上、正在重试。"""
+        return self._state == "starting" and self._connection.state == "reconnecting"
 
     async def wait_for_plan(self, timeout: float) -> Optional[Plan]:
         """等待刚开始的会话决定玩什么；超时还没决定好时返回 None。
@@ -605,21 +923,81 @@ class PhoneAgent:
         session = self._session
         if self._state != "playing" or session is None:
             return False
-        session.paused_since = self._clock()
-        self._resume.clear()
         self._state = "paused"
+        self._sync_running()
         self._log(session.step, "暂停")
         return True
 
     def resume(self) -> bool:
         session = self._session
-        if self._state != "paused" or session is None or session.paused_since is None:
+        if self._state != "paused" or session is None:
             return False
-        session.paused_seconds += self._clock() - session.paused_since
-        session.paused_since = None
         self._state = "playing"
-        self._resume.set()
+        self._sync_running()
         self._log(session.step, "继续")
+        return True
+
+    @property
+    def controller(self) -> str:
+        return self._controller
+
+    def takeover(self) -> bool:
+        """人工接管：她马上停手，不再发任何操作（已经发出的模型调用返回后也作废），自动玩不会抢回来。
+
+        和「暂停」的区别：暂停是让她歇一会儿、这一步做完再停；接管是你要亲自用手机，正在想的这一步也不做了。
+        空闲时也能接管，免得你用手机时她自己开始玩。
+        """
+        if self._controller == "user":
+            return False
+        self._controller = "user"
+        session = self._session
+        if session is not None:
+            session.control_epoch += 1
+            self._log(session.step, "你接管了手机，她先停手")
+        self._sync_running()
+        # 正在看视频、等对方的长等待也马上停下
+        self._wake.set()
+        return True
+
+    def release(self) -> bool:
+        """交还控制：她先重新看前台、截图和界面元素，按现在的画面重新决定，不做接管前想好的动作。"""
+        if self._controller == "bot":
+            return False
+        self._controller = "bot"
+        session = self._session
+        if session is not None:
+            session.handed_back = True
+            self._log(session.step, "你交还了控制，她看看现在的画面再接着玩")
+        self._sync_running()
+        return True
+
+    def _sync_running(self) -> None:
+        """按暂停和接管决定会话能不能继续操作；不能操作的时间不算进这次的游玩时长（墙钟上限另算）。"""
+        session = self._session
+        running = self._controller == "bot" and self._state != "paused"
+        if session is not None:
+            if running and session.paused_since is not None:
+                session.paused_seconds += self._clock() - session.paused_since
+                session.paused_since = None
+            elif not running and session.paused_since is None:
+                session.paused_since = self._clock()
+        if running:
+            self._resume.set()
+        else:
+            self._resume.clear()
+
+    async def _wait_running(self, session: Session) -> bool:
+        """暂停或接管时在这里等；超过墙钟上限（计划时长再加 30 分钟）就不等了，返回 False 结束这次。"""
+        while not self._resume.is_set():
+            minutes = session.max_minutes or self._config().play.max_session_minutes
+            remaining = session.started_clock + (minutes + _PAUSE_ALLOWANCE_MINUTES) * 60 - self._clock()
+            if remaining <= 0:
+                session.end_reason = "暂停或接管太久，这次先结束"
+                return False
+            try:
+                await asyncio.wait_for(self._resume.wait(), timeout=remaining)
+            except asyncio.TimeoutError:
+                continue
         return True
 
     def restart_auto_play(self) -> None:
@@ -712,6 +1090,8 @@ class PhoneAgent:
         except asyncio.CancelledError:
             end_reason = self._stop_reason or "被停止"
             raise
+        except SessionEnd as exc:
+            end_reason = exc.reason
         except (AgentError, DeviceError) as exc:
             end_reason = f"出错：{exc}"
             self._last_error = str(exc)
@@ -740,11 +1120,18 @@ class PhoneAgent:
         config = self._config()
         current = session.current or app
         if current is not None:
-            # 用最新配置里的这个应用（玩的时候可能改了 keep_open）
+            # 用最新配置里的这个应用（玩的时候可能改了回不回桌面）
             current = find_app(config.safety.allowed_apps, current.package) or current
+        now = self._clock()
+        for visit in session.visits:
+            if visit.since is not None:
+                visit.seconds += now - visit.since
+                visit.since = None
         try:
             # 回桌面是为了视频别一直放着；联机游戏回桌面会退出房间，别人进来发现她走了
-            if current is not None and config.play.go_home_after and not current.keep_open:
+            # 你接管着手机时不替你回桌面
+            go_home = current is not None and current.goes_home(config.play.go_home_after)
+            if go_home and self._controller == "bot":
                 try:
                     await (session.device or self._get_device()).press_key("home")
                 except DeviceError as exc:
@@ -768,6 +1155,12 @@ class PhoneAgent:
             ended_at=self._now().isoformat(timespec="seconds"),
             trigger=TRIGGER_LABELS[session.trigger],
             app=app.name,
+            apps=[
+                {"name": visit.app.name, "package": visit.app.package, "seconds": round(visit.seconds)}
+                for visit in session.visits
+            ],
+            last_app=current.name if current else app.name,
+            stats=session.stats.to_dict(),
             goal=session.goal,
             summary=summary,
             steps=session.step,
@@ -776,6 +1169,15 @@ class PhoneAgent:
             interactions=_interaction_list(session),
         )
         self._store.add_record(record)
+        if self._memory is not None and session.goal:
+            # 她自己玩够了算做完；时间到了、被叫停、被接管、出错都记成没做完，下次可以接着做
+            if end_reason == "自己不想玩了":
+                self._memory.clear_unfinished()
+            else:
+                self._memory.set_unfinished(
+                    session.goal, current.name if current else app.name, end_reason, self._now()
+                )
+            await self._save_memory()
         try:
             await self._store.save()
             if session.origin_stream and session.notify:
@@ -796,14 +1198,18 @@ class PhoneAgent:
             max_minutes=max_minutes,
             together=session.together,
             interaction=self._interaction_quota(config) is not None,
+            memories=self._memory.prompt_lines(self._now()) if self._memory else (),
         )
-        response = await self._planner(prompt)
+        response = await self._call_model(session, "planner", self._planner, prompt)
         try:
             plan = parse_plan(response, apps, max_minutes)
         except PlanDeclined:
             raise
         except ValueError as exc:
             raise AgentError(f"没能决定玩什么：{exc}") from exc
+        # 应用单独设了更短的上限就按应用；不会超过全局
+        max_minutes = self._minutes_limit(session, plan.app, config)
+        plan = Plan(app=plan.app, goal=plan.goal, minutes=min(plan.minutes, max_minutes))
         if session.together:
             # 一起玩时什么时候结束主要看对方，给满一起玩的时长
             plan = Plan(app=plan.app, goal=plan.goal, minutes=min(session.minutes_override or max_minutes, max_minutes))
@@ -814,7 +1220,24 @@ class PhoneAgent:
     async def _play(self, session: Session) -> None:
         config = self._config()
         device = session.device or self._get_device()
-        apps = session.apps
+        try:
+            await self._connect(device, _START_CONNECT_SECONDS)
+            installed = await device.installed_packages([app.package for app in config.safety.allowed_apps])
+        except DeviceError as exc:
+            # 聊天里只说个大概，完整原因在 WebUI 的连接状态和最近错误里
+            session.decline_text = {
+                "needs_unlock": "手机锁着屏，得先解锁才能玩",
+                "needs_action": "手机那边要先点一下允许，现在玩不了",
+                "config": "手机的设置有问题，现在玩不了",
+            }.get(exc.kind, "手机连不上，可能没开机或者没连好")
+            raise
+        self._log(0, f"已连接 {device.description}")
+        apps = session.apps = [app for app in config.safety.allowed_apps if app.package in installed]
+        if not apps:
+            session.decline_text = "手机上没有你能玩的应用"
+            session.end_reason = "白名单里的应用都没有安装在手机上，请先安装，或修改插件配置的 allowed_apps"
+            self._last_error = session.end_reason
+            return
         home_packages: Set[str] = set()
         try:
             home_packages = await device.home_packages()
@@ -836,8 +1259,11 @@ class PhoneAgent:
                 action=f"打开 {plan.app.package}",
                 result=f"计划玩 {plan.minutes} 分钟",
             )
+            # 想玩什么的时候被接管：等交还了再打开应用
+            if not await self._wait_running(session):
+                return
             try:
-                if config.play.fresh_start and not self._resumes(session, plan.app):
+                if self._should_reopen(session, plan.app, config):
                     await device.stop_app(plan.app.package)
                 await device.launch_app(plan.app.package)
                 break
@@ -851,18 +1277,19 @@ class PhoneAgent:
                     self._last_error = session.end_reason
                     return
         session.app, session.goal, session.max_minutes = plan.app, plan.goal, plan.minutes
-        session.current = plan.app
+        self._enter_app(session, plan.app)
         session.planned.set()
         self._state = "playing"
         # 真正打开应用才算玩了一次；马上存下来，玩到一半宿主崩溃也不会丢
         self._store.add_session(self._today())
         await self._save_usage()
-        await self._sleep(config.play.step_interval_seconds)
+        await self._sleep(self._interval(session, config))
 
         history: Deque[str] = deque(maxlen=config.play.history_steps)
         consecutive_errors = 0
         while True:
-            await self._resume.wait()
+            if not await self._wait_running(session):
+                return
             config = self._config()
             reason = self._stop_check(session, config)
             if reason:
@@ -878,34 +1305,179 @@ class PhoneAgent:
                 ok, finished, wait_seconds = await self._step(
                     device, session, config, apps, home_packages, persona, history
                 )
+            except ControlTaken:
+                # 做决定期间被接管：想好的动作作废，交还后重新看画面
+                self._log(session.step, "接管期间想好的这一步作废了", result="交还控制后按新画面重新决定")
+                continue
             except DeviceError as exc:
+                if not exc.retryable:
+                    raise
                 # 实测 iPhone 一晚上会断开好几次（数据线松动、WDA 被重启），十几秒就恢复；等它恢复再接着玩，等不到才结束
                 self._log(session.step, "手机断开了，等它恢复", ok=False, result=str(exc))
-                if not await self._wait_for_device(device):
-                    raise
+                await self._connect(device, _RECONNECT_SECONDS)
                 self._log(session.step, "手机恢复了，接着玩")
                 history.append(f"第{session.step}步：手机断开了一会儿，刚恢复，先看看现在是什么画面")
                 ok, finished, wait_seconds = False, False, 0.0
             if finished:
                 return
-            consecutive_errors = 0 if ok else consecutive_errors + 1
-            if consecutive_errors >= config.play.max_consecutive_errors:
-                session.end_reason = f"连续 {consecutive_errors} 步操作失败"
+            session.trace.append((session.last_signature, session.step_kind, session.step_failure))
+            session.step_kind, session.step_failure = "", ""
+            stuck = self._stuck_reason(session)
+            if stuck:
+                session.end_reason = f"卡住了：{stuck}"
                 self._last_error = session.end_reason
                 return
-            # 在房间里等人、等开局这种长等待，期间截图比对，有人进来、开局了就提前醒来
-            await self._nap(session, wait_seconds, device if wait_seconds > PLAIN_WAIT_SECONDS else None)
+            consecutive_errors = 0 if ok else consecutive_errors + 1
+            if consecutive_errors >= config.play.max_consecutive_errors:
+                session.end_reason = f"连续 {consecutive_errors} 步操作失败（最后一次：{session.last_failure}）"
+                self._last_error = session.end_reason
+                return
+            if session.wait_video:
+                await self._watch_video(session, wait_seconds, device)
+            else:
+                # 在房间里等人、等开局这种长等待，期间截图比对，有人进来、开局了就提前醒来
+                await self._nap(session, wait_seconds, device if wait_seconds > PLAIN_WAIT_SECONDS else None)
 
-    def _resumes(self, session: Session, app: AllowedApp) -> bool:
-        """这次打开应用时接着上次的画面，不先关掉。
+    @staticmethod
+    def _note_failure(session: Session, text: str, key: str = "") -> None:
+        """记下这一步的失败：``text`` 给用户看，``key`` 用来比对是不是同一种失败（默认就是 text）。"""
+        session.last_failure = text
+        session.step_failure = key or text
+
+    @staticmethod
+    def _stuck_reason(session: Session) -> str:
+        """结合最近的操作和结果看是不是卡住了，卡住时返回卡在哪，没有返回空字符串。
+
+        正常阅读（每次翻页画面都变）、看视频（等待不算）、等对方（wait_turn 不算）都不会误判。
+        """
+        last = session.last_action
+        if (
+            last is not None
+            and last.kind in _TAP_KINDS
+            and session.repeat_count >= _STUCK_SAME_TAPS
+            and session.unchanged_steps >= _STUCK_SAME_TAPS - 1
+        ):
+            return f"连续 {session.repeat_count} 次{last.describe()}，画面一直没变"
+        recent = list(session.trace)[-_STUCK_PING_PONG:]
+        if len(recent) == _STUCK_PING_PONG and all(kind in _NAVIGATION_KINDS for _, kind, _ in recent):
+            screens = [signature for signature, _, _ in recent]
+            back_and_forth = all(
+                signature_distance(screens[index], screens[index - 2]) < _SAME_SCREEN_DISTANCE
+                and signature_distance(screens[index], screens[index - 1]) > _OTHER_SCREEN_DISTANCE
+                for index in range(2, len(screens))
+            )
+            if back_and_forth:
+                return f"最近 {_STUCK_PING_PONG} 步一直在两个画面之间来回切换"
+        failures = Counter(failure for _, _, failure in session.trace if failure)
+        if failures:
+            failure, count = failures.most_common(1)[0]
+            if count >= _STUCK_SAME_FAILURE:
+                return f"最近 {len(session.trace)} 步里同一个问题出现了 {count} 次：{failure}"
+        return ""
+
+    async def _call_model(
+        self, session: Session, kind: str, call: Callable[[Any], Awaitable[Any]], payload: Any
+    ) -> str:
+        """调用模型，统一计数、计时、查预算，并记下宿主给出的 token 用量。
+
+        每次尝试先算一次再调用：失败、超时的也算，不会漏算；同一次调用只算一次，不会重复算。
+
+        Raises:
+            SessionEnd: 这次或今天的模型调用预算用完了。
+            AgentError: 模型调用失败。
+        """
+        config = self._config()
+        stats = session.stats
+        if stats.calls >= config.play.max_model_calls_per_session:
+            raise SessionEnd(f"这次的模型调用预算用完了（{config.play.max_model_calls_per_session} 次）")
+        if self._store.model_calls(self._today()) >= config.play.daily_model_call_limit:
+            raise SessionEnd(f"今天的模型调用预算用完了（{config.play.daily_model_call_limit} 次）")
+        if kind == "planner":
+            stats.planner_calls += 1
+        else:
+            stats.vision_calls += 1
+        self._store.add_model_call(self._today())
+        started = time.perf_counter()
+        try:
+            reply = await call(payload)
+        except AgentError:
+            stats.failed_calls += 1
+            raise
+        finally:
+            stats.seconds["model"] += time.perf_counter() - started
+        if isinstance(reply, str):
+            return reply
+        if reply.total_tokens:
+            stats.calls_with_usage += 1
+            stats.total_tokens += reply.total_tokens
+            stats.prompt_tokens += reply.prompt_tokens or 0
+            stats.completion_tokens += reply.completion_tokens or 0
+        return reply.text
+
+    async def _read_foreground(self, device: PhoneDevice) -> Tuple[str, str]:
+        """查前台应用，并更新这个设备连接识别前台的能力，返回（包名，能力）。
+
+        认出来过就是 supported，之后再认不出也只当暂时失败，不会因为连着几次空值就降成不支持；
+        只有设备明确给不出（系统输出里没有相关字段、接口不存在）而且从没认出来过，才是 unsupported。
+        """
+        reading = await device.foreground()
+        support = self._foreground_support.get(device, "unknown")
+        if reading.package:
+            support = "supported"
+        elif reading.unsupported and support != "supported":
+            support = "unsupported"
+        self._foreground_support[device] = support
+        return reading.package, support
+
+    @staticmethod
+    def _check_control(session: Session, epoch: int) -> None:
+        if session.control_epoch != epoch:
+            raise ControlTaken
+
+    def _should_reopen(self, session: Session, app: AllowedApp, config: PhonePlayConfig) -> bool:
+        """打开应用时要不要先关掉、从首页开始。
 
         平时先关掉：应用在后台时直接打开会回到上次停下的页面（比如上次看的视频），容易被带跑。
-        但一起玩时上次停下的多半是和对方组好的房间；标了 keep_open 的游戏关掉会退出房间、重新加载要一分钟；
+        但一起玩时上次停下的多半是和对方组好的房间；应用自己设了 reopen_on_start（或旧的 keep_open）就按它；
         刚玩过的同一个应用多半是接着玩（实测群友一喊「回房间」她就重开一次，每次都冷启动）。
         """
-        if session.together or app.keep_open:
-            return True
-        return app.package == self._last_package and self._clock() - self._last_ended_clock < _RESUME_SECONDS
+        if session.together:
+            return False
+        recent = app.package == self._last_package and self._clock() - self._last_ended_clock < _RESUME_SECONDS
+        return app.reopens(config.play.fresh_start and not recent)
+
+    @staticmethod
+    def _interval(session: Session, config: PhonePlayConfig) -> float:
+        """每步操作后等几秒：现在在用的应用单独设了就按它（阅读、看视频的节奏不一样），否则用全局的。"""
+        app = session.current or session.app
+        if app is not None and app.step_interval_seconds:
+            return app.step_interval_seconds
+        return config.play.step_interval_seconds
+
+    def _minutes_limit(self, session: Session, app: Optional[AllowedApp], config: PhonePlayConfig) -> int:
+        """这次最多玩几分钟：全局上限（一起玩用 together_minutes），应用单独设了更短的就按应用，不会超过全局。"""
+        limit = config.play.together_minutes if session.together else config.play.max_session_minutes
+        if app is not None and app.max_minutes:
+            limit = min(limit, app.max_minutes)
+        return limit
+
+    def _enter_app(self, session: Session, app: AllowedApp) -> None:
+        """记下她切到了哪个应用，以及在上一个应用里大概待了多久。"""
+        if session.current is not None and session.current.package == app.package:
+            return
+        # 换了应用，上一个应用里认出来的页面不作数了（WebUI 上别还显示着 B 站的播放器）
+        session.page = ""
+        now = self._clock()
+        for visit in session.visits:
+            if visit.since is not None:
+                visit.seconds += now - visit.since
+                visit.since = None
+        visit = next((visit for visit in session.visits if visit.app.package == app.package), None)
+        if visit is None:
+            visit = Visit(app=app)
+            session.visits.append(visit)
+        visit.since = now
+        session.current = app
 
     async def _nap(self, session: Session, seconds: float, device: Optional[PhoneDevice] = None) -> None:
         """等到下一步；对方在聊天里提了新要求就提前醒来。
@@ -931,6 +1503,34 @@ class PhoneAgent:
         except DeviceError:
             # 截不了图就不等了，下一步会按断开处理
             return
+
+    async def _watch_video(self, session: Session, seconds: float, device: PhoneDevice) -> None:
+        """看视频：画面本来就一直在变，不按画面变化叫醒她，看满她定的时间。
+
+        聊天里有新要求、被叫停或接管时马上醒来；每隔几秒看一眼前台，点到广告跳去了别的应用也提前醒来。
+        """
+        self._wake.clear()
+        if session.requests:
+            return
+        app = session.current or session.app
+        waited = 0.0
+        try:
+            while waited < seconds:
+                interval = min(_VIDEO_POLL_SECONDS, seconds - waited)
+                if await self._sleep_or_wake(interval):
+                    return
+                waited += interval
+                if waited < seconds and app is not None:
+                    package, _ = await self._read_foreground(device)
+                    if package and package != app.package:
+                        return
+        except DeviceError:
+            # 看不了前台就不等了，下一步会按断开处理
+            return
+        finally:
+            session.watch_seconds += waited
+            if session.watch_item and self._memory is not None:
+                self._memory.add_watched_seconds(session.watch_item, waited)
 
     async def _sleep_or_wake(self, seconds: float) -> bool:
         """睡一会儿；被聊天里的新要求叫醒时返回 True。"""
@@ -962,24 +1562,61 @@ class PhoneAgent:
             return "今天的操作步数用完了"
         return ""
 
-    async def _wait_for_device(self, device: PhoneDevice) -> bool:
-        """手机短暂断开时每隔几秒试着连一次，恢复了返回 True，等太久还没恢复返回 False。
+    async def _connect(self, device: PhoneDevice, seconds: float) -> None:
+        """确认手机能用。暂时连不上（网络抖动、WDA 重启）就在 ``seconds`` 秒内每隔几秒再试，
+        配置错误、要人处理（解锁、允许调试）的不重试。开始玩和玩到一半断开都用这一个。
 
-        按真实时间算：每次连接本身可能要等到超时（20 秒），只累计睡眠时间会远远超过说好的上限。
+        按真实时间算总时长，每次连接最多等剩下的时间（一次请求最多要等 20 秒）；被叫停时随会话任务一起取消。
+
+        Raises:
+            DeviceError: 到截止时间还连不上，或者遇到重试也没用的错误。
         """
-        deadline = self._clock() + _RECONNECT_SECONDS
-        while self._clock() < deadline:
-            await self._sleep(_RECONNECT_INTERVAL)
-            remaining = deadline - self._clock()
-            if remaining <= 0:
-                break
+        deadline = self._clock() + seconds
+        attempt = 0
+        while True:
+            attempt += 1
             try:
-                # 单次连接也不能超过剩下的时间（一次请求最多要等 20 秒）
-                await asyncio.wait_for(device.ensure_ready(), timeout=remaining)
-            except (DeviceError, asyncio.TimeoutError):
-                continue
-            return True
-        return False
+                await asyncio.wait_for(device.ensure_ready(), timeout=max(deadline - self._clock(), 0.001))
+            except DeviceError as exc:
+                error = exc
+            except asyncio.TimeoutError:
+                error = DeviceError(f"连接手机超时：{device.description} {seconds:g} 秒内没有回应")
+            else:
+                self._mark_connected()
+                return
+            if not error.retryable or self._clock() + _RECONNECT_INTERVAL >= deadline:
+                self._connection.state = "failed" if error.kind == "transient" else error.kind
+                self._connection.error, self._connection.deadline = str(error), 0.0
+                raise error
+            self._connection.state, self._connection.error = "reconnecting", str(error)
+            self._connection.attempt, self._connection.deadline = attempt, deadline
+            await self._sleep(_RECONNECT_INTERVAL)
+
+    def _mark_connected(self) -> None:
+        connection = self._connection
+        connection.state, connection.error, connection.attempt, connection.deadline = "ok", "", 0, 0.0
+        connection.last_ok_at = self._now()
+
+    def _connection_payload(self, config: PhonePlayConfig) -> Dict[str, Any]:
+        connection = self._connection
+        remaining = max(0, round(connection.deadline - self._clock())) if connection.deadline else 0
+        return {
+            "state": connection.state,
+            "label": CONNECTION_LABELS[connection.state],
+            "last_ok_at": connection.last_ok_at.strftime("%m-%d %H:%M:%S") if connection.last_ok_at else "",
+            "attempt": connection.attempt,
+            "remaining_seconds": remaining,
+            "error": connection.error,
+            "hint": _connection_hint(connection.state, config.device),
+        }
+
+    async def _save_memory(self) -> None:
+        if self._memory is None:
+            return
+        try:
+            await self._memory.save()
+        except OSError as exc:
+            self._logger.warning(f"保存内容记忆失败：{exc}")
 
     async def _save_usage(self) -> None:
         """及时保存次数、步数和互动计数；存不了只记日志，不打断玩手机。"""
@@ -1043,13 +1680,23 @@ class PhoneAgent:
         """执行一步，返回（是否成功，是否结束，下一步前等待的秒数）。"""
         session.step += 1
         step = session.step
+        session.wait_video = ""
         self._store.add_step(self._today())
         await self._save_usage()
-        interval = config.play.step_interval_seconds
+        interval = self._interval(session, config)
 
+        started = time.perf_counter()
         image = await asyncio.to_thread(open_image, await device.screenshot())
+        session.stats.seconds["screenshot"] += time.perf_counter() - started
+        self._mark_connected()
         await self._publish_frame(image, config)
         width, height = image.size
+        if session.handed_back:
+            # 刚交还控制：对方可能动过手机，之前的画面比对、重复操作记录都不作数了
+            session.handed_back = False
+            session.last_signature, session.unchanged_steps = b"", 0
+            session.last_action, session.repeat_count = None, 0
+            history.append(f"第{step}步前：对方接管过手机，刚交还给你；画面可能变了，按现在看到的重新决定")
         signature = await asyncio.to_thread(screen_signature, image)
         if session.last_signature and signature_distance(signature, session.last_signature) < _UNCHANGED_DISTANCE:
             session.unchanged_steps += 1
@@ -1058,24 +1705,42 @@ class PhoneAgent:
         session.last_signature = signature
 
         # 安全检查：不管模型怎么想，停在白名单以外的应用里就直接回桌面
-        package = await device.foreground_package()
+        package, support = await self._read_foreground(device)
         allowed = {app.package for app in apps} | home_packages | set(config.safety.extra_allowed_packages)
         if package and package not in allowed:
             await device.press_key("home")
             result = f"前台是 {package}，不在允许范围内，已回到桌面"
             self._log(step, "离开了不允许的应用", action="回桌面", ok=False, result=result)
             history.append(f"第{step}步：{result}")
+            self._note_failure(session, result)
             return False, False, interval
+        if not package and support != "unsupported":
+            # 认不出前台就没法确认还在白名单里：这一步不问模型、不操作；连续几步这样会按连续失败结束
+            result = _foreground_unknown_text(support)
+            diagnostic = await self._record_failure(session, step, image, None, [], result)
+            self._log(step, "看不出现在在哪个应用，先不操作", ok=False, result=result, diagnostic=diagnostic)
+            self._note_failure(session, result)
+            return False, False, interval
+        if not package and not session.foreground_noted:
+            session.foreground_noted = True
+            self._log(step, "这台手机给不出前台应用", result="没法检查她有没有离开白名单里的应用，请留意 WebUI 画面")
         # 她可能从桌面点进了别的应用，不只是用 launch 切换
-        session.current = find_app(apps, package) or session.current
+        found = find_app(apps, package)
+        if found is not None:
+            self._enter_app(session, found)
 
         elements: List[UIElement] = []
         elements_note = ""
         if config.play.use_ui_tree:
+            started = time.perf_counter()
             try:
                 elements = await device.ui_elements(width, height, config.play.max_elements)
             except DeviceError as exc:
                 elements_note = f"这个画面读不到界面元素（{exc}），请直接用坐标。"
+            session.stats.seconds["ui"] += time.perf_counter() - started
+        # 同一个视频从首页、搜索点开是两种页面，操作不一样；认出来就只讲这一种
+        page = detect_page(package, elements, width, height)
+        session.page = page
         model_image = image
         if elements and config.play.mark_elements:
             model_image = await asyncio.to_thread(draw_element_marks, image, elements)
@@ -1111,15 +1776,33 @@ class PhoneAgent:
             repeated_action=session.last_action.describe() if session.last_action else "",
             requests=requests,
             earlier_requests=earlier_requests,
+            watched=self._watched_titles(session, config),
+            watching=_watching_text(session),
+            app_tips=app_tips(package, page),
+            skip_watched=config.play.skip_watched_videos,
         )
 
+        epoch = session.control_epoch
         try:
-            action = parse_action(await self._vision(build_decision_messages(context)))
+            action = parse_action(
+                await self._call_model(session, "vision", self._vision, build_decision_messages(context))
+            )
         except (AgentError, ActionError) as exc:
-            self._log(step, "没能决定下一步", ok=False, result=str(exc))
+            diagnostic = await self._record_failure(session, step, image, None, elements, f"没能决定下一步：{exc}")
+            self._log(step, "没能决定下一步", ok=False, result=str(exc), diagnostic=diagnostic)
             history.append(f"第{step}步：没有得到有效动作（{exc}），请严格按格式只输出一个 JSON")
+            self._note_failure(session, f"没能决定下一步：{exc}")
             return False, False, interval
+        if session.control_epoch != epoch:
+            # 模型想的时候对方接管了（可能已经交还）：这个决定是按旧画面想的，作废
+            raise ControlTaken
+        if action.video and (action.seen is None or action.seen.media != "video"):
+            # 详情页（和安卓的竖屏播放器）的标题就在界面元素里：她没写 seen 也能记下看过哪个视频、拦住重看
+            title = page_title(page, elements)
+            if title:
+                action = replace(action, seen=Seen(media="video", title=title))
 
+        session.step_kind = action.kind
         same = _same_action(session.last_action, action)
         session.repeat_count = session.repeat_count + 1 if same else int(action.kind in _REPEAT_KINDS)
         session.last_action = action
@@ -1129,32 +1812,91 @@ class PhoneAgent:
         summary = action.summary or action.describe()
         if action.kind in _IN_APP_KINDS:
             # 模型想的这几秒里前台可能换了（广告跳到了别的应用），做之前再看一次，不在白名单里就不做
-            now_package = await device.foreground_package()
+            now_package, support = await self._read_foreground(device)
             result = ""
             if now_package and now_package not in allowed:
                 await device.press_key("home")
                 result = f"做之前前台变成了 {now_package}，不在允许范围内，这一步没做，已回到桌面"
-            elif package and not now_package:
-                # 刚才还认得出、现在认不出（切应用的动画、弹出了系统界面），先不做；一直认不出的设备照常做，不然玩不了
-                result = "做之前看不出现在在哪个应用，这一步先不做"
+            elif not now_package and support != "unsupported":
+                # 认不出就不做，直到重新认出来；只有明确给不出前台的设备才照常做
+                result = f"做之前{_foreground_unknown_text(support)}，这一步先不做"
             if result:
-                self._log(step, summary, thought=action.thought, action=action.describe(), ok=False, result=result)
+                diagnostic = await self._record_failure(session, step, image, action, elements, result)
+                self._log(
+                    step,
+                    summary,
+                    thought=action.thought,
+                    action=action.describe(),
+                    ok=False,
+                    result=result,
+                    diagnostic=diagnostic,
+                )
                 history.append(f"第{step}步：{summary} → {result}")
+                self._note_failure(session, result)
                 return False, False, interval
+        watched = self._watched_block(session, action, elements, width, height, config)
+        if watched:
+            # 不是她做错了，不算连续出错；反复这样也会被当成卡住
+            self._log(step, summary, thought=action.thought, action=action.describe(), ok=False, result=watched)
+            history.append(f"第{step}步：{summary} → {watched}")
+            session.step_failure = watched
+            return True, False, 0.0
+        started = time.perf_counter()
         try:
-            result = await self._execute(device, action, image, elements, apps, config, session)
+            result = await self._execute(device, action, image, elements, apps, config, session, epoch)
         except StaleTarget as exc:
             # 不是她做错了，不算连续出错；画面刚截过，不用再等
-            self._log(step, summary, thought=action.thought, action=action.describe(), ok=False, result=f"没点：{exc}")
+            diagnostic = await self._record_failure(session, step, image, action, elements, f"没点：{exc}")
+            self._log(
+                step,
+                summary,
+                thought=action.thought,
+                action=action.describe(),
+                ok=False,
+                result=f"没点：{exc}",
+                diagnostic=diagnostic,
+            )
             history.append(f"第{step}步：{summary} → 没点：点之前画面变了，{exc}。先看看现在的画面再决定")
+            # 不算出错，但反复这样也是卡住了
+            session.step_failure = f"没点：{exc}"
             return True, False, 0.0
         except (ActionError, DeviceError) as exc:
-            self._log(step, summary, thought=action.thought, action=action.describe(), ok=False, result=str(exc))
+            diagnostic = await self._record_failure(session, step, image, action, elements, str(exc))
+            self._log(
+                step,
+                summary,
+                thought=action.thought,
+                action=action.describe(),
+                ok=False,
+                result=str(exc),
+                diagnostic=diagnostic,
+            )
             history.append(f"第{step}步：{summary} → 失败：{exc}")
+            # 每一步的 summary 措辞不同，比对「同一种失败」只看错误本身
+            self._note_failure(session, f"{summary}：{exc}", str(exc))
             return False, False, interval
 
+        finally:
+            session.stats.seconds["action"] += time.perf_counter() - started
         self._log(step, summary, thought=action.thought, action=action.describe(), result=result)
-        history.append(f"第{step}步：{summary}（{action.describe()}）→ {_history_result(result)}")
+        note = _page_note(page, action)
+        if action.video and (action.seen is None or action.seen.media != "video"):
+            # 没写标题就记不住看过它，下次还会点进来；每次都提醒一下
+            note += "（没写 seen 标题，插件记不住看过这个视频；标题看得清就写上）"
+        history.append(f"第{step}步：{summary}（{action.describe()}）→ {_history_result(result)}{note}")
+        item: Optional[MemoryItem] = None
+        if action.seen is not None and self._memory is not None:
+            current = session.current or session.app
+            name = current.name if current else ""
+            if action.seen.media == "video":
+                item = self._memory.remember_watched(action.seen, name, action.video, self._now())
+                session.video_item, session.video_title = item.id, item.title
+            else:
+                self._memory.remember_content(action.seen, name, self._now())
+            await self._save_memory()
+        # 详情页里上下滑、切简介和评论，视频还在上面接着播，不算换了一个
+        keeps_video = page == BILI_DETAIL and (action.kind == "swipe" or _is_detail_tab(action, elements))
+        self._follow_watching(session, action, item, keeps_video)
         if action.kind == "finish":
             session.finish_summary = action.summary or action.thought
             session.finish_thought = action.thought
@@ -1166,11 +1908,86 @@ class PhoneAgent:
             if action.kind == "wait":
                 session.watch_thoughts.append(action.thought)
         if action.kind == "wait":
+            session.wait_video = action.video
             return True, False, action.seconds
         if action.kind == "wait_turn":
             # 已经等到对方操作完了，画面是新的，不用再等
             return True, False, 0.0
-        return True, False, interval
+        # 这一步可能切了应用：按切过去的应用的节奏等它加载
+        return True, False, self._interval(session, config)
+
+    @staticmethod
+    def _follow_watching(session: Session, action: PhoneAction, item: Optional[MemoryItem], keeps_video: bool) -> None:
+        """更新「连着看的这一段」：看视频接着上一步就是同一段（认出了不同的标题除外），别的操作结束这一段。
+
+        ``keeps_video`` 是这一步没换视频（比如详情页里翻评论），这一段接着算。
+        """
+        if keeps_video:
+            return
+        if action.kind != "wait" or not action.video:
+            session.watching, session.watch_item, session.watch_title, session.watch_seconds = False, "", "", 0.0
+            return
+        if not session.watching or (item is not None and item.id != session.watch_item and session.watch_item):
+            session.watch_item, session.watch_title, session.watch_seconds = "", "", 0.0
+        if item is not None:
+            session.watch_item, session.watch_title = item.id, item.title
+        session.watching, session.watch_form = True, action.video
+
+    def _watched_titles(self, session: Session, config: PhonePlayConfig) -> List[str]:
+        """这个应用里最近看过的视频，告诉她刷到了别再看；关了 skip_watched_videos 就不提。"""
+        app = session.current or session.app
+        if self._memory is None or app is None or not config.play.skip_watched_videos:
+            return []
+        titles = self._memory.watched_titles(app.name, self._now(), _WATCHED_SHOWN + 1)
+        # 正在看的这个不算「别再看」
+        return [
+            title if len(title) <= _WATCHED_TITLE_SHOWN else f"{title[:_WATCHED_TITLE_SHOWN]}…"
+            for title in titles
+            if title != session.video_title
+        ][:_WATCHED_SHOWN]
+
+    def _watched_block(
+        self,
+        session: Session,
+        action: PhoneAction,
+        elements: Sequence[UIElement],
+        width: int,
+        height: int,
+        config: PhonePlayConfig,
+    ) -> str:
+        """要点开或接着看的视频以前看过，就不做这一步，返回给她看的原因；没看过返回空字符串。
+
+        点列表里的卡片时按卡片上的文字（B 站首页、搜索结果的卡片文字就是标题）比对；
+        在播放器里刷到时按她写的 seen 标题比对，正在看的这个接着看不拦。对方点名要看的不拦。
+        """
+        app = session.current or session.app
+        if self._memory is None or app is None or not config.play.skip_watched_videos:
+            return ""
+        now = self._now()
+        asked = normalize_title(" ".join([session.hint, session.goal, *session.request_log, *session.requests]))
+        if action.kind in ("tap", "long_press"):
+            card = _card(action, elements, width, height)
+            if card is None:
+                return ""
+            item = self._memory.find_watched(app.name, card.label, now)
+            if item is None:
+                # 她没记下、但 B 站自己在搜索结果卡片上标着「最近看过」的，也算看过
+                mark = marked_watched(card, elements) if app.package in BILIBILI_PACKAGES else None
+                if mark is None or normalize_title(card.label) in asked:
+                    return ""
+                return f"没点：《{card.label}》B 站标着「{mark}」，换一个没看过的"
+            verb = "没点"
+        elif action.kind == "wait" and action.seen is not None and action.seen.media == "video":
+            item = self._memory.find_watched(app.name, action.seen.title, now)
+            if item is None or item.id == session.video_item:
+                return ""
+            verb = "没看"
+        else:
+            return ""
+        if normalize_title(item.title) in asked:
+            return ""
+        when = _ago(datetime.fromisoformat(item.updated_at), now)
+        return f"{verb}：《{item.title}》{when}看过了，换一个没看过的（短视频直接上滑，列表里点别的）"
 
     async def _confirm_point(
         self,
@@ -1234,19 +2051,24 @@ class PhoneAgent:
         apps: Sequence[AllowedApp],
         config: PhonePlayConfig,
         session: Session,
+        epoch: int,
     ) -> str:
-        """执行动作并返回结果说明；``image`` 是做决定时的截图。
+        """执行动作并返回结果说明；``image`` 是做决定时的截图，``epoch`` 是做决定时的接管序号。
 
         Raises:
             ActionError: 动作越过安全边界或参数无效时抛出。
             StaleTarget: 点之前画面变了，要点的东西不在原处。
+            ControlTaken: 执行前对方接管了手机。
             DeviceError: 设备执行失败时抛出。
         """
+        self._check_control(session, epoch)
         kind = action.kind
         width, height = image.size
         if kind in ("like", "follow"):
             self._check_interaction(config, kind)
             x, y = await self._confirm_point(device, action, image, elements, config)
+            # 核对画面要截图、读界面，这期间也可能被接管
+            self._check_control(session, epoch)
             await device.tap(x, y)
             self._store.add_interaction(self._today(), kind)
             await self._save_usage()
@@ -1266,9 +2088,12 @@ class PhoneAgent:
             if len(text) > config.interaction.comment_max_length:
                 raise ActionError(f"评论太长了，最多 {config.interaction.comment_max_length} 个字")
             x, y = await self._confirm_point(device, action, image, elements, config)
+            # 核对画面要截图、读界面，这期间也可能被接管
+            self._check_control(session, epoch)
             await device.tap(x, y)
             # 等键盘弹出来再写
             await self._sleep(_INPUT_FOCUS_SECONDS)
+            self._check_control(session, epoch)
             await device.input_text(text)
             entered = await device.focused_input_text()
             if entered is not None and text not in entered:
@@ -1283,6 +2108,8 @@ class PhoneAgent:
             return "已写好评论，还要点发送或发布才会发出去"
         if kind in ("tap", "long_press"):
             x, y = await self._confirm_point(device, action, image, elements, config)
+            # 核对画面要截图、读界面，这期间也可能被接管
+            self._check_control(session, epoch)
             if kind == "tap":
                 await device.tap(x, y)
                 return f"已点击 ({x}, {y})"
@@ -1307,7 +2134,7 @@ class PhoneAgent:
             if app is None:
                 raise ActionError(f"「{action.app}」不在可以打开的应用里")
             await device.launch_app(app.package)
-            session.current = app
+            self._enter_app(session, app)
             return f"已打开{app.name}"
         if kind == "wait":
             return f"看 {action.seconds:g} 秒"
@@ -1360,7 +2187,9 @@ class PhoneAgent:
 
     async def _auto_decide(self) -> None:
         config = self._config()
-        if self._state != "idle" or not in_active_hours(config.auto_play.active_hours, self._now()):
+        if self._state != "idle" or self._controller == "user":
+            return
+        if not in_active_hours(config.auto_play.active_hours, self._now()):
             return
         if self._rng() >= config.auto_play.play_probability:
             return

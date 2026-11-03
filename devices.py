@@ -1,6 +1,7 @@
 """手机设备层：统一的操作接口，以及安卓（ADB）和 iPhone（WebDriverAgent）两种实现。"""
 
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 from typing import Any, Awaitable, Callable, Dict, List, Literal, Optional, Sequence, Set, Tuple
 
 import asyncio
@@ -38,6 +39,8 @@ _SPRINGBOARD = "com.apple.springboard"
 # 纯界面画面差别不大；视频类应用画面一直在动，不关掉「等界面空闲」的话每步操作前都要白等十秒
 _WDA_SETTINGS: Dict[str, Any] = {"screenshotQuality": 1, "waitForIdleTimeout": 0, "animationCoolOffTimeout": 0}
 _WDA_INVALID_SESSION = "invalid session id"
+# 接口不存在时 WDA 返回的 W3C 错误码
+_WDA_UNKNOWN_COMMAND = ("unknown command", "unknown method")
 _WDA_NO_SUCH_ELEMENT = "no such element"
 _W3C_ELEMENT_KEY = "element-6066-11e4-a52e-4f735466cecf"
 # 打开没装的应用时，iOS 报的错误里带这些字样
@@ -53,7 +56,44 @@ _BACK_SWIPE_MS = 250
 
 
 class DeviceError(RuntimeError):
-    """设备操作失败；消息会直接展示给用户。"""
+    """设备操作失败；消息会直接展示给用户。
+
+    默认当作暂时的连接问题（网络抖动、WDA 重启、数据线松动），连接时会在限定时间内重试；
+    配置错误、需要人去处理的情况用下面的子类，不重试。
+    """
+
+    retryable = True
+    # 给 WebUI 连接状态用：transient 暂时连不上，config 配置有误，needs_unlock 要手动解锁，needs_action 要人在手机上操作
+    kind = "transient"
+
+
+class DeviceConfigError(DeviceError):
+    """配置有误（找不到 adb、包名不合法、多台设备没指定），重试也没用。"""
+
+    retryable = False
+    kind = "config"
+
+
+class DeviceNeedsUserError(DeviceError):
+    """要人去处理才能继续：手动解锁（needs_unlock）、在手机上允许调试（needs_action）。"""
+
+    retryable = False
+
+    def __init__(self, message: str, kind: Literal["needs_unlock", "needs_action"]) -> None:
+        super().__init__(message)
+        self.kind = kind
+
+
+@dataclass(frozen=True)
+class Foreground:
+    """一次前台应用查询的结果。
+
+    ``package`` 为空时：``unsupported`` 为真表示这台设备明确给不出前台信息（系统输出里根本没有相关字段、
+    接口不存在），否则只是这一次没认出来（切应用的动画、锁屏、系统界面）。
+    """
+
+    package: str
+    unsupported: bool = False
 
 
 class AppNotInstalledError(DeviceError):
@@ -112,6 +152,10 @@ class PhoneDevice(ABC):
     async def foreground_package(self) -> str:
         """当前前台应用的包名，无法判断时返回空字符串。"""
 
+    async def foreground(self) -> Foreground:
+        """前台应用和这台设备能不能识别前台；能明确判断出不支持的设备要覆盖这个方法。"""
+        return Foreground(await self.foreground_package())
+
     @abstractmethod
     async def home_packages(self) -> Set[str]:
         """桌面（启动器）应用的包名。"""
@@ -156,7 +200,7 @@ async def run_process(args: Sequence[str], timeout: float) -> Tuple[int, bytes, 
             **extra,
         )
     except FileNotFoundError as exc:
-        raise DeviceError(
+        raise DeviceConfigError(
             f"找不到 adb：{args[0]}。请安装 Android platform-tools，或在插件配置里填写 adb.exe 的完整路径"
         ) from exc
     try:
@@ -174,7 +218,7 @@ async def run_process(args: Sequence[str], timeout: float) -> Tuple[int, bytes, 
 def _check_package(package: str) -> None:
     """包名会拼进 shell 命令，先校验格式。"""
     if not _PACKAGE_PATTERN.match(package):
-        raise DeviceError(f"包名格式不正确：{package}")
+        raise DeviceConfigError(f"包名格式不正确：{package}")
 
 
 def parse_adb_devices(text: str) -> Dict[str, str]:
@@ -194,6 +238,14 @@ def parse_foreground_package(text: str) -> str:
         if match is not None:
             return match.group(1)
     return ""
+
+
+def _state_error(serial: str, state: str) -> DeviceError:
+    """adb 设备状态不对：未授权要人在手机上点允许，离线等情况重试可能恢复。"""
+    message = f"设备 {serial} {_STATE_HINTS.get(state, f'状态异常：{state}')}"
+    if state == "unauthorized":
+        return DeviceNeedsUserError(message, "needs_action")
+    return DeviceError(message)
 
 
 class AdbDevice(PhoneDevice):
@@ -249,7 +301,7 @@ class AdbDevice(PhoneDevice):
                 connected = "、".join(devices) or "无"
                 raise DeviceError(f"没有找到设备 {serial}（当前已连接：{connected}）")
             if state != "device":
-                raise DeviceError(f"设备 {serial} {_STATE_HINTS.get(state, f'状态异常：{state}')}")
+                raise _state_error(serial, state)
             self._serial = serial
             return
 
@@ -261,9 +313,9 @@ class AdbDevice(PhoneDevice):
         online = [name for name, state in devices.items() if state == "device"]
         if not online:
             name, state = next(iter(devices.items()))
-            raise DeviceError(f"设备 {name} {_STATE_HINTS.get(state, f'状态异常：{state}')}")
+            raise _state_error(name, state)
         if len(online) > 1:
-            raise DeviceError(f"检测到多台设备（{'、'.join(online)}），请在插件配置的 serial 中指定一台")
+            raise DeviceConfigError(f"检测到多台设备（{'、'.join(online)}），请在插件配置的 serial 中指定一台")
         self._serial = online[0]
 
     async def screenshot(self) -> bytes:
@@ -313,9 +365,15 @@ class AdbDevice(PhoneDevice):
         await self._shell(f"am force-stop {package}")
 
     async def foreground_package(self) -> str:
+        return (await self.foreground()).package
+
+    async def foreground(self) -> Foreground:
         # grep 没有匹配时返回 1，用 || true 让「无法判断」走正常返回路径
         text = await self._shell("dumpsys window | grep -E 'mCurrentFocus|mFocusedApp' || true")
-        return parse_foreground_package(text)
+        package = parse_foreground_package(text)
+        # 输出里连这两个字段都没有，说明这个系统的 dumpsys 格式给不出前台；
+        # 有字段但为空（mCurrentFocus=null）只是这一次没认出来
+        return Foreground(package, unsupported=not package and not text.strip())
 
     async def home_packages(self) -> Set[str]:
         text = await self._shell(
@@ -407,8 +465,9 @@ class WdaDevice(PhoneDevice):
             raise DeviceError(f"WebDriverAgent 请求超时（{seconds:g} 秒）：{method} {path}") from None
         except httpx.TransportError as exc:
             raise DeviceError(
-                f"连不上 iPhone 上的 WebDriverAgent（{self._base_url}）：请确认 iPhone 已用数据线连好并解锁，"
-                "电脑上的 ios runwda 和 ios forward 8100 8100 都在运行"
+                f"连不上 iPhone 上的 WebDriverAgent（{self._base_url}）：无线连接时确认 iPhone 和电脑在同一个 Wi-Fi、"
+                "启动 WDA 的 pymobiledevice3 和端口转发在运行；有线连接时确认数据线连好、"
+                "ios runwda 和 ios forward 在运行"
             ) from exc
         try:
             data = response.json()
@@ -466,7 +525,9 @@ class WdaDevice(PhoneDevice):
         # 没设锁屏密码时 WDA 能自己解锁；设了密码只能请人手动解
         await self._request("POST", "/wda/unlock")
         if await self._request("GET", "/wda/locked"):
-            raise DeviceError("iPhone 锁屏了，自动解锁没成功：请手动解锁，并在设置里把「自动锁定」改成「永不」")
+            raise DeviceNeedsUserError(
+                "iPhone 锁屏了，自动解锁没成功：请手动解锁，并在设置里把「自动锁定」改成「永不」", "needs_unlock"
+            )
 
     async def ensure_ready(self) -> None:
         status = await self._request("GET", "/status")
@@ -547,8 +608,17 @@ class WdaDevice(PhoneDevice):
         await self._session_request("POST", "/wda/apps/terminate", {"bundleId": package})
 
     async def foreground_package(self) -> str:
-        info = await self._request("GET", "/wda/activeAppInfo")
-        return str(info.get("bundleId") or "") if isinstance(info, dict) else ""
+        return (await self.foreground()).package
+
+    async def foreground(self) -> Foreground:
+        try:
+            info = await self._request("GET", "/wda/activeAppInfo")
+        except _WdaError as exc:
+            # 老版本 WDA 没有这个接口：明确不支持；其它错误照常抛出
+            if exc.code in _WDA_UNKNOWN_COMMAND:
+                return Foreground("", unsupported=True)
+            raise
+        return Foreground(str(info.get("bundleId") or "") if isinstance(info, dict) else "")
 
     async def home_packages(self) -> Set[str]:
         return {_SPRINGBOARD}
