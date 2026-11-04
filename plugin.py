@@ -7,7 +7,7 @@ from uuid import uuid4
 from maibot_sdk import API, Command, HookHandler, MaiBotPlugin, ON_BOT_CONFIG_RELOAD, Tool
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
-from .agent import AgentError, ModelReply, PhoneAgent, PlayRefused
+from .agent import AgentError, ModelReply, PhoneAgent, PlayRefused, SwitchRefused
 from .devices import DeviceError, create_device
 from .diagnostics import DiagnosticStore
 from .memory import MemoryStore
@@ -23,10 +23,11 @@ _HELP_TEXT = (
     "/手机 开始 [想做的事] — 去玩手机，例如 /手机 开始 刷B站看猫猫；不写则自己决定\n"
     "/手机 暂停 · /手机 继续 · /手机 停止\n"
     "/手机 接管 — 你来操作手机，她马上停手、自动玩也不会抢；/手机 交还 — 交还给她，她看看现在的画面再接着玩\n"
+    "/手机 设备 — 看有哪些设备、现在用哪台；/手机 切换 名字 — 换一台手机（比如 /手机 切换 OPPO），正在玩时不能换\n"
     "实时观看：WebUI 侧边栏「插件扩展」里的「手机实时画面」"
 )
 # /手机、/手机截图、/手机 开始 刷B站 都能匹配；/手机号码 这类普通消息不会被拦截
-_COMMAND_PATTERN = r"^/手机\s*(?P<sub>截图|状态|开始|停止|暂停|继续|接管|交还|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
+_COMMAND_PATTERN = r"^/手机\s*(?P<sub>截图|状态|开始|停止|暂停|继续|接管|交还|设备|切换|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
 # 聊天中叫她去玩手机时，等她决定好玩什么再回话，这样她能说出具体打算
 _PLAN_WAIT_SECONDS = 30.0
 # Maisaka 默认把插件工具放进 tool_search 后面，实测她要先搜一轮才会去玩，对方得催一句。
@@ -214,6 +215,8 @@ class PhonePlayPlugin(MaiBotPlugin):
         status = self.agent.status()
         name = await self._bot_name()
         lines = [f"📱 {name}的手机：{status['state_label']}"]
+        if len(status["devices"]) > 1:
+            lines.append(f"设备：{status['device_name']}（共 {len(status['devices'])} 台，/手机 设备 查看）")
         if status["state"] == "idle":
             lines.append(self.agent.activity_text())
         else:
@@ -250,6 +253,27 @@ class PhonePlayPlugin(MaiBotPlugin):
             return f"正在{status['app']}：{status['goal']}（第 {status['step']} 步）"
         return ""
 
+    def _devices_text(self) -> str:
+        lines = ["📱 设备："]
+        for device in self.agent.device_list():
+            mark = "（现在用的）" if device["current"] else ""
+            lines.append(f"· {device['name']}{mark}：{device['kind']} · {device['address']}")
+        if len(lines) == 2:
+            lines.append("只配置了一台。要加设备，在插件配置的「多设备」里添加，每台写上 name")
+        else:
+            lines.append("用 /手机 切换 名字 换一台")
+        return "\n".join(lines)
+
+    async def _switch_text(self, arg: str) -> str:
+        if not arg:
+            return f"要换哪台？\n{self._devices_text()}"
+        try:
+            device, changed = await self.agent.switch_device(arg)
+        except SwitchRefused as exc:
+            return f"没换：{exc}"
+        name = await self._bot_name()
+        return f"好，{name}之后用{device}玩手机" if changed else f"现在用的就是{device}"
+
     async def _run_command(self, sub: str, arg: str, stream_id: str, user_id: str, is_local_operator: bool) -> str:
         if not sub and arg:
             return f"不认识的手机命令：{arg}\n\n{_HELP_TEXT}"
@@ -257,6 +281,8 @@ class PhonePlayPlugin(MaiBotPlugin):
             return _HELP_TEXT
         if sub in ("", "状态"):
             return await self._status_text()
+        if sub == "设备":
+            return self._devices_text()
 
         is_admin = self._is_admin(user_id, is_local_operator)
         if sub == "截图":
@@ -290,12 +316,14 @@ class PhonePlayPlugin(MaiBotPlugin):
             if not self.agent.release():
                 return f"手机本来就在{name}手里"
             return f"已交还给{name}" + ("，她看看现在的画面再接着玩" if self.agent.state != "idle" else "")
+        if sub == "切换":
+            return await self._switch_text(arg)
         # 命令正则只允许上面这些子命令，剩下的就是「继续」
         if self.agent.resume():
             return "继续玩"
         return "现在没有暂停"
 
-    @Command("phone", description="手机：截图、状态、开始、停止、暂停、继续", pattern=_COMMAND_PATTERN)
+    @Command("phone", description="手机：截图、状态、开始、停止、暂停、继续、切换设备", pattern=_COMMAND_PATTERN)
     async def handle_phone_command(
         self,
         stream_id: str = "",
@@ -328,7 +356,7 @@ class PhonePlayPlugin(MaiBotPlugin):
             "对方想和你一起玩（在这台手机上轮流操作，或者用自己的手机和你联机、组队）时，together 填 true。"
             "会等你想好玩什么（一般几秒）再返回，等结果出来再回对方、说说具体打算；玩不了时照实说原因。"
             "玩完后你会回到这个聊天。正在玩时再调用不会重新开始，而是把 goal 当成对方的新要求交给手机上的你"
-            "（比如点准备、退出房间、接受邀请、换个视频）。"
+            "（比如点准备、退出房间、接受邀请、换个视频）。对方要你换一台手机玩时，先用 switch_phone 换好再调用它。"
         ),
         parameters=[
             ToolParameterInfo(
@@ -395,6 +423,42 @@ class PhonePlayPlugin(MaiBotPlugin):
         else:
             content = f"你拿起了手机，打算打开{plan.app.name}：{plan.goal}（大概玩 {plan.minutes} 分钟）。"
         return {"success": True, "content": content}
+
+    @Tool(
+        "switch_phone",
+        description=(
+            "换一台手机玩（你有不止一台手机时）。对方让你换手机、用另一台玩（比如「换安卓手机」「用 iPhone 玩」"
+            "「切到 OPPO」）时使用；换好后之后玩手机都用这台。只有管理员能让你换，正在玩时换不了；"
+            "换完要接着玩就再调用 play_phone。没换成时照实说原因。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="device",
+                param_type=ToolParamType.STRING,
+                description="换成哪台：设备名字，或者「安卓」「iPhone」这样的说法；留空则返回有哪些设备",
+                required=False,
+            )
+        ],
+    )
+    async def tool_switch_phone(self, device: str = "", user_id: str = "", **kwargs: Any) -> Dict[str, Any]:
+        """在聊天中换一台手机；和 /手机 切换 一样只认管理员。"""
+        del kwargs
+        names = "、".join(
+            f"{item['name']}（{item['kind']}{'，现在用的' if item['current'] else ''}）"
+            for item in self.agent.device_list()
+        )
+        if not device.strip():
+            return {"success": True, "content": f"你的手机有：{names}"}
+        # user_id 是宿主按会话注入的；这个工具的参数里没有 user_id，模型一般不会自己去填
+        if not self._is_admin(user_id, False):
+            return {"success": False, "error": "只有管理员能让你换手机，婉拒就好，照常用现在这台"}
+        try:
+            name, changed = await self.agent.switch_device(device)
+        except SwitchRefused as exc:
+            return {"success": False, "error": f"没换成：{exc}"}
+        if not changed:
+            return {"success": True, "content": f"现在用的就是{name}，不用换。"}
+        return {"success": True, "content": f"换好了，之后玩手机用{name}。要接着玩就调用 play_phone。"}
 
     @Tool(
         "remember_for_phone",
@@ -605,6 +669,14 @@ class PhonePlayPlugin(MaiBotPlugin):
         cleared = self._memory.clear(kind)
         await self._memory.save()
         return {"cleared": cleared}
+
+    @API("webui_switch_device", description="WebUI：换一台设备", version="1")
+    async def webui_switch_device(self, name: str = "") -> Dict[str, Any]:
+        try:
+            device, changed = await self.agent.switch_device(name)
+        except SwitchRefused as exc:
+            raise ValueError(f"没换：{exc}") from exc
+        return {"device": device, "changed": changed}
 
     @API("webui_takeover", description="WebUI：人工接管手机", version="1")
     async def webui_takeover(self) -> Dict[str, Any]:

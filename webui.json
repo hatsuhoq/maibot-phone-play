@@ -62,6 +62,15 @@
         "takeover": {
           "api": "webui_takeover"
         },
+        "switch_device": {
+          "api": "webui_switch_device",
+          "parameters": {
+            "name": {
+              "type": "string",
+              "max_length": 64
+            }
+          }
+        },
         "release": {
           "api": "webui_release"
         },

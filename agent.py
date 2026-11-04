@@ -168,6 +168,39 @@ class PlayRefused(Exception):
         self.chat_text = chat_text or message
 
 
+class SwitchRefused(Exception):
+    """现在不能切换设备（正在玩、没有这台设备），``str(exc)`` 就是原因。"""
+
+
+# 聊天里常说「安卓手机」「苹果」而不是设备名：只有一台这种设备时就认它
+_PLATFORM_WORDS: Dict[str, Tuple[str, ...]] = {
+    "ios_wda": ("iphone", "苹果", "ios"),
+    "adb": ("安卓", "android"),
+}
+
+
+def match_device(query: str, choices: Sequence[Tuple[str, DeviceSettings]]) -> Optional[str]:
+    """按名字认出要切换的设备，认不出或者有歧义时返回 None。
+
+    先比整个名字（不分大小写），再看名字和说法互相包含（只有一台对得上才算），最后看「安卓」「iPhone」这类说法。
+    """
+    text = query.strip().casefold()
+    if not text:
+        return None
+    for name, _ in choices:
+        if name.casefold() == text:
+            return name
+    partial = [name for name, _ in choices if name.casefold() in text or text in name.casefold()]
+    if len(partial) == 1:
+        return partial[0]
+    for backend, words in _PLATFORM_WORDS.items():
+        if any(word in text for word in words):
+            same = [name for name, settings in choices if settings.backend == backend]
+            if len(same) == 1:
+                return same[0]
+    return None
+
+
 class AgentError(RuntimeError):
     """本次游玩无法继续。"""
 
@@ -323,6 +356,9 @@ class Session:
     # 这次操作的设备和它的配置：玩到一半改了设备配置，截图、回桌面也还发给这台，下一步前结束这次
     device: Optional[PhoneDevice] = None
     device_key: str = ""
+    # 这次用的设备名字和设置（多设备时切换不会影响正在进行的这次）
+    device_name: str = ""
+    device_settings: Optional[DeviceSettings] = None
     # 现在实际在用的应用：她可能中途切到别的应用，结束回不回桌面、下次接着玩、操作节奏都按它算
     current: Optional[AllowedApp] = None
     # 这次去过的应用，按第一次去的先后；app 是起始应用，current 是现在的应用
@@ -342,6 +378,10 @@ class Session:
     trace: Deque[Tuple[bytes, str, str]] = field(default_factory=lambda: deque(maxlen=_STUCK_TRACE))
     # 这一步的等待是不是在看视频（short、long），_play 按它决定怎么等
     wait_video: str = ""
+    # 这次连上过手机；没连上就结束的不用锁屏
+    connected: bool = False
+    # 这次替她解开过锁屏：还没打开应用就结束了也要锁回去
+    unlocked: bool = False
     # 认出来的页面（见 pages.detect_page），比如 B 站竖屏播放器、视频详情页
     page: str = ""
     # 最近认出来的视频（内容记忆里那一条的编号和标题）：点开评论再回来接着看它不算重看
@@ -411,7 +451,10 @@ def _foreground_unknown_text(support: str) -> str:
 def _connection_hint(state: str, device: DeviceSettings) -> str:
     """连不上时告诉用户该去查什么；无线、有线的 iPhone 都要照顾到，不再一律让人查数据线。"""
     if state == "needs_unlock":
-        return "请手动解锁手机；手机设了锁屏密码时，WebDriverAgent 自己解不开，最好把自动锁定改成「永不」。"
+        return (
+            "请手动解锁手机。设了锁屏密码的手机插件解不开：要让她自己解开，就去掉锁屏密码；"
+            "不想去掉就关掉「玩完锁屏」（play.lock_after），iPhone 的自动锁定也改成「永不」。"
+        )
     if state == "needs_action":
         return "请按上面的提示在手机上操作（比如允许 USB 调试），弄好后再开始。"
     if state == "config":
@@ -564,9 +607,15 @@ class PhoneAgent:
         # 每个设备连接识别前台的能力：supported 认出来过，unsupported 设备明确给不出，没有记录就是还不确定。
         # 跟着设备对象走：改了设备配置、换了连接，就重新判断
         self._foreground_support: "weakref.WeakKeyDictionary[PhoneDevice, str]" = weakref.WeakKeyDictionary()
+        # 自动解锁没成功过的设备（多半设了锁屏密码）：玩完不再锁屏，免得下次又解不开；再自动解开一次就去掉
+        self._cannot_unlock: "weakref.WeakSet[PhoneDevice]" = weakref.WeakSet()
+        # 按了关屏屏幕还亮着的设备：说一次，之后玩完不再试
+        self._cannot_lock: "weakref.WeakSet[PhoneDevice]" = weakref.WeakSet()
 
-        self._device: Optional[PhoneDevice] = None
-        self._device_key = ""
+        # 每台设备（按名字）的连接和它的配置：切回来时还用原来那个，记住的前台能力、锁屏情况都还在
+        self._devices: Dict[str, Tuple[str, PhoneDevice]] = {}
+        # 现在用哪台设备（名字）；配置里没有这台时用「设备」那一台
+        self._current_device = store.current_device
         # 换下来的旧设备在后台关闭连接，留着引用免得任务被回收
         self._closing: Set[asyncio.Task] = set()
         self._frame: Optional[Frame] = None
@@ -675,18 +724,66 @@ class PhoneAgent:
             self._logger.warning(f"保存诊断记录失败：{exc}")
             return ""
 
+    def _current_choice(self, config: PhonePlayConfig) -> Tuple[str, DeviceSettings]:
+        """现在用的设备（名字，设置）；记住的那台被从配置里删掉了就用「设备」那一台。"""
+        choices = config.device_choices()
+        wanted = self._current_device.casefold()
+        return next((choice for choice in choices if choice[0].casefold() == wanted), choices[0])
+
     def _get_device(self) -> PhoneDevice:
-        """返回当前配置对应的设备；设备配置变化后重新创建。"""
-        settings = self._config().device
+        """返回现在用的那台设备；它的配置变了就重新创建。"""
+        name, settings = self._current_choice(self._config())
         key = settings.model_dump_json()
-        if self._device is None or key != self._device_key:
-            if self._device is not None:
-                task = asyncio.create_task(self._device.close())
-                self._closing.add(task)
-                task.add_done_callback(self._closing.discard)
-            self._device = self._device_factory(settings)
-            self._device_key = key
-        return self._device
+        cached = self._devices.get(name)
+        if cached is not None and cached[0] == key:
+            return cached[1]
+        if cached is not None:
+            task = asyncio.create_task(cached[1].close())
+            self._closing.add(task)
+            task.add_done_callback(self._closing.discard)
+        device = self._device_factory(settings)
+        self._devices[name] = (key, device)
+        return device
+
+    def device_list(self) -> List[Dict[str, str]]:
+        """所有能切换的设备，给命令和 WebUI 用。"""
+        config = self._config()
+        current, _ = self._current_choice(config)
+        return [
+            {
+                "name": name,
+                "kind": "iPhone" if settings.backend == "ios_wda" else "安卓",
+                "address": settings.wda_url if settings.backend == "ios_wda" else (settings.serial or "自动选择"),
+                "current": name == current,
+            }
+            for name, settings in config.device_choices()
+        ]
+
+    async def switch_device(self, query: str) -> Tuple[str, bool]:
+        """换一台设备，返回（换成的名字，是不是真的换了）；记下来，重启后还用这台。
+
+        Raises:
+            SwitchRefused: 正在玩手机，或者认不出是哪台。
+        """
+        config = self._config()
+        choices = config.device_choices()
+        name = match_device(query, choices)
+        if name is None:
+            names = "、".join(choice[0] for choice in choices)
+            raise SwitchRefused(f"没有叫「{query.strip()}」的设备，能用的有：{names}")
+        if self._state != "idle":
+            current = self._session.device_name if self._session else self._current_choice(config)[0]
+            raise SwitchRefused(f"正在用{current}玩手机，先停下再换")
+        current, _ = self._current_choice(config)
+        if name == current:
+            return name, False
+        self._current_device = name
+        self._store.current_device = name
+        # 连接状态、画面都是上一台的，换了就清掉
+        self._connection = ConnectionStatus()
+        self._frame, self._frame_error = None, ""
+        await self._save_usage()
+        return name, True
 
     def status(self) -> Dict[str, Any]:
         """WebUI 与命令共用的状态快照。"""
@@ -720,7 +817,9 @@ class PhoneAgent:
             "logs": [log.to_dict() for log in reversed(self._logs)],
             "history": [record.to_dict() for record in reversed(self._store.history[-8:])],
             "last_error": self._last_error,
-            "device": self._device.description if self._device else "",
+            "device": self._device_label(config),
+            "device_name": session.device_name if session else self._current_choice(config)[0],
+            "devices": self.device_list(),
             "controller": self._controller,
             "controller_label": CONTROLLER_LABELS[self._controller],
             "connection": self._connection_payload(config),
@@ -734,6 +833,15 @@ class PhoneAgent:
             "next_auto_check": next_check,
         }
 
+    def _device_label(self, config: PhonePlayConfig) -> str:
+        name, settings = self._current_choice(config)
+        cached = self._devices.get(name)
+        description = cached[1].description if cached is not None else ""
+        # 描述本来就以「iPhone」开头时不再重复名字
+        if len(config.device_choices()) < 2 or not description or description.startswith(name):
+            return description
+        return f"{name} · {description}"
+
     def activity_text(self) -> str:
         """给聊天中的 Bot 看的近况，方便她聊起手机上看到的东西。"""
         session = self._session
@@ -744,8 +852,9 @@ class PhoneAgent:
             prefix = "（暂停中）" if self._state == "paused" else ""
             others = [visit.app.name for visit in session.visits if visit.app.name != _app_name(session)]
             visited = f"（这次还去过{'、'.join(others)}）" if others else ""
+            device = f"用{session.device_name}" if len(self._config().device_choices()) > 1 else "正在用手机"
             text = (
-                f"{prefix}正在用手机：{_app_name(session)}{visited}，想{session.goal}。"
+                f"{prefix}{device}：{_app_name(session)}{visited}，想{session.goal}。"
                 f"已经玩了 {self._elapsed_seconds(session) / 60:.0f} 分钟，最近在：{recent}。"
             )
             thoughts = "；".join(_recent_unique(session.thoughts, 3))
@@ -850,6 +959,7 @@ class PhoneAgent:
                 )
             config = self._config()
             self._check_limits(config)
+            device_name, device_settings = self._current_choice(config)
             device = self._get_device()
             session = Session(
                 trigger=trigger,
@@ -860,7 +970,9 @@ class PhoneAgent:
                 started_clock=self._clock(),
                 together=together,
                 device=device,
-                device_key=self._device_key,
+                device_key=device_settings.model_dump_json(),
+                device_name=device_name,
+                device_settings=device_settings,
             )
             self._session = session
             self._state = "starting"
@@ -1013,8 +1125,9 @@ class PhoneAgent:
             self._auto_task = None
         # 插件重载、MaiBot 关闭这类技术原因不该让她在聊天里说什么，实测她会编出「黑屏了」之类的理由
         await self.stop("插件卸载", notify=False)
-        if self._device is not None:
-            await self._device.close()
+        for _, device in self._devices.values():
+            await device.close()
+        self._devices.clear()
 
     # ===== 画面 =====
 
@@ -1129,13 +1242,16 @@ class PhoneAgent:
                 visit.since = None
         try:
             # 回桌面是为了视频别一直放着；联机游戏回桌面会退出房间，别人进来发现她走了
-            # 你接管着手机时不替你回桌面
+            # 你接管着手机时不替你回桌面，也不锁屏
             go_home = current is not None and current.goes_home(config.play.go_home_after)
-            if go_home and self._controller == "bot":
-                try:
-                    await (session.device or self._get_device()).press_key("home")
-                except DeviceError as exc:
-                    self._log(session.step, "没能回到桌面", ok=False, result=str(exc))
+            if self._controller == "bot":
+                device = session.device or self._get_device()
+                if go_home:
+                    try:
+                        await device.press_key("home")
+                    except DeviceError as exc:
+                        self._log(session.step, "没能回到桌面", ok=False, result=str(exc))
+                await self._lock_after(session, config, device, current)
         finally:
             # 回桌面被打断（插件卸载、宿主退出）也要把状态改回来，不然再也开始不了
             self._state = "idle"
@@ -1167,6 +1283,7 @@ class PhoneAgent:
             end_reason=end_reason,
             together=session.together,
             interactions=_interaction_list(session),
+            device=session.device_name if len(config.device_choices()) > 1 else "",
         )
         self._store.add_record(record)
         if self._memory is not None and session.goal:
@@ -1184,6 +1301,32 @@ class PhoneAgent:
                 await self._notifier(record, session.origin_stream)
         except Exception:
             self._logger.exception("保存或通知玩手机结果失败")
+
+    async def _lock_after(
+        self, session: Session, config: PhonePlayConfig, device: PhoneDevice, current: Optional[AllowedApp]
+    ) -> None:
+        """玩完锁屏（play.lock_after，iPhone 和安卓真机）。没打开应用、也没替她解过锁的不动手机；现在连不上就不试了。"""
+        if not config.play.lock_after or not device.supports_lock:
+            return
+        if not session.connected or self._connection.state != "ok":
+            return
+        if session.app is None and not session.unlocked:
+            return
+        if (current is not None and current.stays_open()) or device in self._cannot_lock:
+            return
+        if device in self._cannot_unlock:
+            self._log(session.step, "这次不锁屏", result="上次没能自动解锁（可能设了锁屏密码），锁上了下次解不开")
+            return
+        try:
+            locked = await device.lock()
+        except DeviceError as exc:
+            self._log(session.step, "没能锁屏", ok=False, result=str(exc))
+            return
+        if not locked:
+            self._cannot_lock.add(device)
+            self._log(session.step, "这台手机锁不了屏", result="按了关屏，屏幕还亮着，之后玩完不再试")
+            return
+        self._log(session.step, "锁屏了", result="下次玩时自动解开")
 
     async def _choose_plan(
         self, persona: Persona, apps: Sequence[AllowedApp], session: Session, config: PhonePlayConfig
@@ -1221,8 +1364,9 @@ class PhoneAgent:
         config = self._config()
         device = session.device or self._get_device()
         try:
-            await self._connect(device, _START_CONNECT_SECONDS)
-            installed = await device.installed_packages([app.package for app in config.safety.allowed_apps])
+            session.unlocked = await self._connect(device, _START_CONNECT_SECONDS)
+            session.connected = True
+            installed = await device.installed_packages([app.package for app in self._device_apps(session, config)])
         except DeviceError as exc:
             # 聊天里只说个大概，完整原因在 WebUI 的连接状态和最近错误里
             session.decline_text = {
@@ -1231,8 +1375,8 @@ class PhoneAgent:
                 "config": "手机的设置有问题，现在玩不了",
             }.get(exc.kind, "手机连不上，可能没开机或者没连好")
             raise
-        self._log(0, f"已连接 {device.description}")
-        apps = session.apps = [app for app in config.safety.allowed_apps if app.package in installed]
+        self._log(0, f"已连接 {device.description}", result="手机锁着屏，已自动解开" if session.unlocked else "")
+        apps = session.apps = [app for app in self._device_apps(session, config) if app.package in installed]
         if not apps:
             session.decline_text = "手机上没有你能玩的应用"
             session.end_reason = "白名单里的应用都没有安装在手机上，请先安装，或修改插件配置的 allowed_apps"
@@ -1297,7 +1441,7 @@ class PhoneAgent:
                 return
             # 白名单按最新配置：玩的时候删掉的应用下一步就不能用了（新加的没查过装没装，下次再算）
             installed = {app.package for app in session.apps}
-            apps = [app for app in config.safety.allowed_apps if app.package in installed]
+            apps = [app for app in self._device_apps(session, config) if app.package in installed]
             if not apps:
                 session.end_reason = "白名单里没有这次能用的应用了"
                 return
@@ -1314,7 +1458,8 @@ class PhoneAgent:
                     raise
                 # 实测 iPhone 一晚上会断开好几次（数据线松动、WDA 被重启），十几秒就恢复；等它恢复再接着玩，等不到才结束
                 self._log(session.step, "手机断开了，等它恢复", ok=False, result=str(exc))
-                await self._connect(device, _RECONNECT_SECONDS)
+                if await self._connect(device, _RECONNECT_SECONDS):
+                    session.unlocked = True
                 self._log(session.step, "手机恢复了，接着玩")
                 history.append(f"第{session.step}步：手机断开了一会儿，刚恢复，先看看现在是什么画面")
                 ok, finished, wait_seconds = False, False, 0.0
@@ -1549,8 +1694,14 @@ class PhoneAgent:
         await self._publish_frame(image, self._config())
         return await asyncio.to_thread(screen_signature, image)
 
+    @staticmethod
+    def _device_apps(session: Session, config: PhonePlayConfig) -> List[AllowedApp]:
+        """白名单里这次的设备能用的应用（应用的 devices 没写就是都能用）。"""
+        return [app for app in config.safety.allowed_apps if app.available_on(session.device_name)]
+
     def _stop_check(self, session: Session, config: PhonePlayConfig) -> str:
-        if session.device_key and config.device.model_dump_json() != session.device_key:
+        settings = dict(config.device_choices()).get(session.device_name)
+        if session.device_key and (settings is None or settings.model_dump_json() != session.device_key):
             # 接着玩会操作旧手机、截图和回桌面却发给新手机
             return "设备配置改了，这次先停下"
         if session.step >= config.play.max_steps_per_session:
@@ -1562,9 +1713,9 @@ class PhoneAgent:
             return "今天的操作步数用完了"
         return ""
 
-    async def _connect(self, device: PhoneDevice, seconds: float) -> None:
-        """确认手机能用。暂时连不上（网络抖动、WDA 重启）就在 ``seconds`` 秒内每隔几秒再试，
-        配置错误、要人处理（解锁、允许调试）的不重试。开始玩和玩到一半断开都用这一个。
+    async def _connect(self, device: PhoneDevice, seconds: float) -> bool:
+        """确认手机能用，锁着屏就解开，返回解没解过锁。暂时连不上（网络抖动、WDA 重启）就在 ``seconds`` 秒内
+        每隔几秒再试，配置错误、要人处理（解不开锁、允许调试）的不重试。开始玩和玩到一半断开都用这一个。
 
         按真实时间算总时长，每次连接最多等剩下的时间（一次请求最多要等 20 秒）；被叫停时随会话任务一起取消。
 
@@ -1576,14 +1727,16 @@ class PhoneAgent:
         while True:
             attempt += 1
             try:
-                await asyncio.wait_for(device.ensure_ready(), timeout=max(deadline - self._clock(), 0.001))
+                unlocked = await asyncio.wait_for(
+                    self._ready_and_unlocked(device), timeout=max(deadline - self._clock(), 0.001)
+                )
             except DeviceError as exc:
                 error = exc
             except asyncio.TimeoutError:
                 error = DeviceError(f"连接手机超时：{device.description} {seconds:g} 秒内没有回应")
             else:
                 self._mark_connected()
-                return
+                return unlocked
             if not error.retryable or self._clock() + _RECONNECT_INTERVAL >= deadline:
                 self._connection.state = "failed" if error.kind == "transient" else error.kind
                 self._connection.error, self._connection.deadline = str(error), 0.0
@@ -1591,6 +1744,28 @@ class PhoneAgent:
             self._connection.state, self._connection.error = "reconnecting", str(error)
             self._connection.attempt, self._connection.deadline = attempt, deadline
             await self._sleep(_RECONNECT_INTERVAL)
+
+    async def _ready_and_unlocked(self, device: PhoneDevice) -> bool:
+        await device.ensure_ready()
+        return await self._unlock(device)
+
+    async def _unlock(self, device: PhoneDevice) -> bool:
+        """锁着屏就解开，返回解没解过；解不开时记下这台手机（玩完不再锁屏），连接状态改成要解锁。
+
+        Raises:
+            DeviceNeedsUserError: 解不开（设了锁屏密码）。
+        """
+        try:
+            unlocked = await device.unlock_if_locked()
+        except DeviceError as exc:
+            if exc.kind == "needs_unlock":
+                self._cannot_unlock.add(device)
+                self._connection.state, self._connection.error = exc.kind, str(exc)
+                self._connection.attempt, self._connection.deadline = 0, 0.0
+            raise
+        if unlocked:
+            self._cannot_unlock.discard(device)
+        return unlocked
 
     def _mark_connected(self) -> None:
         connection = self._connection
@@ -1607,7 +1782,7 @@ class PhoneAgent:
             "attempt": connection.attempt,
             "remaining_seconds": remaining,
             "error": connection.error,
-            "hint": _connection_hint(connection.state, config.device),
+            "hint": _connection_hint(connection.state, self._current_choice(config)[1]),
         }
 
     async def _save_memory(self) -> None:
@@ -1685,6 +1860,12 @@ class PhoneAgent:
         await self._save_usage()
         interval = self._interval(session, config)
 
+        # 玩到一半锁屏了（有人按了电源键、到了自动锁定的时间）：先解开再看画面；解不开就结束这次
+        if await self._unlock(device):
+            session.unlocked = True
+            self._log(step, "手机锁屏了，已自动解开")
+            history.append(f"第{step}步前：手机锁屏了，已经帮你解开；画面可能回到了桌面，按现在看到的接着玩")
+
         started = time.perf_counter()
         image = await asyncio.to_thread(open_image, await device.screenshot())
         session.stats.seconds["screenshot"] += time.perf_counter() - started
@@ -1751,12 +1932,13 @@ class PhoneAgent:
         earlier_requests = session.request_log[-_REQUEST_LOG_SHOWN:]
         session.request_log.extend(requests)
         history.extend(f"第{step}步前，对方在聊天里让你：{text}" for text in requests)
+        device_settings = session.device_settings or config.device
         context = DecisionContext(
             persona=persona,
             goal=session.goal,
             apps=apps,
             allow_text_input=config.safety.allow_text_input,
-            ascii_text_only=config.device.backend == "adb" and config.device.text_input == "ascii_only",
+            ascii_text_only=device_settings.backend == "adb" and device_settings.text_input == "ascii_only",
             max_text_length=config.safety.max_text_length,
             now=self._now(),
             elapsed_minutes=self._elapsed_seconds(session) / 60,
@@ -1770,7 +1952,7 @@ class PhoneAgent:
             image_url=jpeg_data_url(model_jpeg),
             unchanged_steps=session.unchanged_steps,
             together=session.together,
-            ios=config.device.backend == "ios_wda",
+            ios=device_settings.backend == "ios_wda",
             interaction=self._interaction_quota(config),
             repeated_steps=session.repeat_count if session.repeat_count >= _REPEAT_WARNING else 0,
             repeated_action=session.last_action.describe() if session.last_action else "",

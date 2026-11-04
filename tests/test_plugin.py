@@ -14,7 +14,7 @@ from phone_play import plugin as plugin_module
 from phone_play.actions import Seen
 from phone_play.agent import PlayRefused
 from phone_play.plugin import _COMMAND_PATTERN, create_plugin
-from phone_play.settings import AllowedApp, PhonePlayConfig
+from phone_play.settings import AllowedApp, DeviceSettings, PhonePlayConfig
 from phone_play.store import SessionRecord
 
 from conftest import FakeDevice
@@ -66,6 +66,8 @@ def make_plugin(tmp_path, **overrides: Any):
         ("/手机 停止 ", "停止", None),
         ("/手机 接管", "接管", None),
         ("/手机 交还", "交还", None),
+        ("/手机 设备", "设备", None),
+        ("/手机 切换 OPPO", "切换", "OPPO"),
         ("/手机 乱说", None, "乱说"),
     ],
 )
@@ -91,6 +93,7 @@ async def test_components_and_lifecycle(tmp_path):
             "remember_for_phone",
             "phone_activity",
             "stop_phone",
+            "switch_phone",
             "phone_play_planner_context",
             "phone_play_replyer_context",
             "webui_status",
@@ -106,6 +109,7 @@ async def test_components_and_lifecycle(tmp_path):
             "webui_memory",
             "webui_memory_delete",
             "webui_memory_clear",
+            "webui_switch_device",
         ]
     )
     # 去玩、问近况、叫停一直在她的工具列表里，不用先 tool_search；看屏幕按需搜索
@@ -120,6 +124,7 @@ async def test_components_and_lifecycle(tmp_path):
         "stop_phone": "visible",
         "show_phone_screen": None,
         "remember_for_phone": None,
+        "switch_phone": None,
     }
     # 宿主只把 description 发给模型（detailed_description 已经不用了），用法都要写在这里
     descriptions = {
@@ -622,5 +627,70 @@ async def test_watched_videos_can_be_cleared_without_forgetting_the_rest(tmp_pat
         assert [item["kind"] for item in (await plugin.webui_memory())["items"]] == ["interest"]
         with pytest.raises(ValueError, match="不认识的记忆类型"):
             await plugin.webui_memory_clear(kind="everything")
+    finally:
+        await plugin.on_unload()
+
+
+def two_device_plugin(tmp_path):
+    return make_plugin(
+        tmp_path,
+        device={"name": "iPhone", "backend": "ios_wda"},
+        multi_device={"devices": [DeviceSettings(name="OPPO", serial="192.168.1.23")]},
+    )
+
+
+async def test_devices_can_be_listed_and_switched_by_admins(tmp_path):
+    plugin = two_device_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        listed = await command(plugin, "/手机 设备", user_id="anyone")
+        assert "· iPhone（现在用的）：iPhone · http://127.0.0.1:8100" in listed
+        assert "· OPPO：安卓 · 192.168.1.23" in listed
+        assert "admin_user_ids" in await command(plugin, "/手机 切换 OPPO", user_id="20002")
+        assert await command(plugin, "/手机 切换 华为") == "没换：没有叫「华为」的设备，能用的有：iPhone、OPPO"
+        assert "要换哪台" in await command(plugin, "/手机 切换")
+        # 聊天里常说「安卓」：只有一台安卓设备时就是它
+        assert await command(plugin, "/手机 切换 安卓") == "好，小睦之后用OPPO玩手机"
+        assert await command(plugin, "/手机 切换 oppo") == "现在用的就是OPPO"
+        assert "设备：OPPO（共 2 台" in await command(plugin, "/手机")
+    finally:
+        await plugin.on_unload()
+    # 记住了：插件重新加载后还用 OPPO
+    plugin = two_device_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        assert (await plugin.webui_status())["device_name"] == "OPPO"
+    finally:
+        await plugin.on_unload()
+
+
+async def test_switch_phone_tool_is_for_admins_only(tmp_path):
+    plugin = two_device_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        listed = await plugin.tool_switch_phone(device="", user_id="20002")
+        assert listed["content"] == "你的手机有：iPhone（iPhone，现在用的）、OPPO（安卓）"
+        refused = await plugin.tool_switch_phone(device="OPPO", user_id="20002")
+        assert refused["success"] is False and "只有管理员" in refused["error"]
+        assert plugin.agent.status()["device_name"] == "iPhone"
+        switched = await plugin.tool_switch_phone(device="OPPO", user_id="10001")
+        assert switched["success"] and "之后玩手机用OPPO" in switched["content"]
+        assert "不用换" in (await plugin.tool_switch_phone(device="OPPO", user_id="10001"))["content"]
+        unknown = await plugin.tool_switch_phone(device="小米", user_id="10001")
+        assert unknown["success"] is False and "能用的有：iPhone、OPPO" in unknown["error"]
+    finally:
+        await plugin.on_unload()
+
+
+async def test_webui_switches_devices(tmp_path):
+    plugin = two_device_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        assert await plugin.webui_switch_device(name="OPPO") == {"device": "OPPO", "changed": True}
+        status = await plugin.webui_status()
+        assert status["device_name"] == "OPPO"
+        assert [(item["name"], item["current"]) for item in status["devices"]] == [("iPhone", False), ("OPPO", True)]
+        with pytest.raises(ValueError, match="没有叫「小米」的设备"):
+            await plugin.webui_switch_device(name="小米")
     finally:
         await plugin.on_unload()

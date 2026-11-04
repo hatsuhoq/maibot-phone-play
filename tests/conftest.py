@@ -9,7 +9,13 @@ import sys
 # 让测试可以用 phone_play.xxx 的方式导入插件模块（与宿主加载插件包的方式一致）
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from phone_play.devices import AppNotInstalledError, DeviceError, KeyName, PhoneDevice  # noqa: E402
+from phone_play.devices import (  # noqa: E402
+    AppNotInstalledError,
+    DeviceError,
+    DeviceNeedsUserError,
+    KeyName,
+    PhoneDevice,
+)
 from phone_play.ui_tree import UIElement  # noqa: E402
 
 
@@ -31,7 +37,9 @@ def scene_png(*boxes: Tuple[Tuple[int, int, int, int], str]) -> bytes:
 
 
 class FakeDevice(PhoneDevice):
-    """记录所有操作的假手机。"""
+    """记录所有操作的假手机；能锁屏（像 iPhone），测安卓时把 supports_lock 设成 False。"""
+
+    supports_lock = True
 
     def __init__(
         self,
@@ -58,6 +66,9 @@ class FakeDevice(PhoneDevice):
         self.elements = list(elements or [])
         self.home = home if home is not None else {"com.android.launcher3"}
         self.png = make_png()
+        # 锁着屏时下一次 unlock_if_locked 解开；unlock_fails 为真时模拟设了锁屏密码、解不开
+        self.locked = False
+        self.unlock_fails = False
 
     @property
     def description(self) -> str:
@@ -112,6 +123,20 @@ class FakeDevice(PhoneDevice):
         if self.input_focus is None:
             return None
         return self.typed if self.input_focus else ""
+
+    async def unlock_if_locked(self) -> bool:
+        if not self.locked:
+            return False
+        if self.unlock_fails:
+            raise DeviceNeedsUserError("测试手机锁着屏，自动解锁没成功", "needs_unlock")
+        self.locked = False
+        self.calls.append(("unlock",))
+        return True
+
+    async def lock(self) -> bool:
+        self.calls.append(("lock",))
+        self.locked = True
+        return True
 
     async def close(self) -> None:
         self.calls.append(("close",))

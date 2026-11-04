@@ -34,6 +34,8 @@ class SessionRecord:
     last_app: str = ""
     # 这次的模型调用次数、token（宿主给出的才算）和各环节耗时，见 agent 的 SessionStats；旧记录没有
     stats: Dict[str, Any] = field(default_factory=dict)
+    # 用的哪台设备（多设备时的名字）；旧记录没有
+    device: str = ""
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)
@@ -64,6 +66,8 @@ class UsageStore:
         # 当天调用模型的次数（失败的也算）
         self._model_calls = 0
         self._history: List[SessionRecord] = []
+        # 现在用哪台设备（多设备时的名字，空字符串是「设备」那一台），重启后还记得
+        self.current_device = ""
         # 加载时发现记录文件损坏、已备份重来的说明，没出问题是空字符串
         self.recovered = ""
         # 每步都会保存。写文件的线程停不下来：保存被取消（叫停时）后它还在写，
@@ -85,6 +89,7 @@ class UsageStore:
             interactions = {str(kind): int(count) for kind, count in data.get("interactions", {}).items()}
             model_calls = int(data.get("model_calls", 0))
             history = [SessionRecord.from_dict(item) for item in data["history"]]
+            current_device = str(data.get("current_device", ""))
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             # 一个记录文件坏了不该让整个插件加载失败：留个备份，从空记录重新开始
             backup = self._path.with_name(f"{self._path.name}.broken-{datetime.now():%Y%m%d%H%M%S}")
@@ -94,6 +99,7 @@ class UsageStore:
         self._date, self._sessions, self._steps = date, sessions, steps
         self._interactions, self._history = interactions, history
         self._model_calls = model_calls
+        self.current_device = current_device
 
     def _snapshot(self) -> Dict[str, Any]:
         return {
@@ -103,6 +109,7 @@ class UsageStore:
             "interactions": dict(self._interactions),
             "model_calls": self._model_calls,
             "history": [record.to_dict() for record in self._history],
+            "current_device": self.current_device,
         }
 
     def _write(self, version: int, payload: Dict[str, Any]) -> None:

@@ -34,6 +34,10 @@
   .logs li { padding: 8px 0; border-bottom: 1px solid var(--maibot-border, #8883); overflow-wrap: anywhere; }
   .logs li:last-child { border-bottom: none; }
   .logs .row { display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+  .device-row { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin: 4px 0 8px; }
+  /* display: flex 会盖过 hidden 属性，只有一台设备时要真的藏起来 */
+  .device-row[hidden] { display: none; }
+  .device-row select { flex: 1 1 180px; min-width: 0; }
   .logs .time { font-family: var(--maibot-font-mono, ui-monospace, monospace); font-size: 12px; flex: none; }
   .logs .failed .summary { color: var(--maibot-danger, #d33); }
   .logs .detail { font-size: 12px; margin-left: 4px; }
@@ -94,6 +98,11 @@
       <div class="maibot-card-header">
         <span>连接</span>
         <span id="connection" class="maibot-badge">—</span>
+      </div>
+      <div id="deviceRow" class="device-row" hidden>
+        <label for="deviceSelect" class="maibot-muted">设备</label>
+        <select id="deviceSelect" class="maibot-input"></select>
+        <button id="switchDevice" class="maibot-button">切换</button>
       </div>
       <div id="connectionMeta" class="meta-line maibot-muted"></div>
       <p id="connectionError" class="error"></p>
@@ -208,6 +217,27 @@
     $('refreshMemory').disabled = busy;
     $('clearMemory').disabled = busy;
     $('clearWatched').disabled = busy;
+    // 正在玩时不能换设备
+    $('switchDevice').disabled = busy || active;
+    $('deviceSelect').disabled = busy || active;
+  }
+
+  let deviceNames = '';
+  function renderDevices(data) {
+    const devices = data.devices || [];
+    $('deviceRow').hidden = devices.length < 2;
+    const names = devices.map(item => item.name).join('\n');
+    // 列表没变就不重建，免得正在选的时候被轮询打断
+    if (names === deviceNames) return;
+    deviceNames = names;
+    const select = $('deviceSelect');
+    select.replaceChildren(...devices.map(item => {
+      const option = document.createElement('option');
+      option.value = item.name;
+      option.textContent = `${item.name}（${item.kind} · ${item.address}）`;
+      option.selected = item.current;
+      return option;
+    }));
   }
 
   function renderConnection(connection) {
@@ -270,6 +300,7 @@
     $('controller').textContent = data.controller_label;
     $('controller').classList.toggle('badge-user', data.controller === 'user');
     $('device').textContent = data.device;
+    renderDevices(data);
     $('controlNote').textContent = data.controller === 'user'
       ? '你在操作：她不会发任何操作，自动玩也不会开始；用完点「交还控制」，她会看看现在的画面再接着玩。'
       : '想自己用手机时点「我来操作」，她会马上停手；和「暂停」不同，正在想的这一步也会作废。';
@@ -449,6 +480,11 @@
   $('resume').onclick = () => run('resume', {});
   $('stop').onclick = () => run('stop', {});
   $('takeover').onclick = () => run('takeover', {});
+  $('switchDevice').onclick = async () => {
+    await run('switch_device', { name: $('deviceSelect').value });
+    deviceNames = '';
+    if (lastStatus) renderDevices(lastStatus);
+  };
   $('release').onclick = () => run('release', {});
   $('clearDiagnostics').onclick = () => run('clear_diagnostics', {});
   $('clearMemory').onclick = () => { if (confirm('删除她记得的全部内容（包括看过的视频）？')) run('memory_clear', {}, true); };

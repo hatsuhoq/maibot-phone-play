@@ -1,13 +1,15 @@
 """刷会儿手机插件配置模型。"""
 
-from typing import List, Literal
+from typing import List, Literal, Tuple
 
 from maibot_sdk import Field, PluginConfigBase
-from pydantic import field_validator
+from pydantic import field_validator, model_validator
 
 import re
 
 _HOURS_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
+# 「设备」那一台没写名字时叫这个
+DEFAULT_DEVICE_NAME = "默认"
 
 
 class PluginSettings(PluginConfigBase):
@@ -36,6 +38,10 @@ class DeviceSettings(PluginConfigBase):
     __ui_icon__ = "smartphone"
     __ui_order__ = 1
 
+    name: str = Field(
+        default="",
+        description="设备名字，切换设备时用，例如 iPhone、OPPO；只有一台设备时可以不填（叫「默认」）",
+    )
     backend: Literal["adb", "ios_wda"] = Field(
         default="adb",
         description="设备类型：adb=安卓真机或模拟器；ios_wda=iPhone（通过 WebDriverAgent 控制）",
@@ -48,9 +54,11 @@ class DeviceSettings(PluginConfigBase):
     serial: str = Field(
         default="",
         description="设备序列号或 IP:端口（如 MuMu 的 127.0.0.1:16384）；留空时使用唯一已连接的设备。"
-        "只填自己的设备，别指向不可信的主机",
+        "无线调试的手机填 IP:端口，或者只填 IP，端口变了插件会用 mDNS 找新的。只填自己的设备，别指向不可信的主机",
     )
-    auto_connect: bool = Field(default=True, description="序列号是 IP:端口 时，自动执行 adb connect")
+    auto_connect: bool = Field(
+        default=True, description="序列号是 IP:端口 或 IP 时，自动执行 adb connect，无线调试换了端口时用 mDNS 找新端口"
+    )
     wda_url: str = Field(
         default="http://127.0.0.1:8100",
         description="iPhone 上 WebDriverAgent 的地址（ios_wda 用）；用 ios forward 8100 8100 转发时保持默认即可。"
@@ -129,6 +137,11 @@ class AllowedApp(PluginConfigBase):
         default=False,
         description="旧选项，相当于 reopen_on_start=no 加 go_home_after=no；单独设置了那两项时以那两项为准",
     )
+    devices: List[str] = Field(
+        default_factory=list,
+        description='只在这些设备上用，写设备名，例如 ["OPPO"]；不写就是哪台都能用。'
+        "iPhone 和安卓上包名不一样的应用各写一条、各标上设备",
+    )
 
     @field_validator("step_interval_seconds")
     @classmethod
@@ -148,6 +161,14 @@ class AllowedApp(PluginConfigBase):
         if self.go_home_after != "default":
             return self.go_home_after == "yes"
         return False if self.keep_open else default
+
+    def available_on(self, device_name: str) -> bool:
+        """这台设备能不能用这个应用（devices 没写就是都能用）。"""
+        return not self.devices or device_name.casefold() in {name.casefold() for name in self.devices}
+
+    def stays_open(self) -> bool:
+        """这个应用自己设了玩完留在里面（go_home_after=no，或者旧的 keep_open）：联机游戏锁屏也会掉线，玩完不锁屏。"""
+        return self.go_home_after == "no" or (self.go_home_after == "default" and self.keep_open)
 
 
 def _default_allowed_apps() -> List[AllowedApp]:
@@ -241,6 +262,11 @@ class PlaySettings(PluginConfigBase):
         default=True, description="每次开始玩时先关掉应用再打开，从应用首页开始，不接着上次停下的页面"
     )
     go_home_after: bool = Field(default=True, description="玩完后回到桌面，视频不会在后台一直播放")
+    lock_after: bool = Field(
+        default=True,
+        description="玩完锁屏（iPhone 和安卓真机，模拟器不锁），下次玩时自动解开；"
+        "你接管着手机、应用设了玩完留在里面（联机游戏）时不锁。手机设了锁屏密码就关掉，不然下次她解不开、玩不了",
+    )
     skip_watched_videos: bool = Field(
         default=True,
         description="记住 30 天内看过的视频，不再点开、刷到了直接划走；对方在聊天里点名要看的不拦",
@@ -297,6 +323,28 @@ class WebUISettings(PluginConfigBase):
     chat_image_max_edge: int = Field(default=1280, ge=320, le=2560, description="/手机截图 发到聊天里的图片最长边像素")
 
 
+class MultiDeviceSettings(PluginConfigBase):
+    """更多手机：可以用 /手机 切换、或者在聊天里叫她换一台。"""
+
+    __ui_label__ = "多设备"
+    __ui_icon__ = "smartphone"
+    __ui_order__ = 8
+
+    devices: List[DeviceSettings] = Field(
+        default_factory=list,
+        description="除了「设备」那一台以外的手机，写法和「设备」一样，每台都要写 name；"
+        "用 /手机 切换 名字 换着用，当前用的是哪台插件会记住",
+    )
+
+    @field_validator("devices")
+    @classmethod
+    def validate_devices(cls, value: List[DeviceSettings]) -> List[DeviceSettings]:
+        for device in value:
+            if not device.name.strip():
+                raise ValueError("多设备里的每台手机都要写 name，切换时用它")
+        return value
+
+
 class PhonePlayConfig(PluginConfigBase):
     """刷会儿手机插件配置。"""
 
@@ -308,3 +356,27 @@ class PhonePlayConfig(PluginConfigBase):
     play: PlaySettings = Field(default_factory=PlaySettings)
     auto_play: AutoPlaySettings = Field(default_factory=AutoPlaySettings)
     webui: WebUISettings = Field(default_factory=WebUISettings)
+    multi_device: MultiDeviceSettings = Field(default_factory=MultiDeviceSettings)
+
+    @model_validator(mode="after")
+    def validate_device_names(self) -> "PhonePlayConfig":
+        names = [name for name, _ in self.device_choices()]
+        folded = [name.casefold() for name in names]
+        duplicated = sorted({name for name in names if folded.count(name.casefold()) > 1})
+        if duplicated:
+            raise ValueError(
+                f"设备名字重复了：{'、'.join(duplicated)}（「设备」那一台没写 name 时叫「{DEFAULT_DEVICE_NAME}」）"
+            )
+        for app in self.safety.allowed_apps:
+            unknown = [name for name in app.devices if name.casefold() not in folded]
+            if unknown:
+                raise ValueError(
+                    f"应用 {app.name or app.package} 的 devices 里有不存在的设备：{'、'.join(unknown)}"
+                    f"（现有：{'、'.join(names)}）"
+                )
+        return self
+
+    def device_choices(self) -> List[Tuple[str, DeviceSettings]]:
+        """所有能切换的设备（名字，设置）：「设备」那一台在最前面。"""
+        main = (self.device.name.strip() or DEFAULT_DEVICE_NAME, self.device)
+        return [main, *((device.name.strip(), device) for device in self.multi_device.devices)]

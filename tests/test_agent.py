@@ -8,10 +8,19 @@ import pytest
 import threading
 import time
 
-from phone_play.agent import AgentError, ModelReply, PhoneAgent, PlayRefused, Session, in_active_hours
+from phone_play.agent import (
+    AgentError,
+    ModelReply,
+    PhoneAgent,
+    PlayRefused,
+    Session,
+    SwitchRefused,
+    in_active_hours,
+    match_device,
+)
 from phone_play.devices import DeviceConfigError, DeviceError, DeviceNeedsUserError, Foreground
 from phone_play.prompts import Persona
-from phone_play.settings import AllowedApp, PhonePlayConfig
+from phone_play.settings import AllowedApp, DeviceSettings, PhonePlayConfig
 from phone_play.actions import Seen
 from phone_play.memory import MemoryStore
 from phone_play.store import SessionRecord, UsageStore
@@ -115,13 +124,14 @@ async def test_full_session_plans_launches_acts_and_records(tmp_path):
     )
     record = await harness.run(hint="看猫", origin_stream="stream-1")
 
-    # 先关掉应用再打开（从首页开始），玩完回桌面
+    # 先关掉应用再打开（从首页开始），玩完回桌面、锁屏
     assert harness.device.actions() == [
         ("stop", "tv.danmaku.bili"),
         ("launch", "tv.danmaku.bili"),
         ("tap", 270, 200),
         ("swipe", 270, 600, 270, 120),
         ("key", "home"),
+        ("lock",),
     ]
     assert record.app == "哔哩哔哩"
     assert record.goal == "看猫猫视频"
@@ -169,7 +179,8 @@ async def test_fresh_start_and_go_home_can_be_disabled(tmp_path):
     config.play.go_home_after = False
     harness = Harness(tmp_path, FakeDevice(), [action(action="finish")], config=config)
     await harness.run()
-    assert harness.device.actions() == [("launch", "tv.danmaku.bili")]
+    # 不回桌面也照常锁屏：锁屏不会关掉应用，解开后还在原来的画面
+    assert harness.device.actions() == [("launch", "tv.danmaku.bili"), ("lock",)]
 
 
 async def test_goal_is_repeated_next_to_screenshot(tmp_path):
@@ -1018,16 +1029,21 @@ async def test_keep_open_apps_are_not_closed_or_left_for_the_home_screen(tmp_pat
 async def test_reopening_the_same_app_soon_resumes_where_she_left(tmp_path):
     # 实测群友一喊「回房间」她就重开一次，每次都先关掉游戏、冷启动
     harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="看了一会儿猫猫视频")] * 3)
+
+    def first_app_action() -> Tuple:
+        # 上次玩完锁了屏，这次先解锁；只看对应用做了什么
+        return next(call for call in harness.device.actions() if call[0] in ("stop", "launch"))
+
     await harness.run()
-    assert harness.device.actions()[0] == ("stop", "tv.danmaku.bili")
+    assert first_app_action() == ("stop", "tv.danmaku.bili")
     harness.device.calls.clear()
     harness.seconds += 5 * 60
     await harness.run()
-    assert harness.device.actions()[0] == ("launch", "tv.danmaku.bili")
+    assert first_app_action() == ("launch", "tv.danmaku.bili")
     harness.device.calls.clear()
     harness.seconds += 16 * 60
     await harness.run()
-    assert harness.device.actions()[0] == ("stop", "tv.danmaku.bili")
+    assert first_app_action() == ("stop", "tv.danmaku.bili")
 
 
 @pytest.mark.parametrize("changes_at,woke_early", [(5, True), (None, False)])
@@ -1329,6 +1345,160 @@ async def test_errors_that_retrying_cannot_fix_are_not_retried(tmp_path, error, 
     assert refused.value.chat_text == chat
     assert harness.agent.status()["connection"]["state"] == state
     harness.assert_not_counted()
+
+
+def log_lines(harness: Harness) -> List[Tuple[str, str]]:
+    return [(log["summary"], log["result"]) for log in harness.agent.status()["logs"]]
+
+
+async def test_locked_phone_is_unlocked_at_start_and_locked_again_after(tmp_path):
+    device = FakeDevice()
+    device.locked = True
+    harness = Harness(tmp_path, device, [action(action="finish", summary="看了一会儿")])
+    await harness.run()
+    actions = harness.device.actions()
+    assert actions[0] == ("unlock",)
+    assert actions[-2:] == [("key", "home"), ("lock",)]
+    assert ("已连接 测试手机", "手机锁着屏，已自动解开") in log_lines(harness)
+    assert ("锁屏了", "下次玩时自动解开") in log_lines(harness)
+    assert harness.device.locked
+
+
+class LockedMidwayPhone(FakeDevice):
+    """滑动后手机锁屏了（模拟有人按了电源键、到了自动锁定时间）。"""
+
+    async def swipe(self, x1: int, y1: int, x2: int, y2: int, duration_ms: int) -> None:
+        await super().swipe(x1, y1, x2, y2, duration_ms)
+        self.locked = True
+
+
+async def test_phone_locked_midway_is_unlocked_before_the_next_look(tmp_path):
+    harness = Harness(
+        tmp_path,
+        LockedMidwayPhone(),
+        [action(action="swipe", direction="up", summary="刷下一个"), action(action="finish", summary="刷完了")],
+    )
+    record = await harness.run()
+    calls = harness.device.calls
+    unlock = calls.index(("unlock",))
+    # 先解锁再截图看画面，她看到的不是锁屏
+    assert calls[unlock + 1] == ("screenshot",)
+    assert calls.index(("swipe", 270, 600, 270, 120)) < unlock
+    assert (record.steps, record.end_reason) == (2, "自己不想玩了")
+    assert ("手机锁屏了，已自动解开", "") in log_lines(harness)
+    assert "第2步前：手机锁屏了，已经帮你解开" in harness.state_texts()[1]
+    assert harness.device.actions()[-1] == ("lock",)
+
+
+async def test_phone_locked_midway_that_cannot_be_unlocked_ends_the_session(tmp_path):
+    device = LockedMidwayPhone()
+    device.unlock_fails = True
+    harness = Harness(
+        tmp_path,
+        device,
+        [action(action="swipe", direction="up", summary="刷下一个"), action(action="finish", summary="不会走到这")],
+    )
+    record = await harness.run()
+    assert record.end_reason == "出错：测试手机锁着屏，自动解锁没成功"
+    # 解不开时不再问模型，也不会对着锁屏乱点；本来就锁着，收尾不再锁
+    assert len(harness.vision_messages) == 1
+    assert ("lock",) not in harness.device.actions()
+    assert harness.agent.status()["connection"]["state"] == "needs_unlock"
+
+
+async def test_phone_that_could_not_be_unlocked_is_not_locked_after_play(tmp_path):
+    # 上次解不开（多半设了锁屏密码），人手动解开后再玩：玩完不锁，免得下次又解不开
+    device = FakeDevice()
+    device.locked, device.unlock_fails = True, True
+    harness = Harness(tmp_path, device, [action(action="finish", summary="看了一会儿")] * 2)
+    await harness.agent.start(trigger="chat", origin_stream="s")
+    with pytest.raises(PlayRefused):
+        await harness.agent.wait_for_plan(5)
+    await harness.wait_done()
+    assert harness.agent.status()["connection"]["state"] == "needs_unlock"
+    harness.assert_not_counted()
+
+    device.locked = False
+    await harness.run()
+    assert ("lock",) not in device.actions()
+    assert any(summary == "这次不锁屏" for summary, _ in log_lines(harness))
+
+    # 后来又能自动解开了（去掉了锁屏密码），之后照常锁屏
+    device.locked, device.unlock_fails = True, False
+    await harness.run()
+    assert device.actions()[-1] == ("lock",)
+
+
+async def test_lock_after_can_be_disabled_and_skips_apps_that_stay_open(tmp_path):
+    config = PhonePlayConfig()
+    config.play.lock_after = False
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish")], config=config)
+    await harness.run()
+    assert ("lock",) not in harness.device.actions()
+
+    # 联机游戏设了玩完留在里面：锁屏也会掉线，不锁
+    config = PhonePlayConfig()
+    config.safety.allowed_apps = [AllowedApp(package="tv.danmaku.bili", name="哔哩哔哩", go_home_after="no")]
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish")], config=config)
+    await harness.run()
+    assert harness.device.actions()[-1] == ("launch", "tv.danmaku.bili")
+
+
+class AndroidPhone(FakeDevice):
+    """安卓：不查锁屏，也不锁屏。"""
+
+    supports_lock = False
+
+    async def unlock_if_locked(self) -> bool:
+        self.calls.append(("unlock_check",))
+        return False
+
+
+async def test_android_is_never_locked_after_play(tmp_path):
+    harness = Harness(tmp_path, AndroidPhone(), [action(action="finish", summary="看了一会儿")])
+    await harness.run()
+    assert ("lock",) not in harness.device.actions()
+    assert not any("锁" in summary for summary, _ in log_lines(harness))
+
+
+class SilentLockPhone(FakeDevice):
+    """锁屏请求发出去了却没锁上。"""
+
+    async def lock(self) -> bool:
+        self.calls.append(("lock",))
+        return False
+
+
+async def test_lock_that_did_not_take_is_reported_once(tmp_path):
+    # 按了关屏屏幕还亮着：不能写成「锁屏了」，说一次，之后不再试
+    harness = Harness(tmp_path, SilentLockPhone(), [action(action="finish", summary="看了一会儿")] * 2)
+    await harness.run()
+    assert ("这台手机锁不了屏", "按了关屏，屏幕还亮着，之后玩完不再试") in log_lines(harness)
+    assert not any(summary == "锁屏了" for summary, _ in log_lines(harness))
+    await harness.run()
+    assert harness.device.actions().count(("lock",)) == 1
+
+
+async def test_declined_plan_relocks_only_a_phone_it_unlocked(tmp_path):
+    plan = json.dumps({"app": "", "reason": "手机上没有王者荣耀"}, ensure_ascii=False)
+    device = FakeDevice()
+    device.locked = True
+    harness = Harness(tmp_path, device, [], plan=plan)
+    await harness.agent.start(trigger="chat", origin_stream="s")
+    with pytest.raises(PlayRefused):
+        await harness.agent.wait_for_plan(5)
+    await harness.wait_done()
+    # 是她解开的，没玩成也锁回去
+    assert device.actions() == [("unlock",), ("lock",)]
+
+
+async def test_watching_the_screen_from_webui_does_not_unlock(tmp_path):
+    device = FakeDevice()
+    device.locked = True
+    harness = Harness(tmp_path, device, [])
+    await harness.agent.refresh_frame()
+    await harness.agent.chat_screenshot()
+    assert device.locked and ("unlock",) not in device.calls
 
 
 class StuckConnectingPhone(FakeDevice):
@@ -2088,3 +2258,129 @@ async def test_page_is_forgotten_when_she_switches_apps(tmp_path):
     await harness.run()
     # 打开小红书时，刚才在 B 站认出来的竖屏播放器就清掉了
     assert pages[-1] == ""
+
+
+def two_device_config() -> PhonePlayConfig:
+    config = PhonePlayConfig()
+    config.device.name = "iPhone"
+    config.device.backend = "ios_wda"
+    config.multi_device.devices = [DeviceSettings(name="OPPO", serial="192.168.1.23")]
+    config.safety.allowed_apps = [
+        AllowedApp(package="tv.danmaku.bilianime", name="哔哩哔哩", devices=["iPhone"]),
+        AllowedApp(package="tv.danmaku.bili", name="哔哩哔哩", devices=["OPPO"]),
+        AllowedApp(package="com.xingin.xhs", name="小红书"),
+    ]
+    return config
+
+
+def two_device_harness(tmp_path, responses: Sequence[str], plan: str = PLAN) -> Tuple[Harness, Dict[str, FakeDevice]]:
+    phones = {
+        "iPhone": FakeDevice(installed={"tv.danmaku.bilianime", "com.xingin.xhs"}),
+        "OPPO": FakeDevice(installed={"tv.danmaku.bili", "com.xingin.xhs"}),
+    }
+    phones["iPhone"].default_foreground = "tv.danmaku.bilianime"
+    harness = Harness(tmp_path, phones["iPhone"], responses, config=two_device_config(), plan=plan)
+    harness.agent._device_factory = lambda settings: phones[settings.name]
+    return harness, phones
+
+
+@pytest.mark.parametrize(
+    "query,expected",
+    [
+        ("OPPO", "OPPO"),
+        ("oppo", "OPPO"),
+        ("OPPO手机", "OPPO"),
+        ("安卓手机", "OPPO"),
+        ("苹果", "iPhone"),
+        ("iphone 14", "iPhone"),
+        ("华为", None),
+        ("", None),
+    ],
+)
+def test_match_device(query, expected):
+    assert match_device(query, two_device_config().device_choices()) == expected
+
+
+def test_match_device_is_not_guessed_when_ambiguous():
+    config = two_device_config()
+    config.multi_device.devices.append(DeviceSettings(name="模拟器", serial="127.0.0.1:16416"))
+    # 两台安卓：「安卓」认不出是哪台
+    assert match_device("安卓", config.device_choices()) is None
+
+
+async def test_switched_device_is_used_and_its_apps_only(tmp_path):
+    plan = json.dumps({"app": "tv.danmaku.bili", "goal": "看猫猫视频", "minutes": 5}, ensure_ascii=False)
+    harness, phones = two_device_harness(tmp_path, [action(action="finish", summary="看了一会儿")], plan=plan)
+    assert await harness.agent.switch_device("OPPO") == ("OPPO", True)
+    record = await harness.run()
+    assert ("launch", "tv.danmaku.bili") in phones["OPPO"].actions()
+    assert phones["iPhone"].calls == []
+    # 只标了 iPhone 的 B 站不会出现在 OPPO 的计划里
+    assert "tv.danmaku.bilianime" not in harness.plan_prompts[0]
+    assert "tv.danmaku.bili" in harness.plan_prompts[0] and "com.xingin.xhs" in harness.plan_prompts[0]
+    assert record.device == "OPPO"
+    assert "用OPPO" not in harness.agent.activity_text()
+    # 换的设备存进了使用记录，重启后还在
+    saved = json.loads((tmp_path / "usage.json").read_text(encoding="utf-8"))
+    assert saved["current_device"] == "OPPO"
+
+
+IPHONE_PLAN = json.dumps({"app": "tv.danmaku.bilianime", "goal": "看猫猫视频", "minutes": 5}, ensure_ascii=False)
+
+
+async def test_cannot_switch_while_playing(tmp_path):
+    harness, _ = two_device_harness(
+        tmp_path, [action(action="wait", seconds=5), action(action="finish")], plan=IPHONE_PLAN
+    )
+    gate, deciding = asyncio.Event(), asyncio.Event()
+    harness.agent._vision = gated_vision(harness, gate, deciding)
+    await harness.agent.start(trigger="command")
+    await asyncio.wait_for(deciding.wait(), 5)
+    assert "用iPhone：" in harness.agent.activity_text()
+    with pytest.raises(SwitchRefused, match="正在用iPhone玩手机，先停下再换"):
+        await harness.agent.switch_device("OPPO")
+    with pytest.raises(SwitchRefused, match="没有叫「华为」的设备"):
+        await harness.agent.switch_device("华为")
+    gate.set()
+    await harness.wait_done()
+    assert harness.agent.status()["device_name"] == "iPhone"
+
+
+async def test_removed_device_falls_back_to_the_main_one(tmp_path):
+    harness, phones = two_device_harness(tmp_path, [action(action="finish")])
+    await harness.agent.switch_device("OPPO")
+    harness.config.multi_device.devices = []
+    harness.config.safety.allowed_apps = [AllowedApp(package="tv.danmaku.bilianime", name="哔哩哔哩")]
+    harness.plans = [IPHONE_PLAN]
+    await harness.run()
+    assert harness.agent.status()["device_name"] == "iPhone"
+    assert ("launch", "tv.danmaku.bilianime") in phones["iPhone"].actions()
+
+
+def test_device_names_are_checked():
+    with pytest.raises(ValueError, match="设备名字重复了：OPPO"):
+        PhonePlayConfig.model_validate(
+            {"device": {"name": "OPPO"}, "multi_device": {"devices": [{"name": "oppo", "serial": "a"}]}}
+        )
+    with pytest.raises(ValueError, match="每台手机都要写 name"):
+        PhonePlayConfig.model_validate({"multi_device": {"devices": [{"serial": "a"}]}})
+    with pytest.raises(ValueError, match="不存在的设备：小米"):
+        PhonePlayConfig.model_validate(
+            {"safety": {"allowed_apps": [{"package": "com.a.b", "name": "A", "devices": ["小米"]}]}}
+        )
+    # 只有一台、没写名字时叫「默认」，旧配置照常能用
+    assert [name for name, _ in PhonePlayConfig().device_choices()] == ["默认"]
+
+
+async def test_device_label_names_the_device_once(tmp_path):
+    harness, phones = two_device_harness(tmp_path, [])
+    phones["OPPO"].__class__ = type(
+        "NamedPhone", (FakeDevice,), {"description": property(lambda self: "安卓 · 1.2.3.4:5")}
+    )
+    await harness.agent.switch_device("OPPO")
+    harness.agent._get_device()
+    assert harness.agent.status()["device"] == "OPPO · 安卓 · 1.2.3.4:5"
+    phones["iPhone"].__class__ = type("IPhone", (FakeDevice,), {"description": property(lambda self: "iPhone · url")})
+    await harness.agent.switch_device("iPhone")
+    harness.agent._get_device()
+    assert harness.agent.status()["device"] == "iPhone · url"

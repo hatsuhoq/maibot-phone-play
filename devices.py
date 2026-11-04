@@ -14,6 +14,8 @@ import shlex
 import subprocess
 import sys
 
+from .imaging import is_dark_screen
+from .mdns import query_adb_port
 from .settings import DeviceSettings
 from .ui_tree import UIElement, parse_uiautomator_xml, parse_wda_xml
 
@@ -21,6 +23,22 @@ KeyName = Literal["back", "home", "enter"]
 ProcessRunner = Callable[[Sequence[str], float], Awaitable[Tuple[int, bytes, bytes]]]
 
 _KEYCODES: Dict[str, int] = {"back": 4, "home": 3, "enter": 66}
+# 只点亮、只关掉屏幕的按键（安卓 4.4W 起有），不像电源键那样按一下切换一次
+_KEYCODE_SLEEP = 223
+_KEYCODE_WAKEUP = 224
+# 安卓的锁屏状态：屏幕亮没亮（dumpsys power），锁屏界面在不在（dumpsys window policy 里 KeyguardServiceDelegate 那一段）
+_LOCK_STATE_COMMAND = "dumpsys power | grep 'mWakefulness='; dumpsys window policy | grep -E '^ *showing='; true"
+_WAKEFULNESS_PATTERN = re.compile(r"mWakefulness=(\w+)")
+_KEYGUARD_PATTERN = re.compile(r"^\s*showing=(true|false)\s*$", re.MULTILINE)
+# 用本机地址连的是模拟器（MuMu、雷电、夜神是 127.0.0.1:端口，Android Studio 的是 emulator-5554），不锁屏
+_EMULATOR_SERIAL = re.compile(r"^(emulator-\d+|(127\.0\.0\.1|localhost):\d+)$")
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost")
+# 要 adb connect 的序列号：主机:端口，或者只有 IP（无线调试的端口用 mDNS 找）
+_HOST_PORT_SERIAL = re.compile(r"^([^\s:]+):(\d+)$")
+_BARE_IP_SERIAL = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
+# 关屏、划掉锁屏界面都有动画，按完隔一会儿再看成没成
+_ADB_LOCK_CHECKS = 4
+_ADB_LOCK_CHECK_SECONDS = 0.5
 _PACKAGE_PATTERN = re.compile(r"^[A-Za-z][A-Za-z0-9_]*(\.[A-Za-z0-9_]+)+$")
 _FOCUS_PATTERNS = (
     re.compile(r"mCurrentFocus=Window\{[^}]*?\s([A-Za-z0-9_.]+)/"),
@@ -53,6 +71,9 @@ _WDA_PRESS_SECONDS = 0.05
 # iPhone 没有返回键，用「从屏幕左边缘往右滑」的返回手势代替（相对屏幕宽高的比例）
 _BACK_SWIPE = (0.005, 0.5, 0.75, 0.5)
 _BACK_SWIPE_MS = 250
+# 按主屏幕键点亮屏幕后，隔一会儿看亮了没有
+_WAKE_CHECKS = 3
+_WAKE_CHECK_SECONDS = 0.5
 
 
 class DeviceError(RuntimeError):
@@ -172,6 +193,21 @@ class PhoneDevice(ABC):
         """当前获得焦点的输入框里的文字；没有点开输入框时是空字符串，这台设备查不了时返回 None。"""
         return None
 
+    # 能不能锁屏、自动解锁：iPhone 和安卓真机支持，模拟器不查锁屏、也不锁屏
+    supports_lock = False
+
+    async def unlock_if_locked(self) -> bool:
+        """锁着屏就试着解开，返回刚才是不是锁着；不支持锁屏的设备不查，返回 False。
+
+        Raises:
+            DeviceNeedsUserError: 解不开（设了锁屏密码），kind 是 needs_unlock。
+        """
+        return False
+
+    async def lock(self) -> bool:
+        """锁屏，返回锁上没有；只在 ``supports_lock`` 为真的设备上调用。"""
+        raise NotImplementedError(f"{self.description} 不支持锁屏")
+
     async def close(self) -> None:
         """释放连接等资源；关闭后再调用其它方法会重新连接。"""
         # 安卓每条命令都是单独的 adb 进程，没有要释放的
@@ -240,6 +276,26 @@ def parse_foreground_package(text: str) -> str:
     return ""
 
 
+def _network_target(serial: str) -> Optional[Tuple[str, str]]:
+    """要用 adb connect 连的设备返回（主机，端口），只填了 IP 时端口是空字符串；USB 序列号返回 None。"""
+    match = _HOST_PORT_SERIAL.match(serial)
+    if match:
+        return match.group(1), match.group(2)
+    if _BARE_IP_SERIAL.match(serial):
+        return serial, ""
+    return None
+
+
+def parse_android_lock(text: str) -> Tuple[Optional[bool], Optional[bool]]:
+    """从 ``_LOCK_STATE_COMMAND`` 的输出里取出（屏幕亮着吗，锁屏界面在不在），系统没给出的那项是 None。"""
+    wakefulness = _WAKEFULNESS_PATTERN.search(text)
+    keyguard = _KEYGUARD_PATTERN.search(text)
+    return (
+        wakefulness.group(1) == "Awake" if wakefulness else None,
+        keyguard.group(1) == "true" if keyguard else None,
+    )
+
+
 def _state_error(serial: str, state: str) -> DeviceError:
     """adb 设备状态不对：未授权要人在手机上点允许，离线等情况重试可能恢复。"""
     message = f"设备 {serial} {_STATE_HINTS.get(state, f'状态异常：{state}')}"
@@ -251,19 +307,34 @@ def _state_error(serial: str, state: str) -> DeviceError:
 class AdbDevice(PhoneDevice):
     """通过 adb 控制安卓真机或模拟器。"""
 
-    def __init__(self, settings: DeviceSettings, runner: ProcessRunner = run_process) -> None:
+    def __init__(
+        self,
+        settings: DeviceSettings,
+        runner: ProcessRunner = run_process,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+        port_finder: Callable[[str], str] = query_adb_port,
+    ) -> None:
         self._adb_path = settings.adb_path.strip() or "adb"
         self._configured_serial = settings.serial.strip()
         self._auto_connect = settings.auto_connect
         self._timeout = float(settings.command_timeout_seconds)
         self._text_input = settings.text_input
         self._runner = runner
+        self._sleep = sleep
+        # 问无线调试的手机它现在的端口（会阻塞，放进线程里调用）
+        self._port_finder = port_finder
         # 已确认在线的设备序列号；命令失败后清空，下次重新确认
         self._serial = ""
 
     @property
     def description(self) -> str:
         return f"安卓 · {self._serial or self._configured_serial or '自动选择'}"
+
+    @property
+    def supports_lock(self) -> bool:  # type: ignore[override]
+        """真机才锁屏、查锁屏；模拟器按连接地址认（还没连上、不知道是哪台时也先不查）。"""
+        serial = self._serial or self._configured_serial
+        return bool(serial) and not _EMULATOR_SERIAL.match(serial)
 
     async def _adb_global(self, args: Sequence[str], timeout: Optional[float] = None) -> bytes:
         code, stdout, stderr = await self._runner([self._adb_path, *args], timeout or self._timeout)
@@ -287,14 +358,61 @@ class AdbDevice(PhoneDevice):
         output = await self._adb("shell", command, timeout=timeout)
         return output.decode("utf-8", errors="replace")
 
+    async def _devices(self) -> Dict[str, str]:
+        return parse_adb_devices((await self._adb_global(["devices"])).decode("utf-8", errors="replace"))
+
+    async def _adb_connect(self, serial: str) -> str:
+        """adb connect；连上了（或本来就连着）返回空字符串，没连上返回 adb 的回答。"""
+        text = (await self._adb_global(["connect", serial])).decode("utf-8", errors="replace").strip()
+        return "" if text.startswith(("connected to", "already connected to")) else text
+
+    async def _mdns_port(self, host: str) -> str:
+        """直接问这个 IP 上无线调试现在的端口（见 mdns.py），它没回答时返回空字符串。"""
+        try:
+            return await asyncio.to_thread(self._port_finder, host)
+        except (OSError, ValueError) as exc:
+            raise DeviceError(f"问 {host} 无线调试的端口失败：{exc}") from exc
+
+    async def _connect_network(self, host: str, port: str) -> Tuple[str, Dict[str, str]]:
+        """连上 IP:端口 的设备，返回实际用的序列号和设备列表。
+
+        手机上的「无线调试」每次重启（开关它、插拔数据线、重启手机）端口都会变，配置里的端口连不上、
+        或者旧端口的连接一直是 offline 时，按 IP 用 mDNS 找它现在的端口；只填了 IP 时直接找。模拟器不找。
+        """
+        serial = f"{host}:{port}" if port else ""
+        problem = "配置里只填了 IP"
+        if port:
+            problem = await self._adb_connect(serial)
+            if not problem:
+                devices = await self._devices()
+                if devices.get(serial) != "offline" or host in _LOOPBACK_HOSTS:
+                    # 未授权这类状态交给后面按状态提示
+                    return serial, devices
+                problem = "连接处于离线状态"
+        if host in _LOOPBACK_HOSTS:
+            raise DeviceError(f"adb connect {serial} 失败：{problem}。请确认模拟器已启动并开启了 ADB 调试")
+        found = await self._mdns_port(host)
+        if not found or found == port:
+            raise DeviceError(
+                f"连不上 {serial or host}（{problem}），mDNS 也没找到它无线调试的新端口："
+                "请确认手机和电脑连着同一个 Wi-Fi、开发者选项里的「无线调试」开着；"
+                "插拔过数据线、开关过无线调试后，端口会变"
+            )
+        # 旧端口的连接 adb 会自己在后台重连一阵，列表里间歇显示 offline，之后自己消失；不去断开它：
+        # 赶上它刚好不在时 adb disconnect 会报 no such device，反而让这次连接失败
+        serial = f"{host}:{found}"
+        problem = await self._adb_connect(serial)
+        if problem:
+            raise DeviceError(f"adb connect {serial} 失败：{problem}")
+        return serial, await self._devices()
+
     async def ensure_ready(self) -> None:
         serial = self._configured_serial
-        if serial and ":" in serial and self._auto_connect:
-            text = (await self._adb_global(["connect", serial])).decode("utf-8", errors="replace").strip()
-            if not text.startswith(("connected to", "already connected to")):
-                raise DeviceError(f"adb connect {serial} 失败：{text}。请确认模拟器已启动并开启了 ADB 调试")
-
-        devices = parse_adb_devices((await self._adb_global(["devices"])).decode("utf-8", errors="replace"))
+        target = _network_target(serial) if self._auto_connect else None
+        if target is not None:
+            serial, devices = await self._connect_network(*target)
+        else:
+            devices = await self._devices()
         if serial:
             state = devices.get(serial)
             if state is None:
@@ -390,6 +508,42 @@ class AdbDevice(PhoneDevice):
         installed = {line[len("package:") :] for line in lines if line.startswith("package:")}
         return installed & set(packages)
 
+    async def _lock_state(self) -> Tuple[Optional[bool], Optional[bool]]:
+        return parse_android_lock(await self._shell(_LOCK_STATE_COMMAND))
+
+    @staticmethod
+    def _is_locked(state: Tuple[Optional[bool], Optional[bool]]) -> bool:
+        awake, keyguard = state
+        return awake is False or keyguard is True
+
+    async def unlock_if_locked(self) -> bool:
+        if not self.supports_lock:
+            return False
+        state = await self._lock_state()
+        if not self._is_locked(state):
+            return False
+        if state[0] is False:
+            await self._shell(f"input keyevent {_KEYCODE_WAKEUP}")
+        # 没设锁屏方式时点亮就进去了；滑动解锁的锁屏界面能直接划掉，设了密码、图案时只会弹出输密码的界面
+        await self._shell("wm dismiss-keyguard")
+        for _ in range(_ADB_LOCK_CHECKS):
+            await self._sleep(_ADB_LOCK_CHECK_SECONDS)
+            if not self._is_locked(await self._lock_state()):
+                return True
+        raise DeviceNeedsUserError(
+            "安卓手机锁着屏，自动解锁没成功（设了锁屏密码、图案时解不开）：请手动解锁；"
+            "想让她自己解开，就把这台手机的锁屏方式改成「无」或「滑动」，或者关掉「玩完锁屏」（play.lock_after）",
+            "needs_unlock",
+        )
+
+    async def lock(self) -> bool:
+        await self._shell(f"input keyevent {_KEYCODE_SLEEP}")
+        for _ in range(_ADB_LOCK_CHECKS):
+            await self._sleep(_ADB_LOCK_CHECK_SECONDS)
+            if self._is_locked(await self._lock_state()):
+                return True
+        return False
+
     async def ui_elements(self, width: int, height: int, limit: int) -> List[UIElement]:
         output = await self._shell(f"uiautomator dump {_UI_DUMP_PATH}", timeout=max(self._timeout, 15.0))
         if "dumped to" not in output:
@@ -436,10 +590,16 @@ class WdaDevice(PhoneDevice):
     对外仍然一律用截图像素，发给 WDA 前再除以倍率。
     """
 
-    def __init__(self, settings: DeviceSettings, transport: Optional[httpx.AsyncBaseTransport] = None) -> None:
+    def __init__(
+        self,
+        settings: DeviceSettings,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+        sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
+    ) -> None:
         self._base_url = settings.wda_url.strip().rstrip("/")
         self._timeout = float(settings.command_timeout_seconds)
         self._transport = transport
+        self._sleep = sleep
         # 复用同一个客户端：每次新建都要加载一遍证书库，要半秒多，每步操作都会慢下来
         self._client: Optional[httpx.AsyncClient] = None
         # 会话和倍率在 ensure_ready 里获取；会话失效后清空，下次重新建立
@@ -519,15 +679,44 @@ class WdaDevice(PhoneDevice):
             },
         )
 
-    async def _ensure_unlocked(self) -> None:
+    supports_lock = True
+
+    async def unlock_if_locked(self) -> bool:
         if not await self._request("GET", "/wda/locked"):
-            return
-        # 没设锁屏密码时 WDA 能自己解锁；设了密码只能请人手动解
+            return await self._wake_if_dark()
+        # 没设锁屏密码时 WDA 能自己解锁（点亮屏幕再上滑）；设了密码只会停在输密码的界面
         await self._request("POST", "/wda/unlock")
         if await self._request("GET", "/wda/locked"):
             raise DeviceNeedsUserError(
-                "iPhone 锁屏了，自动解锁没成功：请手动解锁，并在设置里把「自动锁定」改成「永不」", "needs_unlock"
+                "iPhone 锁着屏，自动解锁没成功（设了锁屏密码时解不开）：请手动解锁；"
+                "想让她自己解开，就别给这台 iPhone 设锁屏密码，或者关掉「玩完锁屏」（play.lock_after）",
+                "needs_unlock",
             )
+        return True
+
+    async def _wake_if_dark(self) -> bool:
+        """实测有人动过手机之后出现过：屏幕关着，/wda/locked 却说没锁，/wda/unlock 也就什么都不做；
+        这时按一下主屏幕键就点亮回到桌面。只在前台是桌面时这么做：应用里按主屏幕键会退出应用，
+        应用里全黑的画面也可能只是视频黑场。返回点亮过没有。
+
+        Raises:
+            DeviceNeedsUserError: 按了主屏幕键还是黑的。
+        """
+        if await self.foreground_package() != _SPRINGBOARD or not await self._screen_dark():
+            return False
+        await self._request("POST", "/wda/homescreen")
+        for _ in range(_WAKE_CHECKS):
+            await self._sleep(_WAKE_CHECK_SECONDS)
+            if not await self._screen_dark():
+                return True
+        raise DeviceNeedsUserError("iPhone 屏幕关着，按主屏幕键也没点亮：请手动点亮、解锁手机", "needs_unlock")
+
+    async def _screen_dark(self) -> bool:
+        return await asyncio.to_thread(is_dark_screen, await self.screenshot())
+
+    async def lock(self) -> bool:
+        await self._request("POST", "/wda/lock")
+        return bool(await self._request("GET", "/wda/locked"))
 
     async def ensure_ready(self) -> None:
         status = await self._request("GET", "/status")
@@ -541,7 +730,7 @@ class WdaDevice(PhoneDevice):
             await self._request("POST", f"/session/{session_id}/appium/settings", {"settings": _WDA_SETTINGS})
             self._scale, _ = _parse_screen(await self._request("GET", "/wda/screen"))
             self._session_id = session_id
-        await self._ensure_unlocked()
+        # 这里不解锁：WebUI 空闲时刷新画面也会走到这里，玩完锁上的屏不能被它解开；要玩时由 unlock_if_locked 解
 
     async def screenshot(self) -> bytes:
         if not self._session_id:

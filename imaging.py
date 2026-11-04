@@ -15,12 +15,20 @@ from .ui_tree import Bounds, UIElement
 _MARK_COLORS = ("#ff3b30", "#007aff", "#34c759", "#ff9500", "#af52de")
 _MIN_JPEG_QUALITY = 30
 _SIGNATURE_SIZE = (24, 24)
+# 屏幕关着时截图是纯黑的（实测 iPhone 每个像素都是 0），留一点余量
+_DARK_MAX = 8
 
 
 def open_image(data: bytes) -> Image.Image:
     """把截图字节解码为 RGB 图像。"""
     with Image.open(BytesIO(data)) as image:
         return image.convert("RGB")
+
+
+def is_dark_screen(data: bytes) -> bool:
+    """截图是不是全黑（屏幕关着）：亮着的屏幕至少有状态栏的时间、电量，最亮的像素不会这么暗。"""
+    with Image.open(BytesIO(data)) as image:
+        return image.convert("L").getextrema()[1] <= _DARK_MAX
 
 
 def screen_signature(image: Image.Image) -> bytes:

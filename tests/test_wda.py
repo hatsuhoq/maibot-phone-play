@@ -5,7 +5,7 @@ import httpx
 import json
 import pytest
 
-from phone_play.devices import AppNotInstalledError, DeviceError, WdaDevice
+from phone_play.devices import AppNotInstalledError, DeviceError, DeviceNeedsUserError, WdaDevice
 from phone_play.settings import DeviceSettings
 
 from conftest import make_png
@@ -211,13 +211,84 @@ async def test_unreachable_wda_is_explained():
 async def test_locked_phone_is_unlocked_or_reported():
     fake = FakeWda()
     fake.locked = [True, False]
-    await make_device(fake).ensure_ready()
+    # 解开后在桌面上：亮着的画面，不用按主屏幕键
+    fake.screenshot = make_png(39, 84)
+    device = make_device(fake)
+    # 连接时不解锁：WebUI 空闲时刷新画面也会连接，玩完锁上的屏不能被它解开
+    await device.ensure_ready()
+    assert "/wda/locked" not in fake.paths()
+    assert await device.unlock_if_locked() is True
+    assert fake.paths().count("/wda/unlock") == 1
+    assert await device.unlock_if_locked() is False
     assert fake.paths().count("/wda/unlock") == 1
 
     fake = FakeWda()
     fake.locked = [True]
-    with pytest.raises(DeviceError, match="自动解锁没成功"):
-        await make_device(fake).ensure_ready()
+    with pytest.raises(DeviceNeedsUserError, match="自动解锁没成功（设了锁屏密码时解不开）") as raised:
+        await make_device(fake).unlock_if_locked()
+    assert raised.value.kind == "needs_unlock"
+    assert "play.lock_after" in str(raised.value)
+
+
+async def test_lock_uses_wda_lock():
+    fake = FakeWda()
+    fake.locked = [True]
+    assert await make_device(fake).lock() is True
+    assert fake.paths() == ["/wda/lock", "/wda/locked"]
+
+
+class SleepingWda(FakeWda):
+    """屏幕关着、/wda/locked 却说没锁（实测有人动过 iPhone 之后出现过）；``wakes`` 为真时按主屏幕键能点亮。"""
+
+    def __init__(self, wakes: bool = True) -> None:
+        super().__init__()
+        self.screenshot = make_png(39, 84, "#000000")
+        self.wakes = wakes
+
+    def __call__(self, request: httpx.Request) -> httpx.Response:
+        if request.url.path == "/wda/homescreen" and self.wakes:
+            self.screenshot = make_png(39, 84)
+        return super().__call__(request)
+
+
+def make_sleeping_device(fake: FakeWda) -> Tuple[WdaDevice, List[float]]:
+    slept: List[float] = []
+
+    async def sleep(seconds: float) -> None:
+        slept.append(seconds)
+
+    return WdaDevice(DeviceSettings(backend="ios_wda"), transport=httpx.MockTransport(fake), sleep=sleep), slept
+
+
+async def test_dark_screen_on_springboard_is_woken_with_home():
+    fake = SleepingWda()
+    device, slept = make_sleeping_device(fake)
+    assert await device.unlock_if_locked() is True
+    assert fake.paths().count("/wda/homescreen") == 1
+    assert "/wda/unlock" not in fake.paths()
+    assert slept == [0.5]
+    # 已经亮了，再查不再按
+    assert await device.unlock_if_locked() is False
+    assert fake.paths().count("/wda/homescreen") == 1
+
+
+async def test_dark_screen_inside_an_app_is_left_alone():
+    # 应用里按主屏幕键会退出应用，全黑也可能只是视频黑场
+    fake = SleepingWda()
+    fake.active = "tv.danmaku.bilianime"
+    device, _ = make_sleeping_device(fake)
+    assert await device.unlock_if_locked() is False
+    assert "/wda/homescreen" not in fake.paths()
+    assert "/screenshot" not in fake.paths()
+
+
+async def test_dark_screen_that_does_not_wake_needs_the_user():
+    fake = SleepingWda(wakes=False)
+    device, slept = make_sleeping_device(fake)
+    with pytest.raises(DeviceNeedsUserError, match="按主屏幕键也没点亮") as raised:
+        await device.unlock_if_locked()
+    assert raised.value.kind == "needs_unlock"
+    assert len(slept) == 3
 
 
 async def test_apps_open_close_and_missing_ones_are_remembered():
