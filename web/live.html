@@ -16,8 +16,9 @@
   .phone img { width: 100%; height: 100%; object-fit: contain; display: none; }
   .phone .placeholder { color: #bbb; padding: 24px; text-align: center; font-size: 13px; }
   .frame-meta { display: flex; justify-content: space-between; gap: 8px; margin-top: 8px; font-size: 12px; }
-  .stack { display: grid; gap: 16px; min-width: 0; }
-  .maibot-card { border: 1px solid var(--maibot-border, #8884); border-radius: var(--maibot-radius, 10px); }
+  /* 列宽要写死成 minmax(0, 1fr)：默认的 auto 列会被卡片里最宽的内容（设备下拉框的长选项、输入框）撑开，窄屏时整列超出页面 */
+  .stack { display: grid; grid-template-columns: minmax(0, 1fr); gap: 16px; min-width: 0; }
+  .maibot-card { border: 1px solid var(--maibot-border, #8884); border-radius: var(--maibot-radius, 10px); min-width: 0; }
   .maibot-card-header { font-size: 15px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .now-goal { font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
   .thought { margin-top: 10px; padding: 10px 12px; border-radius: var(--maibot-radius, 10px); background: var(--maibot-soft, #8881); overflow-wrap: anywhere; }
@@ -52,6 +53,14 @@
   .memory li { display: flex; gap: 8px; align-items: baseline; justify-content: space-between; }
   .watched-box { margin-top: 10px; }
   .watched-box summary { cursor: pointer; }
+  /* 手机宽度：输入框独占一行，按钮两个一排，设备下拉框和「切换」挤在一行 */
+  @media (max-width: 480px) {
+    /* 宿主主题样式插在页面样式后面，要多一层选择器才能改卡片内边距 */
+    .stack > .maibot-card { padding: 16px; }
+    .controls input { flex-basis: 100%; }
+    .controls .maibot-button { flex: 1 1 calc(50% - 4px); }
+    .device-row select { flex-basis: 120px; }
+  }
 </style>
 
 <div class="header">
