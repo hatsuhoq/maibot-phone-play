@@ -135,6 +135,7 @@
         <div><div class="maibot-muted">模型调用</div><div id="calls" class="value maibot-number">—</div></div>
         <div><div class="maibot-muted">自动玩</div><div id="auto" class="value">—</div></div>
       </div>
+      <p id="life" class="hint maibot-muted"></p>
       <p id="lastError" class="error"></p>
     </section>
 
@@ -356,6 +357,8 @@
     $('auto').textContent = data.auto_play
       ? (data.next_auto_check ? `开启 · ${data.next_auto_check}` : '开启')
       : '关闭';
+    // 生活联动：自动玩按麦生活的日程决定时，写出最近一次查到的这一段和能不能玩
+    $('life').textContent = data.life ? `生活联动（${data.life.checked_at} 查看）：${data.life.text}` : '';
     $('lastError').textContent = data.last_error ? `最近的错误：${data.last_error}` : '';
 
     const history = $('history');

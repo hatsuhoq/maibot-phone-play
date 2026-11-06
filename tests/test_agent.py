@@ -10,6 +10,7 @@ import time
 
 from phone_play.agent import (
     AgentError,
+    LifeSource,
     ModelReply,
     PhoneAgent,
     PlayRefused,
@@ -19,6 +20,7 @@ from phone_play.agent import (
     match_device,
 )
 from phone_play.devices import DeviceConfigError, DeviceError, DeviceNeedsUserError, Foreground
+from phone_play.life import LifeActivity, LifeLinkError
 from phone_play.prompts import Persona
 from phone_play.settings import AllowedApp, DeviceSettings, PhonePlayConfig
 from phone_play.actions import Seen
@@ -46,6 +48,8 @@ class Harness:
         *,
         config: Optional[PhonePlayConfig] = None,
         plan: Union[str, Sequence[str]] = PLAN,
+        life: Optional[LifeSource] = None,
+        share: bool = False,
     ) -> None:
         self.config = config or PhonePlayConfig()
         self.device = device
@@ -53,6 +57,9 @@ class Harness:
         self.vision_messages: List[List[Dict[str, Any]]] = []
         self.plan_prompts: List[str] = []
         self.notified: List[tuple] = []
+        # share=True 时接上假的「交给麦生活分享」：记下交过去的记录，share_error 不为空时抛出
+        self.shared: List[SessionRecord] = []
+        self.share_error: Optional[LifeLinkError] = None
         # 给了多个计划时依次返回，最后一个一直沿用
         self.plans = [plan] if isinstance(plan, str) else list(plan)
         self.store = UsageStore(tmp_path / "usage.json")
@@ -69,7 +76,15 @@ class Harness:
             logger=logging.getLogger("phone_play_test"),
             clock=lambda: self.seconds,
             sleep=self.fake_sleep,
+            life=life,
+            life_share=self.share if share else None,
         )
+
+    async def share(self, record: SessionRecord) -> str:
+        if self.share_error is not None:
+            raise self.share_error
+        self.shared.append(record)
+        return f"op{len(self.shared)}"
 
     async def vision(self, messages: List[Dict[str, Any]]) -> str:
         self.vision_messages.append(messages)
@@ -546,6 +561,286 @@ async def test_auto_play_respects_probability_and_hours(tmp_path):
     assert harness.agent.state != "idle"
     await asyncio.wait_for(harness.agent._task, 5)
     assert harness.store.history[-1].trigger == "自己想玩"
+
+
+class Schedule:
+    """假的麦生活：依次给出日程里现在这一段（或抛出查不到的原因），最后一个一直沿用；记下被问了几次。"""
+
+    def __init__(self, *results: Union[Optional[LifeActivity], LifeLinkError]) -> None:
+        self.results = list(results)
+        self.calls = 0
+
+    async def __call__(self) -> Optional[LifeActivity]:
+        self.calls += 1
+        result = self.results.pop(0) if len(self.results) > 1 else self.results[0]
+        if isinstance(result, LifeLinkError):
+            raise result
+        return result
+
+
+def life(kind: str, name: str, minutes: float = 40, location: str = "", scene: str = "") -> LifeActivity:
+    return LifeActivity(kind=kind, name=name, location=location, scene=scene, remaining_seconds=minutes * 60)
+
+
+def auto_config(**life_link: Any) -> PhonePlayConfig:
+    """一定会去玩的自动玩（概率 1、全天），生活联动按参数改。"""
+    config = PhonePlayConfig()
+    config.auto_play.enabled = True
+    config.auto_play.play_probability = 1.0
+    config.auto_play.active_hours = "00:00-00:00"
+    for key, value in life_link.items():
+        setattr(config.life_link, key, value)
+    return config
+
+
+async def test_auto_play_skips_sleep_in_the_schedule_and_says_why(tmp_path):
+    schedule = Schedule(life("sleep", "睡到闹钟响", location="卧室"))
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish")], config=auto_config(), life=schedule)
+    await harness.agent._auto_decide()
+    assert harness.agent.state == "idle"
+    assert harness.agent.status()["life"] == {
+        "checked_at": harness.agent._life_check.checked_at.strftime("%H:%M"),
+        "allowed": False,
+        "slack": False,
+        "text": "按麦生活的日程，现在是「睡到闹钟响」（睡觉 · 卧室），先不玩",
+    }
+    # 看状态时一分钟内不重复问；自动玩每次都重新问
+    await harness.agent.refresh_life(max_age=60)
+    assert schedule.calls == 1
+    harness.seconds += 61
+    await harness.agent.refresh_life(max_age=60)
+    assert schedule.calls == 2
+
+
+async def test_work_time_is_an_occasional_short_slack(tmp_path):
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [action(action="finish", summary="偷看了两条猫猫视频")],
+        config=auto_config(),
+        life=Schedule(life("work", "整理项目文档", minutes=120, location="公司工位")),
+        share=True,
+    )
+    # 平常的概率是 1，上班时只按摸鱼的概率（默认 0.1）
+    harness.agent._rng = lambda: 0.2
+    await harness.agent._auto_decide()
+    assert harness.agent.state == "idle"
+    status = harness.agent.status()["life"]
+    assert (status["allowed"], status["slack"]) == (True, True)
+    assert status["text"] == (
+        "按麦生活的日程，现在是「整理项目文档」（工作 · 公司工位），"
+        "偶尔摸鱼玩一会儿（每次考虑时 10% 的概率，最多 5 分钟）"
+    )
+
+    harness.agent._rng = lambda: 0.05
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    prompt = harness.plan_prompts[0]
+    assert "你正忙着，想趁没人注意偷偷拿起手机摸一会儿鱼。" in prompt
+    assert "这是工作中途偷偷摸鱼：只玩几分钟" in prompt and "玩完接着工作" in prompt
+    assert "玩多久（1~5 分钟）" in prompt
+    logs = harness.agent.status()["logs"]
+    assert logs[-1]["summary"] == "拿起手机（摸鱼）"
+    assert (
+        logs[-1]["result"]
+        == "按麦生活的日程，现在是「整理项目文档」（工作 · 公司工位），偷偷摸鱼玩一会儿（最多 5 分钟）"
+    )
+    record = harness.store.history[-1]
+    assert record.trigger == "摸鱼"
+    # 自然结束的摸鱼也交给麦生活
+    assert harness.shared == [record]
+
+
+async def test_slack_can_be_turned_off(tmp_path):
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [],
+        config=auto_config(slack_probability=0),
+        life=Schedule(life("work", "整理项目文档", location="公司工位")),
+    )
+    harness.agent._rng = lambda: 0.0
+    await harness.agent._auto_decide()
+    assert harness.agent.state == "idle"
+    assert harness.agent.status()["life"]["text"] == "按麦生活的日程，现在是「整理项目文档」（工作 · 公司工位），先不玩"
+
+
+async def test_auto_play_in_free_time_fits_into_what_is_left(tmp_path):
+    config = auto_config(min_minutes=1)
+    schedule = Schedule(life("travel", "坐地铁回家", minutes=3.5, location="地铁上", scene="站在车门边，信号时有时无"))
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish")], config=config, life=schedule)
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+
+    prompt = harness.plan_prompts[0]
+    assert (
+        "按你今天的日程，现在是「坐地铁回家」（在路上 · 地铁上），这段还有大约 3 分钟。"
+        "此刻的情形：站在车门边，信号时有时无" in prompt
+    )
+    assert "玩多久（1~3 分钟）" in prompt
+    logs = harness.agent.status()["logs"]
+    assert logs[-1]["summary"] == "拿起手机（自己想玩）"
+    assert logs[-1]["result"] == "按麦生活的日程，现在是「坐地铁回家」（在路上 · 地铁上），这段还有 3 分钟"
+    # 模型想玩 5 分钟：日程只剩 3 分钟，按 3 分钟
+    planned = next(log for log in logs if log["summary"].startswith("打算打开"))
+    assert planned["result"] == "计划玩 3 分钟"
+    assert harness.store.history[-1].trigger == "自己想玩"
+
+
+async def test_auto_play_waits_when_free_time_is_almost_over(tmp_path):
+    harness = Harness(
+        tmp_path, FakeDevice(), [], config=auto_config(), life=Schedule(life("meal", "午饭", minutes=4.5))
+    )
+    await harness.agent._auto_decide()
+    assert harness.agent.state == "idle"
+    assert harness.agent.status()["life"]["text"] == "按麦生活的日程，现在是「午饭」（吃饭），只剩 4 分钟，先不玩"
+
+
+@pytest.mark.parametrize(
+    "result,reason",
+    [
+        (
+            LifeLinkError("没连上麦生活：未找到 API 提供方插件: maibot-community.mai-life"),
+            "没连上麦生活：未找到 API 提供方插件: maibot-community.mai-life",
+        ),
+        (LifeLinkError("麦生活今天的日程还没生成"), "麦生活今天的日程还没生成"),
+        (None, "麦生活的日程这会儿是空档"),
+    ],
+)
+async def test_auto_play_without_a_usable_schedule_uses_active_hours(tmp_path, result, reason):
+    config = auto_config()
+    config.auto_play.active_hours = "19:00-23:00"
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish")], config=config, life=Schedule(result))
+    harness.agent._now = lambda: datetime(2026, 11, 6, 13, 0)
+    await harness.agent._auto_decide()
+    assert harness.agent.state == "idle"
+    assert harness.agent.status()["life"] == {
+        "checked_at": "13:00",
+        "allowed": None,
+        "slack": False,
+        "text": f"{reason}，按 active_hours（19:00-23:00）",
+    }
+
+    config.auto_play.active_hours = "10:00-23:00"
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    assert "按你今天的日程" not in harness.plan_prompts[0]
+    assert harness.store.history[-1].trigger == "自己想玩"
+
+
+async def test_schedule_is_not_asked_when_the_link_is_off_or_she_is_asked_to_play(tmp_path):
+    schedule = Schedule(life("work", "整理项目文档"))
+    config = auto_config(enabled=False)
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish")] * 2, config=config, life=schedule)
+    # 关掉联动：日程上在工作也照 active_hours 去玩
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    assert schedule.calls == 0 and harness.agent.status()["life"] is None
+
+    # 聊天、命令、WebUI 叫她玩：不看日程
+    config.life_link.enabled = True
+    await harness.run()
+    assert schedule.calls == 0
+    assert "按你今天的日程" not in harness.plan_prompts[-1]
+
+
+def log_entries(harness: Harness, summary: str) -> List[Dict[str, Any]]:
+    return [entry for entry in harness.agent.status()["logs"] if entry["summary"] == summary]
+
+
+async def test_auto_play_by_the_schedule_is_shared_with_mai_life(tmp_path):
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [action(thought="这只布偶叫得好认真", summary="看布偶猫", action="finish")],
+        config=auto_config(),
+        life=Schedule(life("leisure", "看悬疑剧", location="客厅")),
+        share=True,
+    )
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    assert [record.app for record in harness.shared] == ["哔哩哔哩"]
+    assert harness.shared[0].end_reason == "自己不想玩了"
+    assert log_entries(harness, "交给麦生活分享")[0]["ok"] is True
+
+
+async def test_mai_life_refusing_the_share_is_shown_in_the_log(tmp_path):
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [action(action="finish", summary="看布偶猫")],
+        config=auto_config(),
+        life=Schedule(life("leisure", "看悬疑剧")),
+        share=True,
+    )
+    harness.share_error = LifeLinkError("麦生活的日程这会儿是空档，它只在有日程时收分享")
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    entry = log_entries(harness, "没交给麦生活分享")[0]
+    assert entry["ok"] is False and entry["result"] == "麦生活的日程这会儿是空档，它只在有日程时收分享"
+    # 记录照常保存
+    assert harness.store.history[-1].app == "哔哩哔哩"
+
+
+async def test_only_natural_auto_sessions_from_the_schedule_are_shared(tmp_path):
+    finish = [action(action="finish", summary="看布偶猫")]
+
+    # 关掉分享
+    harness = Harness(
+        tmp_path / "off",
+        FakeDevice(),
+        finish,
+        config=auto_config(share_after_play=False),
+        life=Schedule(life("leisure", "看悬疑剧")),
+        share=True,
+    )
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    assert harness.shared == [] and log_entries(harness, "交给麦生活分享") == []
+
+    # 没装麦生活、按 active_hours 玩的：不去调一个不存在的接口
+    harness = Harness(
+        tmp_path / "fallback",
+        FakeDevice(),
+        finish,
+        config=auto_config(),
+        life=Schedule(LifeLinkError("没连上麦生活：未找到 API 提供方插件: maibot-community.mai-life")),
+        share=True,
+    )
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    assert harness.shared == [] and log_entries(harness, "没交给麦生活分享") == []
+
+    # 命令叫她玩的：有人看着，不交
+    harness = Harness(
+        tmp_path / "command", FakeDevice(), finish, config=auto_config(), life=Schedule(life("leisure", "看悬疑剧"))
+    )
+    harness.agent._life_share = harness.share
+    await harness.run()
+    assert harness.shared == []
+
+    # 自动玩到一半被叫停：不是自然结束，不交
+    harness = Harness(
+        tmp_path / "stopped",
+        FakeDevice(),
+        [],
+        config=auto_config(),
+        life=Schedule(life("leisure", "看悬疑剧")),
+        share=True,
+    )
+    looking = asyncio.Event()
+
+    async def slow_vision(messages: List[Dict[str, Any]]) -> str:
+        looking.set()
+        await asyncio.sleep(3600)
+        return ""
+
+    harness.agent._vision = slow_vision
+    await harness.agent._auto_decide()
+    await asyncio.wait_for(looking.wait(), 5)
+    assert await harness.agent.stop("在 WebUI 中停止") is True
+    assert harness.store.history[-1].end_reason == "在 WebUI 中停止"
+    assert harness.shared == []
 
 
 class PartnerPhone(FakeDevice):

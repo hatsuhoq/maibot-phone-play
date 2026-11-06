@@ -13,6 +13,7 @@ from maibot_sdk.context import PluginContext, PluginPaths
 from phone_play import plugin as plugin_module
 from phone_play.actions import Seen
 from phone_play.agent import PlayRefused
+from phone_play.life import LifeLinkError
 from phone_play.plugin import _COMMAND_PATTERN, create_plugin
 from phone_play.settings import AllowedApp, DeviceSettings, PhonePlayConfig
 from phone_play.store import SessionRecord
@@ -694,3 +695,117 @@ async def test_webui_switches_devices(tmp_path):
             await plugin.webui_switch_device(name="小米")
     finally:
         await plugin.on_unload()
+
+
+# 麦生活 get_schedule_snapshot 经 SDK 返回的样子：宿主那一层已经拆掉，剩它自己的信封
+WORKING = {
+    "success": True,
+    "error": None,
+    "data": {
+        "timezone": "Asia/Shanghai",
+        "as_of": "2026-11-06T13:47:00+08:00",
+        "revision": "abc",
+        "schedule_available": True,
+        "current": {
+            "id": "n7",
+            "kind": "work",
+            "name": "补齐项目表格里的进度记录",
+            "description": "",
+            "start_at": "2026-11-06T13:25:00+08:00",
+            "end_at": "2026-11-06T17:30:00+08:00",
+            "location": "公司工位",
+            "scene": "",
+        },
+        "next_activities": [],
+    },
+}
+
+
+async def test_auto_play_asks_mai_life_for_the_schedule(tmp_path):
+    plugin = make_plugin(tmp_path, auto_play={"enabled": True})
+    calls = []
+
+    async def api_call(api_name, *, version="", **kwargs):
+        calls.append((api_name, version, kwargs))
+        return WORKING
+
+    plugin.ctx.api.call = api_call
+    await plugin.on_load()
+    try:
+        status = await plugin.webui_status()
+        assert calls == [("maibot-community.mai-life.get_schedule_snapshot", "1", {"future_limit": 0})]
+        assert (status["life"]["allowed"], status["life"]["slack"]) == (True, True)
+        assert status["life"]["text"] == (
+            "按麦生活的日程，现在是「补齐项目表格里的进度记录」（工作 · 公司工位），"
+            "偶尔摸鱼玩一会儿（每次考虑时 10% 的概率，最多 5 分钟）"
+        )
+        # WebUI 每隔几秒要一次状态：一分钟内不再问
+        await plugin.webui_status()
+        assert len(calls) == 1
+        assert "生活联动：按麦生活的日程，现在是「补齐项目表格里的进度记录」" in await command(plugin, "/手机")
+    finally:
+        await plugin.on_unload()
+
+
+async def test_without_mai_life_auto_play_uses_active_hours(tmp_path):
+    plugin = make_plugin(tmp_path, auto_play={"enabled": True})
+    plugin.ctx.api.call = AsyncMock(
+        return_value={"success": False, "error": "未找到 API 提供方插件: maibot-community.mai-life"}
+    )
+    await plugin.on_load()
+    try:
+        status = await plugin.webui_status()
+        assert status["life"] == {
+            "checked_at": status["life"]["checked_at"],
+            "allowed": None,
+            "slack": False,
+            "text": "没连上麦生活：未找到 API 提供方插件: maibot-community.mai-life，按 active_hours（10:00-23:00）",
+        }
+        # 宿主 RPC 本身出错：带着原因退回 active_hours，不让状态接口跟着报错
+        plugin.ctx.api.call = AsyncMock(side_effect=TimeoutError("等宿主回应超时"))
+        await plugin.agent.refresh_life()
+        assert (await plugin.webui_status())["life"]["text"] == (
+            "查麦生活的日程失败：等宿主回应超时，按 active_hours（10:00-23:00）"
+        )
+    finally:
+        await plugin.on_unload()
+
+
+async def test_schedule_is_not_asked_while_auto_play_is_off(tmp_path):
+    plugin = make_plugin(tmp_path)
+    plugin.ctx.api.call = AsyncMock(return_value=WORKING)
+    await plugin.on_load()
+    try:
+        assert (await plugin.webui_status())["life"] is None
+        assert "生活联动" not in await command(plugin, "/手机")
+        plugin.ctx.api.call.assert_not_awaited()
+    finally:
+        await plugin.on_unload()
+
+
+async def test_finished_session_is_handed_to_mai_life_for_sharing(tmp_path):
+    plugin = make_plugin(tmp_path, life_link={"share_weight": 0.6})
+    plugin.ctx.api.call = AsyncMock(return_value={"success": True, "opportunity_id": "f00d"})
+    record = SessionRecord(
+        started_at="2026-11-06T19:20:00",
+        ended_at="2026-11-06T19:30:00",
+        trigger="自己想玩",
+        app="抖音",
+        goal="刷几个短视频",
+        summary="这只布偶叫得好认真",
+        steps=13,
+        end_reason="玩够 10 分钟了",
+    )
+    assert await plugin._share_with_life(record) == "f00d"
+    plugin.ctx.api.call.assert_awaited_once_with(
+        "maibot-community.mai-life.create_proactive_opportunity",
+        version="1",
+        topic="刚才自己刷抖音看到的：这只布偶叫得好认真",
+        motive="空闲时自己拿起手机刷到的，觉得有意思可以当见闻随口聊聊；不想说也可以不说",
+        weight=0.6,
+        expires_minutes=120,
+    )
+    # 宿主 RPC 出错：带着原因，交给 agent 记进操作记录
+    plugin.ctx.api.call = AsyncMock(side_effect=TimeoutError("等宿主回应超时"))
+    with pytest.raises(LifeLinkError, match="交给麦生活失败：等宿主回应超时"):
+        await plugin._share_with_life(record)

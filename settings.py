@@ -3,9 +3,11 @@
 from typing import List, Literal, Tuple
 
 from maibot_sdk import Field, PluginConfigBase
-from pydantic import field_validator, model_validator
+from pydantic import ValidationInfo, field_validator, model_validator
 
 import re
+
+from .life import KIND_LABELS
 
 _HOURS_PATTERN = re.compile(r"^([01]\d|2[0-3]):([0-5]\d)-([01]\d|2[0-3]):([0-5]\d)$")
 # 「设备」那一台没写名字时叫这个
@@ -298,7 +300,11 @@ class AutoPlaySettings(PluginConfigBase):
     enabled: bool = Field(default=False, description="开启后 Bot 会在空闲时自己决定要不要玩手机、玩什么")
     check_interval_minutes: int = Field(default=30, ge=1, le=1440, description="每隔多少分钟考虑一次要不要玩")
     play_probability: float = Field(default=0.3, ge=0, le=1, description="每次考虑时去玩的概率")
-    active_hours: str = Field(default="10:00-23:00", description="允许自动玩的时间段，格式 HH:MM-HH:MM，可跨午夜")
+    active_hours: str = Field(
+        default="10:00-23:00",
+        description="允许自动玩的时间段，格式 HH:MM-HH:MM，可跨午夜；"
+        "开着「生活联动」并查得到麦生活的日程时按日程，这里不用",
+    )
 
     @field_validator("active_hours")
     @classmethod
@@ -306,6 +312,64 @@ class AutoPlaySettings(PluginConfigBase):
         if not _HOURS_PATTERN.match(value.strip()):
             raise ValueError("active_hours 格式应为 HH:MM-HH:MM，例如 10:00-23:00")
         return value.strip()
+
+
+_KIND_BY_LABEL = {label: kind for kind, label in KIND_LABELS.items()}
+
+
+class LifeLinkSettings(PluginConfigBase):
+    """和麦生活（Mai_life）的日程联动、玩完交给它分享。"""
+
+    __ui_label__ = "生活联动"
+    __ui_icon__ = "calendar"
+    __ui_order__ = 9
+
+    enabled: bool = Field(
+        default=True,
+        description="装了麦生活（Mai_life）时，自动玩按它的日程决定玩不玩、最多玩多久；"
+        "没装、查不到当天日程时按「自动玩」的 active_hours。聊天、命令和 WebUI 叫她玩不受影响",
+    )
+    play_kinds: List[str] = Field(
+        default_factory=lambda: ["leisure", "rest", "meal", "travel"],
+        description="日程是这几类时按 play_probability 自动玩：leisure 休闲、rest 休息、meal 吃饭、travel 在路上、"
+        "study 学习、work 工作、nap 午睡、sleep 睡觉（写中文也行）",
+    )
+    slack_kinds: List[str] = Field(
+        default_factory=lambda: ["work", "study"],
+        description="日程是这几类时偶尔摸鱼玩一会儿（写法同 play_kinds；也写在 play_kinds 里的按 play_kinds）；"
+        "两边都没写的（默认是睡觉、午睡）不玩",
+    )
+    slack_probability: float = Field(
+        default=0.1, ge=0, le=1, description="上班、上课这类日程时，每次考虑摸鱼的概率；0 表示这时候不玩"
+    )
+    slack_minutes: int = Field(default=5, ge=1, le=60, description="摸鱼一次最多玩几分钟")
+    min_minutes: int = Field(default=5, ge=1, le=60, description="这段日程剩下不到这么多分钟就先不玩")
+    share_after_play: bool = Field(
+        default=True,
+        description="按麦生活日程自动玩、自然结束的那几局，玩完把看到的交给麦生活的主动分享；"
+        "由它按私聊用户的额度、免打扰决定什么时候跟谁提起，也可能不提",
+    )
+    share_weight: float = Field(
+        default=0.4,
+        ge=0,
+        le=1,
+        description="交给麦生活时的分享权重：它打分时从这里起步，再加精力、心情、关系温度，"
+        "过了它的阈值（默认 0.45）才可能提起；越高越容易被挑中",
+    )
+
+    @field_validator("play_kinds", "slack_kinds")
+    @classmethod
+    def validate_kinds(cls, value: List[str], info: ValidationInfo) -> List[str]:
+        kinds: List[str] = []
+        for item in value:
+            text = item.strip()
+            kind = _KIND_BY_LABEL.get(text, text.lower())
+            if kind not in KIND_LABELS:
+                choices = "、".join(f"{key}（{label}）" for key, label in KIND_LABELS.items())
+                raise ValueError(f"{info.field_name} 里的「{item}」不认识，可以写：{choices}")
+            if kind not in kinds:
+                kinds.append(kind)
+        return kinds
 
 
 class WebUISettings(PluginConfigBase):
@@ -357,6 +421,7 @@ class PhonePlayConfig(PluginConfigBase):
     auto_play: AutoPlaySettings = Field(default_factory=AutoPlaySettings)
     webui: WebUISettings = Field(default_factory=WebUISettings)
     multi_device: MultiDeviceSettings = Field(default_factory=MultiDeviceSettings)
+    life_link: LifeLinkSettings = Field(default_factory=LifeLinkSettings)
 
     @model_validator(mode="after")
     def validate_device_names(self) -> "PhonePlayConfig":

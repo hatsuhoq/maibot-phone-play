@@ -26,6 +26,7 @@ from .actions import (
     swipe_points,
 )
 from .devices import AppNotInstalledError, DeviceError, KeyName, PhoneDevice
+from .life import SLACK_LABEL, LifeActivity, LifeLinkError
 from .diagnostics import DiagnosticStore, Mark
 from .memory import MemoryItem, MemoryStore, normalize_title
 from .pages import BILI_DETAIL, BILI_PLAYER, BILIBILI_PACKAGES, PAGE_LABELS, detect_page, marked_watched, page_title
@@ -154,6 +155,23 @@ TextCall = Callable[[str], Awaitable[Union[str, ModelReply]]]
 PersonaProvider = Callable[[], Awaitable[Persona]]
 FinishNotifier = Callable[[SessionRecord, str], Awaitable[None]]
 DeviceFactory = Callable[[DeviceSettings], PhoneDevice]
+# 查麦生活日程里现在这一段；空档返回 None，查不到能用的日程抛 LifeLinkError
+LifeSource = Callable[[], Awaitable[Optional[LifeActivity]]]
+# 玩完把这次看到的交给麦生活分享，返回契机编号；没收下抛 LifeLinkError
+LifeShare = Callable[[SessionRecord], Awaitable[str]]
+# 自然结束（她自己玩够了、到了时长、步数或预算）的结束原因；出错、卡住、被叫停、接管太久的不算
+_NATURAL_END_PREFIXES = ("玩够", "达到", "今天的操作步数", "这次的模型调用", "今天的模型调用")
+
+
+@dataclass(frozen=True)
+class LifeCheck:
+    """最近一次查麦生活日程的结果。"""
+
+    checked_clock: float
+    checked_at: datetime
+    activity: Optional[LifeActivity]
+    # 没拿到能用的这一段时的原因（没装、没就绪、日程没生成、空档）
+    error: str = ""
 
 
 class PlayRefused(Exception):
@@ -373,6 +391,11 @@ class Session:
     last_failure: str = ""
     # 已经提醒过这台手机给不出前台应用
     foreground_noted: bool = False
+    # 自动玩时麦生活日程里现在这一段，和它结束的时刻（按 clock）；计划时按剩下的时间封顶
+    life: Optional[LifeActivity] = None
+    life_deadline: float = 0.0
+    # 上班、上课中途偷偷摸鱼（自动玩、按日程开始时）
+    slack: bool = False
     stats: SessionStats = field(default_factory=SessionStats)
     # 最近几步的（这一步开始时的画面，做了什么操作，失败的话是什么失败），用来发现卡住了
     trace: Deque[Tuple[bytes, str, str]] = field(default_factory=lambda: deque(maxlen=_STUCK_TRACE))
@@ -542,6 +565,11 @@ def _app_name(session: Optional[Session]) -> str:
     return app.name if app else ""
 
 
+def _trigger_label(session: Session) -> str:
+    """这次是怎么开始的：自动玩里上班、上课时偷偷玩的写「摸鱼」。"""
+    return SLACK_LABEL if session.slack else TRIGGER_LABELS[session.trigger]
+
+
 def _interaction_list(session: Session) -> List[str]:
     """这次用她自己的账号做的互动，例如 ["点赞 3 次", "评论「好圆」"]。"""
     likes = [f"点赞 {session.likes} 次"] if session.likes else []
@@ -568,10 +596,15 @@ class PhoneAgent:
         rng: Callable[[], float] = random.random,
         diagnostics: Optional[DiagnosticStore] = None,
         memory: Optional[MemoryStore] = None,
+        life: Optional[LifeSource] = None,
+        life_share: Optional[LifeShare] = None,
     ) -> None:
         self._config = config
         self._diagnostics = diagnostics
         self._memory = memory
+        self._life = life
+        self._life_share = life_share
+        self._life_check: Optional[LifeCheck] = None
         self._device_factory = device_factory
         self._vision = vision
         self._planner = planner
@@ -796,7 +829,7 @@ class PhoneAgent:
         return {
             "state": self._state,
             "state_label": STATE_LABELS[self._state],
-            "trigger": TRIGGER_LABELS[session.trigger] if session else "",
+            "trigger": _trigger_label(session) if session else "",
             "app": _app_name(session),
             "start_app": session.app.name if session and session.app else "",
             "visited": [visit.app.name for visit in session.visits] if session else [],
@@ -831,6 +864,7 @@ class PhoneAgent:
             },
             "auto_play": config.auto_play.enabled,
             "next_auto_check": next_check,
+            "life": self.life_status(),
         }
 
     def _device_label(self, config: PhonePlayConfig) -> str:
@@ -930,7 +964,15 @@ class PhoneAgent:
     # ===== 控制 =====
 
     async def start(
-        self, *, trigger: str, hint: str = "", origin_stream: str = "", minutes: int = 0, together: bool = False
+        self,
+        *,
+        trigger: str,
+        hint: str = "",
+        origin_stream: str = "",
+        minutes: int = 0,
+        together: bool = False,
+        life: Optional[LifeActivity] = None,
+        slack: bool = False,
     ) -> None:
         """在后台开始一次玩手机。
 
@@ -943,6 +985,8 @@ class PhoneAgent:
             origin_stream: 结束后要通知的聊天流，留空不通知。
             minutes: 指定玩多久，0 表示由 Bot 决定。
             together: 是否和对方在这台手机上一起玩（对方直接在手机上操作，她轮到对方时等着）。
+            life: 麦生活日程里现在这一段（自动玩时）：告诉她在做什么，玩的时长不超过这段剩下的时间。
+            slack: 上班、上课中途偷偷摸鱼（自动玩时）：最多玩 ``life_link.slack_minutes`` 分钟，记录里写「摸鱼」。
 
         Raises:
             PlayRefused: 已经在玩、正在人工接管、额度用完时抛出。
@@ -973,6 +1017,9 @@ class PhoneAgent:
                 device_key=device_settings.model_dump_json(),
                 device_name=device_name,
                 device_settings=device_settings,
+                life=life,
+                life_deadline=self._clock() + life.remaining_seconds if life is not None else 0.0,
+                slack=slack and life is not None,
             )
             self._session = session
             self._state = "starting"
@@ -980,7 +1027,14 @@ class PhoneAgent:
             self._last_error = ""
             self._resume.set()
             self._logs.clear()
-            self._log(0, f"拿起手机（{TRIGGER_LABELS[trigger]}）", result=session.hint)
+            note = session.hint
+            if life is not None:
+                note = f"按麦生活的日程，现在是{life.describe()}，"
+                if session.slack:
+                    note += f"偷偷摸鱼玩一会儿（最多 {config.life_link.slack_minutes} 分钟）"
+                else:
+                    note += f"这段还有 {int(life.remaining_seconds // 60)} 分钟"
+            self._log(0, f"拿起手机（{_trigger_label(session)}）", result=note)
             self._task = asyncio.create_task(self._run(session), name="phone_play_session")
 
     @property
@@ -1269,7 +1323,7 @@ class PhoneAgent:
         record = SessionRecord(
             started_at=session.started_at.isoformat(timespec="seconds"),
             ended_at=self._now().isoformat(timespec="seconds"),
-            trigger=TRIGGER_LABELS[session.trigger],
+            trigger=_trigger_label(session),
             app=app.name,
             apps=[
                 {"name": visit.app.name, "package": visit.app.package, "seconds": round(visit.seconds)}
@@ -1301,6 +1355,34 @@ class PhoneAgent:
                 await self._notifier(record, session.origin_stream)
         except Exception:
             self._logger.exception("保存或通知玩手机结果失败")
+        if self._should_share(session, end_reason, config):
+            await self._share_with_life(session, record)
+
+    def _should_share(self, session: Session, end_reason: str, config: PhonePlayConfig) -> bool:
+        """只交按麦生活日程自动玩、自然结束的那几局。
+
+        聊天里叫她玩的会在那个聊天里提起，命令和 WebUI 开的有人看着；没装麦生活、按 active_hours 玩的
+        （session.life 为空）不去调一个不存在的接口；出错、卡住、被叫停的没什么可分享。
+        """
+        return (
+            self._life_share is not None
+            and session.trigger == "auto"
+            and session.life is not None
+            and config.life_link.enabled
+            and config.life_link.share_after_play
+            and (end_reason == "自己不想玩了" or end_reason.startswith(_NATURAL_END_PREFIXES))
+        )
+
+    async def _share_with_life(self, session: Session, record: SessionRecord) -> None:
+        assert self._life_share is not None
+        try:
+            opportunity = await self._life_share(record)
+        except LifeLinkError as exc:
+            self._logger.warning(f"玩完没交给麦生活分享：{exc}")
+            self._log(session.step, "没交给麦生活分享", ok=False, result=str(exc))
+            return
+        self._logger.info(f"玩完交给麦生活分享了（契机 {opportunity}）：{record.places_text()}")
+        self._log(session.step, "交给麦生活分享", result="由它决定什么时候、跟谁提起刚才看到的，也可能不提")
 
     async def _lock_after(
         self, session: Session, config: PhonePlayConfig, device: PhoneDevice, current: Optional[AllowedApp]
@@ -1332,6 +1414,14 @@ class PhoneAgent:
         self, persona: Persona, apps: Sequence[AllowedApp], session: Session, config: PhonePlayConfig
     ) -> Plan:
         max_minutes = config.play.together_minutes if session.together else config.play.max_session_minutes
+        life = session.life
+        if life is not None:
+            # 自动玩：不玩到日程这一段结束以后（连手机、解锁花掉的时间也算进去）；摸鱼只玩几分钟
+            left = max(0.0, session.life_deadline - self._clock())
+            life = replace(life, remaining_seconds=left)
+            max_minutes = max(1, min(max_minutes, int(left // 60)))
+            if session.slack:
+                max_minutes = min(max_minutes, config.life_link.slack_minutes)
         prompt = build_plan_prompt(
             persona=persona,
             now=self._now(),
@@ -1342,6 +1432,8 @@ class PhoneAgent:
             together=session.together,
             interaction=self._interaction_quota(config) is not None,
             memories=self._memory.prompt_lines(self._now()) if self._memory else (),
+            life=life,
+            slack=session.slack,
         )
         response = await self._call_model(session, "planner", self._planner, prompt)
         try:
@@ -1350,8 +1442,8 @@ class PhoneAgent:
             raise
         except ValueError as exc:
             raise AgentError(f"没能决定玩什么：{exc}") from exc
-        # 应用单独设了更短的上限就按应用；不会超过全局
-        max_minutes = self._minutes_limit(session, plan.app, config)
+        # 应用单独设了更短的上限就按应用；不会超过全局，也不会超过日程这一段剩下的时间
+        max_minutes = min(self._minutes_limit(session, plan.app, config), max_minutes)
         plan = Plan(app=plan.app, goal=plan.goal, minutes=min(plan.minutes, max_minutes))
         if session.together:
             # 一起玩时什么时候结束主要看对方，给满一起玩的时长
@@ -2371,11 +2463,88 @@ class PhoneAgent:
         config = self._config()
         if self._state != "idle" or self._controller == "user":
             return
-        if not in_active_hours(config.auto_play.active_hours, self._now()):
+        check = await self.refresh_life()
+        mode, reason = self._life_rule(config, check)
+        if mode is None:
+            # 没开联动或查不到能用的日程：按固定的时间段
+            if not in_active_hours(config.auto_play.active_hours, self._now()):
+                return
+        elif mode == "no":
+            self._logger.info(f"这次不自动玩手机：{reason}")
             return
-        if self._rng() >= config.auto_play.play_probability:
+        # 上班、上课时摸鱼用摸鱼的概率，其它时候用平常的概率
+        probability = config.life_link.slack_probability if mode == "slack" else config.auto_play.play_probability
+        if self._rng() >= probability:
             return
+        life = check.activity if mode is not None and check is not None else None
         try:
-            await self.start(trigger="auto")
+            await self.start(trigger="auto", life=life, slack=mode == "slack")
         except PlayRefused as exc:
             self._logger.info(f"这次不自动玩手机：{exc}")
+
+    async def refresh_life(self, max_age: float = 0.0) -> Optional[LifeCheck]:
+        """查一次麦生活的日程；上次查的还没超过 ``max_age`` 秒就直接用。没开联动时返回 None。
+
+        查不到能用的日程（没装、没就绪、日程没生成、空档）记下原因，自动玩按 active_hours；
+        调用本身抛出的其它异常不在这里吞掉。
+        """
+        if not self._config().life_link.enabled or self._life is None:
+            self._life_check = None
+            return None
+        cached = self._life_check
+        if cached is not None and max_age > 0 and self._clock() - cached.checked_clock < max_age:
+            return cached
+        try:
+            activity = await self._life()
+            error = "" if activity is not None else "麦生活的日程这会儿是空档"
+        except LifeLinkError as exc:
+            activity, error = None, str(exc)
+        self._life_check = LifeCheck(
+            checked_clock=self._clock(), checked_at=self._now(), activity=activity, error=error
+        )
+        return self._life_check
+
+    def _life_rule(self, config: PhonePlayConfig, check: Optional[LifeCheck]) -> Tuple[Optional[str], str]:
+        """按日程怎么自动玩，附带原因。
+
+        "play" 平常地玩、"slack" 上班上课时偶尔摸鱼、"no" 这会儿不玩，None 表示没有能用的日程（按 active_hours）。
+        """
+        if check is None:
+            return None, ""
+        activity = check.activity
+        if activity is None:
+            return None, f"{check.error}，按 active_hours（{config.auto_play.active_hours}）"
+        link = config.life_link
+        where = f"按麦生活的日程，现在是{activity.describe()}"
+        if activity.kind in link.play_kinds:
+            mode = "play"
+        elif activity.kind in link.slack_kinds and link.slack_probability > 0:
+            mode = "slack"
+        else:
+            return "no", f"{where}，先不玩"
+        left = self._life_minutes_left(check)
+        if left < link.min_minutes:
+            return "no", f"{where}，只剩 {left} 分钟，先不玩"
+        if mode == "slack":
+            chance = f"每次考虑时 {link.slack_probability:.0%} 的概率，最多 {link.slack_minutes} 分钟"
+            return "slack", f"{where}，偶尔摸鱼玩一会儿（{chance}）"
+        return "play", f"{where}，这段还有 {left} 分钟，可以玩"
+
+    def _life_minutes_left(self, check: LifeCheck) -> int:
+        assert check.activity is not None
+        return max(0, int((check.activity.remaining_seconds - (self._clock() - check.checked_clock)) // 60))
+
+    def life_status(self) -> Optional[Dict[str, Any]]:
+        """最近一次查日程的结果，给状态和 WebUI 看；没开自动玩、没开联动或还没查过时为 None。"""
+        config = self._config()
+        check = self._life_check if config.auto_play.enabled and config.life_link.enabled else None
+        if check is None:
+            return None
+        mode, reason = self._life_rule(config, check)
+        return {
+            "checked_at": check.checked_at.strftime("%H:%M"),
+            # True 能玩（含摸鱼）、False 这会儿不玩、None 没有能用的日程
+            "allowed": None if mode is None else mode != "no",
+            "slack": mode == "slack",
+            "text": reason,
+        }

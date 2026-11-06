@@ -5,6 +5,7 @@ from datetime import datetime
 from typing import Any, Dict, List, Optional, Sequence
 
 from .actions import extract_json_object, find_app
+from .life import LifeActivity
 from .pages import BILI_DETAIL, BILI_PLAYER, BILIBILI_PACKAGES
 from .settings import AllowedApp
 from .store import SessionRecord
@@ -144,10 +145,14 @@ def build_plan_prompt(
     together: bool = False,
     interaction: bool = False,
     memories: Sequence[str] = (),
+    life: Optional[LifeActivity] = None,
+    slack: bool = False,
 ) -> str:
     """让文本模型决定这次打开哪个应用、做什么、玩多久。
 
-    ``interaction`` 表示开启了用她自己的账号互动；``memories`` 是她记得的内容（看过的、对方说过的、上次没做完的）。
+    ``interaction`` 表示开启了用她自己的账号互动；``memories`` 是她记得的内容（看过的、对方说过的、上次没做完的）；
+    ``life`` 是麦生活日程里现在这一段（自动玩时才有，``remaining_seconds`` 已经换算到现在），
+    ``max_minutes`` 已经按这段剩下的时间（摸鱼时还有摸鱼的上限）算过；``slack`` 表示是上班、上课中途偷偷摸鱼。
     """
     recent_text = "\n".join(
         f"- {record.started_at[5:16].replace('T', ' ')} {record.places_text()}：{record.goal}（{record.summary}）"
@@ -187,9 +192,25 @@ def build_plan_prompt(
         )
         if together:
             interact_text += "和对方一起玩时就专心和对方玩。\n"
+    opener = "你有一点空闲，打算拿起手机玩一会儿。"
+    life_text = ""
+    if life is not None:
+        # 两边时区可能设得不一样，只说这段还剩多久，不说几点结束
+        life_text = f"按你今天的日程，现在是{life.describe()}，这段还有大约 {int(life.remaining_seconds // 60)} 分钟。"
+        if life.scene:
+            life_text += f"此刻的情形：{life.scene}"
+        if slack:
+            opener = "你正忙着，想趁没人注意偷偷拿起手机摸一会儿鱼。"
+            life_text += (
+                f"\n这是{life.kind_label}中途偷偷摸鱼：只玩几分钟，挑能随时放下的内容（刷几条短视频、看几条笔记），"
+                f"别一头扎进长视频、游戏里，玩完接着{life.kind_label}。\n"
+            )
+        else:
+            life_text += "\n挑适合这会儿的内容，别玩到这段结束以后。\n"
     return (
         f"{_identity(persona)}\n\n"
-        f"现在是 {now:%Y-%m-%d %H:%M}（{_WEEKDAYS[now.weekday()]}），你有一点空闲，打算拿起手机玩一会儿。\n"
+        f"现在是 {now:%Y-%m-%d %H:%M}（{_WEEKDAYS[now.weekday()]}），{opener}\n"
+        f"{life_text}"
         f"手机上可以打开的应用：\n{format_apps(apps)}\n\n"
         f"最近玩过：\n{recent_text or '（还没玩过）'}\n\n"
         f"{memory_text}"

@@ -12,6 +12,18 @@ from .devices import DeviceError, create_device
 from .diagnostics import DiagnosticStore
 from .memory import MemoryStore
 from .imaging import jpeg_data_url, to_base64
+from .life import (
+    SHARE_API,
+    SHARE_API_VERSION,
+    SHARE_EXPIRES_MINUTES,
+    SNAPSHOT_API,
+    SNAPSHOT_API_VERSION,
+    LifeActivity,
+    LifeLinkError,
+    parse_share_result,
+    parse_snapshot,
+    share_text,
+)
 from .prompts import Persona
 from .settings import PhonePlayConfig
 from .store import SessionRecord, UsageStore
@@ -26,6 +38,8 @@ _HELP_TEXT = (
     "/手机 设备 — 看有哪些设备、现在用哪台；/手机 切换 名字 — 换一台手机（比如 /手机 切换 OPPO），正在玩时不能换\n"
     "实时观看：WebUI 侧边栏「插件扩展」里的「手机实时画面」"
 )
+# 看状态时最多这么久查一次麦生活的日程（它的接口只读、很便宜，但 WebUI 每隔几秒就要一次状态）
+_LIFE_REFRESH_SECONDS = 60.0
 # /手机、/手机截图、/手机 开始 刷B站 都能匹配；/手机号码 这类普通消息不会被拦截
 _COMMAND_PATTERN = r"^/手机\s*(?P<sub>截图|状态|开始|停止|暂停|继续|接管|交还|设备|切换|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
 # 聊天中叫她去玩手机时，等她决定好玩什么再回话，这样她能说出具体打算
@@ -100,6 +114,8 @@ class PhonePlayPlugin(MaiBotPlugin):
             logger=self.ctx.logger,
             diagnostics=self._diagnostics,
             memory=self._memory,
+            life=self._life_snapshot,
+            life_share=self._share_with_life,
         )
         self._agent.restart_auto_play()
 
@@ -172,6 +188,36 @@ class PhonePlayPlugin(MaiBotPlugin):
         model = self.settings.model
         return await self._call_llm(prompt, model.planner_task, model.planner_model, "文本模型")
 
+    async def _life_snapshot(self) -> Optional[LifeActivity]:
+        """问麦生活（Mai_life）日程里现在这一段，见 life.py。"""
+        try:
+            response = await self.ctx.api.call(SNAPSHOT_API, version=SNAPSHOT_API_VERSION, future_limit=0)
+        except Exception as exc:
+            # 和 _call_llm 一样：宿主 RPC 超时或断开时抛出的异常不在 SDK 中导出，转成带原因的联动错误
+            raise LifeLinkError(f"查麦生活的日程失败：{exc}") from exc
+        return parse_snapshot(response)
+
+    async def _share_with_life(self, record: SessionRecord) -> str:
+        """把这次看到的交给麦生活的主动分享（create_proactive_opportunity），返回契机编号。"""
+        topic, motive = share_text(record)
+        try:
+            response = await self.ctx.api.call(
+                SHARE_API,
+                version=SHARE_API_VERSION,
+                topic=topic,
+                motive=motive,
+                weight=self.settings.life_link.share_weight,
+                expires_minutes=SHARE_EXPIRES_MINUTES,
+            )
+        except Exception as exc:
+            raise LifeLinkError(f"交给麦生活失败：{exc}") from exc
+        return parse_share_result(response)
+
+    async def _refresh_life(self) -> None:
+        """看状态时顺便更新日程（一分钟内查过就不再查）；只有开着自动玩时日程才有用。"""
+        if self.settings.auto_play.enabled:
+            await self.agent.refresh_life(max_age=_LIFE_REFRESH_SECONDS)
+
     async def _notify_finished(self, record: SessionRecord, stream_id: str) -> None:
         """在发起的聊天里告知玩完了（只有真正打开过应用的那次才会通知）：默认请 Maisaka 让她自己决定说不说、怎么说。"""
         style = self.settings.play.finish_notice
@@ -212,6 +258,7 @@ class PhonePlayPlugin(MaiBotPlugin):
     # ===== Command 组件 =====
 
     async def _status_text(self) -> str:
+        await self._refresh_life()
         status = self.agent.status()
         name = await self._bot_name()
         lines = [f"📱 {name}的手机：{status['state_label']}"]
@@ -235,6 +282,8 @@ class PhonePlayPlugin(MaiBotPlugin):
         if status["auto_play"]:
             next_check = f"，下次考虑在 {status['next_auto_check']}" if status["next_auto_check"] else ""
             lines.append(f"自动玩：已开启{next_check}")
+            if status["life"]:
+                lines.append(f"生活联动：{status['life']['text']}")
         if status["last_error"]:
             lines.append(f"⚠ 最近的错误：{status['last_error']}")
         lines.append("发送 /手机 帮助 查看全部命令")
@@ -600,6 +649,7 @@ class PhonePlayPlugin(MaiBotPlugin):
 
     @API("webui_status", description="WebUI：手机状态与操作记录", version="1")
     async def webui_status(self) -> Dict[str, Any]:
+        await self._refresh_life()
         status = self.agent.status()
         status["nickname"] = await self._bot_name()
         return status

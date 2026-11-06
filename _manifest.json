@@ -41,6 +41,7 @@
     }
   ],
   "capabilities": [
+    "api.call",
     "config.get",
     "llm.generate",
     "maisaka.proactive.trigger",
