@@ -4,7 +4,7 @@
 
 # 刷会儿手机
 
-![Plugin Version](https://img.shields.io/badge/Plugin-0.2.2-informational.svg) ![MaiBot](https://img.shields.io/badge/MaiBot-1.4.0%E2%80%931.4.99-blue.svg) ![MaiBot Plugin SDK](https://img.shields.io/badge/Plugin%20SDK-2.21.0%E2%80%932.22.99-blueviolet.svg) ![License](https://img.shields.io/badge/License-GPL--3.0--or--later-green.svg)
+![Plugin Version](https://img.shields.io/badge/Plugin-0.3.0-informational.svg) ![MaiBot](https://img.shields.io/badge/MaiBot-1.4.0%E2%80%931.4.99-blue.svg) ![MaiBot Plugin SDK](https://img.shields.io/badge/Plugin%20SDK-2.21.0%E2%80%932.22.99-blueviolet.svg) ![License](https://img.shields.io/badge/License-GPL--3.0--or--later-green.svg)
 
 让 Bot 用一台安卓手机、模拟器或 iPhone 自己刷视频、逛帖子、听歌、看小说：按人设和心情挑内容，像真人一样看屏幕、点击、滑动、搜索
 
