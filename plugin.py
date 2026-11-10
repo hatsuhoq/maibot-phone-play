@@ -1,17 +1,28 @@
 """刷会儿手机：让 Bot 用安卓手机、模拟器或 iPhone 自己刷视频、逛帖子、听歌、看小说。"""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, cast
+from typing import Any, Dict, List, Optional, Set, cast
 from uuid import uuid4
 
-from maibot_sdk import API, Command, HookHandler, MaiBotPlugin, ON_BOT_CONFIG_RELOAD, Tool
+import asyncio
+
+from maibot_sdk import (
+    API,
+    Command,
+    DesktopPetButton,
+    DesktopPetButtonState,
+    HookHandler,
+    MaiBotPlugin,
+    ON_BOT_CONFIG_RELOAD,
+    Tool,
+)
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
 from .agent import AgentError, ModelReply, PhoneAgent, PlayRefused, SwitchRefused
 from .devices import DeviceError, create_device
 from .diagnostics import DiagnosticStore
 from .memory import MemoryStore
-from .imaging import jpeg_data_url, to_base64
+from .imaging import jpeg_data_url, panel_png_base64, to_base64
 from .life import (
     SHARE_API,
     SHARE_API_VERSION,
@@ -40,6 +51,20 @@ _HELP_TEXT = (
 )
 # 看状态时最多这么久查一次麦生活的日程（它的接口只读、很便宜，但 WebUI 每隔几秒就要一次状态）
 _LIFE_REFRESH_SECONDS = 60.0
+# 桌宠「插件扩展」菜单里的按钮
+_PET_BUTTON = "phone"
+# 桌宠的按钮和面板回调限时 8 秒，截图最多等这么久，超时就用上一张
+_PET_SCREENSHOT_SECONDS = 3.0
+# 面板上的操作：ID → 按钮文字
+_PET_ACTION_LABELS: Dict[str, str] = {
+    "start": "开始玩",
+    "pause": "暂停",
+    "resume": "继续",
+    "stop": "停止",
+    "takeover": "我来操作",
+    "release": "交还控制",
+    "refresh": "刷新",
+}
 # /手机、/手机截图、/手机 开始 刷B站 都能匹配；/手机号码 这类普通消息不会被拦截
 _COMMAND_PATTERN = r"^/手机\s*(?P<sub>截图|状态|开始|停止|暂停|继续|接管|交还|设备|切换|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
 # 聊天中叫她去玩手机时，等她决定好玩什么再回话，这样她能说出具体打算
@@ -47,6 +72,55 @@ _PLAN_WAIT_SECONDS = 30.0
 # Maisaka 默认把插件工具放进 tool_search 后面，实测她要先搜一轮才会去玩，对方得催一句。
 # 去玩、问近况、叫停这三个要立刻能用，所以一直放在她的工具列表里；看屏幕不常用，仍按需搜索
 _ALWAYS_VISIBLE = "visible"
+
+
+def _first_clause(text: str, limit: int) -> str:
+    """取第一句（她的感想常用「；」连着好几句），去掉句尾标点，超长截断。桌宠面板一行只放得下十几个字。"""
+    clause = text.split("；")[0].strip().rstrip("。．.！!？?，,、；; ")
+    return clause if len(clause) <= limit else clause[: limit - 1] + "…"
+
+
+def _pet_panel_lines(status: Dict[str, Any]) -> List[str]:
+    """桌宠面板正文：大约三行，空闲时说上一次玩了什么，玩的时候说在玩什么、想做什么、在想什么。"""
+    device = f" · {status['device_name']}" if len(status["devices"]) > 1 else ""
+    playing = status["state"] in ("playing", "paused")
+    if status["controller"] == "user":
+        lines = [f"你在操作手机{device}，用完点「交还控制」"]
+    elif playing:
+        progress = f"{status['elapsed_minutes']:g}/{status['max_minutes']} 分钟"
+        lines = [f"{status['state_label']}{device}：{status['app']} {progress}"]
+    elif status["state"] == "starting":
+        lines = [f"正在拿起手机{device}…"]
+    else:
+        lines = [f"空闲{device} · 今天玩了 {status['today']['sessions']} 次"]
+    if playing:
+        if status["goal"]:
+            lines.append(f"想做：{_first_clause(status['goal'], 26)}")
+        if status["thought"]:
+            lines.append(f"💭 {_first_clause(status['thought'], 34)}")
+    elif status["state"] == "idle" and status["controller"] == "bot" and status["history"]:
+        last = status["history"][0]
+        started = datetime.fromisoformat(last["started_at"])
+        minutes = max(1, round((datetime.fromisoformat(last["ended_at"]) - started).total_seconds() / 60))
+        when = f"{started:%H:%M}" if started.date() == datetime.now().date() else f"{started:%m-%d %H:%M}"
+        lines.append(f"上次 {when} · {last['app']} · {minutes} 分钟")
+        if last["summary"]:
+            lines.append(f"💭 {_first_clause(last['summary'], 34)}")
+    return lines
+
+
+def _pet_actions(status: Dict[str, Any]) -> List[str]:
+    """桌宠面板上按现在的状态能做的操作。"""
+    if status["controller"] == "user":
+        return ["release", "refresh"]
+    if status["state"] == "idle":
+        return ["start", "takeover", "refresh"]
+    if status["state"] == "playing":
+        return ["pause", "stop", "takeover", "refresh"]
+    if status["state"] == "paused":
+        return ["resume", "stop", "takeover", "refresh"]
+    # 正在拿起手机（连手机、想玩什么）
+    return ["stop", "refresh"]
 
 
 def _finish_reason_text(end_reason: str) -> str:
@@ -70,6 +144,7 @@ class PhonePlayPlugin(MaiBotPlugin):
 
     config_model = PhonePlayConfig
     config_reload_subscriptions = (ON_BOT_CONFIG_RELOAD,)
+    desktop_pet_buttons = [DesktopPetButton(id=_PET_BUTTON, label="手机", icon="star")]
 
     def __init__(self) -> None:
         super().__init__()
@@ -77,6 +152,8 @@ class PhonePlayPlugin(MaiBotPlugin):
         self._diagnostics: Optional[DiagnosticStore] = None
         self._memory: Optional[MemoryStore] = None
         self._bot_nickname = ""
+        # 桌宠面板上点了「停止」：收尾（回桌面、锁屏）可能超过回调的 8 秒，放到后台
+        self._pet_tasks: Set[asyncio.Task[bool]] = set()
 
     @property
     def settings(self) -> PhonePlayConfig:
@@ -116,6 +193,8 @@ class PhonePlayPlugin(MaiBotPlugin):
             memory=self._memory,
             life=self._life_snapshot,
             life_share=self._share_with_life,
+            announcer=self._pet_bubble,
+            refresher=self._pet_refresh_buttons,
         )
         self._agent.restart_auto_play()
 
@@ -124,6 +203,9 @@ class PhonePlayPlugin(MaiBotPlugin):
         if self._agent is not None:
             await self._agent.shutdown()
             self._agent = None
+        if self._pet_tasks:
+            # 桌宠上点的「停止」和 shutdown 等的是同一个会话，这里只等它们收完
+            await asyncio.wait(self._pet_tasks)
 
     async def on_config_update(self, scope: str, config_data: Dict[str, Any], version: str) -> None:
         """处理配置热重载：插件配置变化后重启自动玩调度，Bot 配置变化后刷新昵称。
@@ -644,6 +726,114 @@ class PhonePlayPlugin(MaiBotPlugin):
         if not text or not isinstance(extra, str):
             return {"action": "continue"}
         return {"action": "continue", "modified_kwargs": {**kwargs, "extra_prompt": f"{extra}\n{text}".strip()}}
+
+    # ===== 桌宠 =====
+    # 宿主内置桌宠（MaiBot 1.4）：「插件扩展」菜单里的「手机」按钮、点开后的面板，以及玩手机时冒的气泡
+
+    async def _pet_bubble(self, text: str) -> None:
+        """在桌宠上冒一句气泡；桌宠没就绪时跳过。开关和间隔由 agent 判断，出错由 agent 记进日志。"""
+        state = await self.ctx.desktop_pet.status()
+        if not state.get("ready"):
+            return
+        await self.ctx.desktop_pet.say(text)
+
+    async def _pet_refresh_buttons(self) -> None:
+        """她的状态变了，让宿主重新读一次按钮上的字；按钮关掉了就不打扰宿主。
+
+        宿主只是排一次刷新，桌宠没开时也不会出错；面板本身不会跟着变，要重新点按钮。
+        """
+        if self.settings.desktop_pet.button:
+            await self.ctx.desktop_pet.refresh_buttons()
+
+    def _pet_button_text(self) -> str:
+        """按钮上的一行状态，打开桌宠的扩展菜单时刷新。"""
+        status = self.agent.status()
+        if status["controller"] == "user":
+            return "你在操作手机"
+        if status["state"] in ("playing", "paused"):
+            prefix = "暂停中" if status["state"] == "paused" else "正在玩"
+            return f"{prefix}：{status['app']} {status['elapsed_minutes']:g}/{status['max_minutes']} 分钟"
+        if status["state"] == "starting":
+            return "正在拿起手机"
+        return f"空闲 · 今天玩了 {status['today']['sessions']} 次"
+
+    async def get_desktop_pet_button_states(self) -> Dict[str, DesktopPetButtonState]:
+        visible = self.settings.desktop_pet.button and self._agent is not None
+        return {_PET_BUTTON: DesktopPetButtonState(visible=visible, text=self._pet_button_text() if visible else "")}
+
+    async def on_desktop_pet_button_click(self, button_id: str) -> Dict[str, Any]:
+        return await self.get_desktop_pet_panel(button_id)
+
+    async def get_desktop_pet_panel(self, button_id: str, notice: str = "") -> Dict[str, Any]:
+        """桌宠里的面板：她在玩什么、此刻的想法、手机截图，以及按现在的状态能做的操作。
+
+        宿主每次执行面板操作前也会调一次这里来核对操作还在不在，所以截图复用最短刷新间隔内的那张。
+        """
+        if button_id != _PET_BUTTON:
+            raise ValueError(f"没有这个桌宠按钮：{button_id}")
+        agent = self.agent
+        try:
+            await asyncio.wait_for(agent.refresh_frame(), _PET_SCREENSHOT_SECONDS)
+            stale = False
+        except TimeoutError:
+            stale = True
+        jpeg, frame_error = agent.latest_frame()
+        image = await asyncio.to_thread(panel_png_base64, jpeg) if jpeg is not None else None
+        status = agent.status()
+        lines = [notice] if notice else []
+        lines.extend(_pet_panel_lines(status))
+        # 有问题时才多一行；生活联动、步数这些细节在 WebUI 里看
+        connection = status["connection"]
+        if connection["state"] not in ("ok", "unknown"):
+            lines.append(f"⚠ {connection['label']}")
+        if stale:
+            lines.append("⚠ 截图超时，这是上一张")
+        elif frame_error:
+            lines.append(f"⚠ 截图失败：{_first_clause(frame_error, 24)}")
+        name = await self._bot_name()
+        return {
+            "title": f"{name or '她'}的手机"[:64],
+            "text": "\n".join(lines)[:4000],
+            "image": image,
+            "actions": [{"id": action, "label": _PET_ACTION_LABELS[action]} for action in _pet_actions(status)],
+        }
+
+    async def on_desktop_pet_panel_action(self, button_id: str, action_id: str) -> Dict[str, Any]:
+        """面板上的操作，做完返回更新后的面板，最上面一行说明做了什么。"""
+        if button_id != _PET_BUTTON:
+            raise ValueError(f"没有这个桌宠按钮：{button_id}")
+        agent = self.agent
+        notice = ""
+        if action_id == "start":
+            try:
+                await agent.start(trigger="pet")
+                notice = "她拿起了手机，正在想玩什么"
+            except PlayRefused as exc:
+                notice = f"没开始：{exc}"
+        elif action_id == "pause":
+            notice = "暂停了：这一步做完就停下" if agent.pause() else "现在没在玩，不用暂停"
+        elif action_id == "resume":
+            notice = "接着玩了" if agent.resume() else "现在没有暂停"
+        elif action_id == "stop":
+            # 收尾要回桌面、锁屏，可能超过回调的 8 秒：放到后台，面板先说一声
+            task = asyncio.create_task(agent.stop("在桌宠上停止"), name="phone_play_pet_stop")
+            self._pet_tasks.add(task)
+            task.add_done_callback(self._pet_task_done)
+            notice = "她正在放下手机"
+        elif action_id == "takeover":
+            agent.takeover()
+            notice = "手机交给你了，她不会再操作；用完点「交还控制」"
+        elif action_id == "release":
+            agent.release()
+            notice = "交还给她了，她会先看看现在的画面再接着玩"
+        elif action_id != "refresh":
+            raise ValueError(f"没有这个操作：{action_id}")
+        return await self.get_desktop_pet_panel(button_id, notice)
+
+    def _pet_task_done(self, task: "asyncio.Task[bool]") -> None:
+        self._pet_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self.ctx.logger.error(f"桌宠上停止玩手机失败：{task.exception()}")
 
     # ===== WebUI 页面 API =====
 

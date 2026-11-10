@@ -5,7 +5,7 @@ from dataclasses import asdict, dataclass, field, replace
 from datetime import datetime, timedelta
 from logging import Logger
 from PIL import Image
-from typing import Any, Awaitable, Callable, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
+from typing import Any, Awaitable, Callable, Coroutine, Deque, Dict, List, Optional, Sequence, Set, Tuple, Union
 
 import asyncio
 import math
@@ -65,7 +65,19 @@ CONNECTION_LABELS: Dict[str, str] = {
     "config": "配置有误",
     "failed": "连接失败",
 }
-TRIGGER_LABELS: Dict[str, str] = {"auto": "自己想玩", "chat": "聊天中决定", "command": "命令", "webui": "WebUI"}
+TRIGGER_LABELS: Dict[str, str] = {
+    "auto": "自己想玩",
+    "chat": "聊天中决定",
+    "command": "命令",
+    "webui": "WebUI",
+    "pet": "桌宠",
+}
+# 插件卸载、MaiBot 关闭时结束这次用的原因：这时不在聊天里提，也不冒桌宠气泡
+_UNLOAD_REASON = "插件卸载"
+# 桌宠气泡里放下手机时的感想最多这么多字
+_ANNOUNCE_SUMMARY_LIMIT = 80
+# 桌宠想法气泡里一句想法最多这么多字
+_THOUGHT_BUBBLE_LIMIT = 60
 
 _LOG_LIMIT = 60
 # WebUI 查询结果上限 512 KiB，Base64 会膨胀约 4/3，再给其它字段留出余量
@@ -159,6 +171,10 @@ DeviceFactory = Callable[[DeviceSettings], PhoneDevice]
 LifeSource = Callable[[], Awaitable[Optional[LifeActivity]]]
 # 玩完把这次看到的交给麦生活分享，返回契机编号；没收下抛 LifeLinkError
 LifeShare = Callable[[SessionRecord], Awaitable[str]]
+# 她拿起、放下手机和玩的时候冒一句（桌宠气泡）；在后台跑，出错只记日志，不影响这次玩手机
+Announcer = Callable[[str], Awaitable[None]]
+# 状态变了（开始、每一步、暂停、接管、结束）时让桌宠刷新按钮上的字；同样在后台跑
+Refresher = Callable[[], Awaitable[None]]
 # 自然结束（她自己玩够了、到了时长、步数或预算）的结束原因；出错、卡住、被叫停、接管太久的不算
 _NATURAL_END_PREFIXES = ("玩够", "达到", "今天的操作步数", "这次的模型调用", "今天的模型调用")
 
@@ -445,6 +461,17 @@ def _recent_unique(items: Sequence[str], count: int) -> List[str]:
     return list(dict.fromkeys(items))[-count:]
 
 
+def _clip(text: str, limit: int) -> str:
+    """超过 limit 个字时截断，末尾换成省略号。"""
+    text = text.strip()
+    return text if len(text) <= limit else text[: limit - 1] + "…"
+
+
+def _no_end_mark(text: str) -> str:
+    """去掉句尾标点：几句话用「；」「：」拼起来时，不出现「。；」「。：」。"""
+    return text.strip().rstrip("。．.！!？?，,、；;：: ")
+
+
 def _history_result(result: str) -> str:
     """给模型看的操作结果：去掉截图像素坐标（WebUI 的操作记录里照样保留）。
 
@@ -598,12 +625,20 @@ class PhoneAgent:
         memory: Optional[MemoryStore] = None,
         life: Optional[LifeSource] = None,
         life_share: Optional[LifeShare] = None,
+        announcer: Optional[Announcer] = None,
+        refresher: Optional[Refresher] = None,
     ) -> None:
         self._config = config
         self._diagnostics = diagnostics
         self._memory = memory
         self._life = life
         self._life_share = life_share
+        self._announcer = announcer
+        self._refresher = refresher
+        self._pet_tasks: Set[asyncio.Task[None]] = set()
+        # 上一个气泡什么时候冒的、上一句想法气泡说的什么：想法气泡隔开一段时间，同一句不重复
+        self._last_bubble_clock: Optional[float] = None
+        self._last_thought_bubble = ""
         self._life_check: Optional[LifeCheck] = None
         self._device_factory = device_factory
         self._vision = vision
@@ -907,8 +942,8 @@ class PhoneAgent:
         place = f"在{last.places_text()}里" if last.app else ""
         text = (
             f"现在没在玩手机。上一次玩手机是 {last.started_at[5:16].replace('T', ' ')}，"
-            f"{place}{last.goal or '没决定好玩什么'}："
-            f"{last.summary}（{last.end_reason}）。今天一共玩了 {sessions_today} 次。"
+            f"{place}{_no_end_mark(last.goal) or '没决定好玩什么'}："
+            f"{_no_end_mark(last.summary)}（{last.end_reason}）。今天一共玩了 {sessions_today} 次。"
         )
         if last.interactions:
             text += f"那次用自己的账号{'、'.join(last.interactions)}。"
@@ -1036,6 +1071,7 @@ class PhoneAgent:
                     note += f"这段还有 {int(life.remaining_seconds // 60)} 分钟"
             self._log(0, f"拿起手机（{_trigger_label(session)}）", result=note)
             self._task = asyncio.create_task(self._run(session), name="phone_play_session")
+            self._changed()
 
     @property
     def connecting(self) -> bool:
@@ -1092,6 +1128,7 @@ class PhoneAgent:
         self._state = "paused"
         self._sync_running()
         self._log(session.step, "暂停")
+        self._changed()
         return True
 
     def resume(self) -> bool:
@@ -1101,6 +1138,7 @@ class PhoneAgent:
         self._state = "playing"
         self._sync_running()
         self._log(session.step, "继续")
+        self._changed()
         return True
 
     @property
@@ -1123,6 +1161,7 @@ class PhoneAgent:
         self._sync_running()
         # 正在看视频、等对方的长等待也马上停下
         self._wake.set()
+        self._changed()
         return True
 
     def release(self) -> bool:
@@ -1135,6 +1174,7 @@ class PhoneAgent:
             session.handed_back = True
             self._log(session.step, "你交还了控制，她看看现在的画面再接着玩")
         self._sync_running()
+        self._changed()
         return True
 
     def _sync_running(self) -> None:
@@ -1178,10 +1218,55 @@ class PhoneAgent:
             await asyncio.wait({self._auto_task})
             self._auto_task = None
         # 插件重载、MaiBot 关闭这类技术原因不该让她在聊天里说什么，实测她会编出「黑屏了」之类的理由
-        await self.stop("插件卸载", notify=False)
+        await self.stop(_UNLOAD_REASON, notify=False)
+        for task in list(self._pet_tasks):
+            task.cancel()
+        if self._pet_tasks:
+            await asyncio.wait(self._pet_tasks)
         for _, device in self._devices.values():
             await device.close()
         self._devices.clear()
+
+    def _announce(self, text: str, *, thought: bool = False) -> None:
+        """在后台说一句（桌宠气泡），不等它说完，也不让它的错误打断玩手机。
+
+        拿起、放下手机的那句只看 bubbles 开关；想法气泡还要打开 thought_bubbles，离上一个气泡至少隔
+        thought_bubble_seconds 秒（桌宠一次只显示一个气泡，太密了前一句还没看完就被顶掉），和上一句想法
+        一样时不再说。
+        """
+        if self._announcer is None:
+            return
+        settings = self._config().desktop_pet
+        now = self._clock()
+        if thought:
+            if not settings.thought_bubbles or text == self._last_thought_bubble:
+                return
+            if self._last_bubble_clock is not None and now - self._last_bubble_clock < settings.thought_bubble_seconds:
+                return
+            self._last_thought_bubble = text
+        elif not settings.bubbles:
+            return
+        self._last_bubble_clock = now
+        self._spawn_pet(self._announcer(text), "桌宠气泡没显示")
+
+    def _changed(self) -> None:
+        """状态变了：在后台让桌宠刷新按钮上的字（打开着的扩展菜单也会跟着变）。"""
+        if self._refresher is not None:
+            self._spawn_pet(self._refresher(), "桌宠按钮没刷新")
+
+    def _spawn_pet(self, call: Coroutine[Any, Any, None], failure: str) -> None:
+        task = asyncio.create_task(call, name="phone_play_pet")
+        self._pet_tasks.add(task)
+        task.add_done_callback(lambda done: self._pet_done(done, failure))
+
+    def _pet_done(self, task: asyncio.Task[None], failure: str) -> None:
+        self._pet_tasks.discard(task)
+        if not task.cancelled() and task.exception() is not None:
+            self._logger.warning(f"{failure}：{task.exception()}")
+
+    def latest_frame(self) -> Tuple[Optional[bytes], str]:
+        """最近一张画面（JPEG）和截图出错的原因；还没截过时画面为 None。"""
+        return (self._frame.jpeg if self._frame is not None else None), self._frame_error
 
     # ===== 画面 =====
 
@@ -1279,8 +1364,8 @@ class PhoneAgent:
         summary = session.finish_summary
         if len(summary) < _SHORT_SUMMARY:
             # 实测 gpt-6.1-terra 结束时只写「结束刷抖音」，聊天里提起这次时没什么可说的；用她看的时候的想法补上
-            parts = [text for text in (summary, *seen, session.finish_thought) if text]
-            summary = "；".join(dict.fromkeys(parts))
+            parts = [_no_end_mark(text) for text in (summary, *seen, session.finish_thought)]
+            summary = "；".join(dict.fromkeys(part for part in parts if part))
         summary = summary or "；".join(_recent_unique(session.summaries, 3)) or "没做什么"
         failed = end_reason.startswith(("出错", "意外错误", "连续"))
         self._log(session.step, f"结束：{end_reason}", ok=not failed, result=summary if app else "")
@@ -1315,6 +1400,7 @@ class PhoneAgent:
             # 还没决定玩什么就结束了，让等待计划的调用方立刻拿到原因
             session.planned.set()
             self._resume.set()
+            self._changed()
         if app is None:
             # 没打开过应用不算玩了一次，也不发结束通知：原因已经由等待计划的调用方告诉对方，
             # 完整原因留在操作记录和最近的错误里
@@ -1357,6 +1443,8 @@ class PhoneAgent:
             self._logger.exception("保存或通知玩手机结果失败")
         if self._should_share(session, end_reason, config):
             await self._share_with_life(session, record)
+        if end_reason != _UNLOAD_REASON:
+            self._announce(f"放下手机：{_clip(record.summary, _ANNOUNCE_SUMMARY_LIMIT)}")
 
     def _should_share(self, session: Session, end_reason: str, config: PhonePlayConfig) -> bool:
         """只交按麦生活日程自动玩、自然结束的那几局。
@@ -1516,6 +1604,8 @@ class PhoneAgent:
         self._enter_app(session, plan.app)
         session.planned.set()
         self._state = "playing"
+        self._announce(f"{'偷偷摸鱼' if session.slack else '拿起手机'}：打开{plan.app.name}，{plan.goal}")
+        self._changed()
         # 真正打开应用才算玩了一次；马上存下来，玩到一半宿主崩溃也不会丢
         self._store.add_session(self._today())
         await self._save_usage()
@@ -1557,6 +1647,7 @@ class PhoneAgent:
                 ok, finished, wait_seconds = False, False, 0.0
             if finished:
                 return
+            self._changed()
             session.trace.append((session.last_signature, session.step_kind, session.step_failure))
             session.step_kind, session.step_failure = "", ""
             stuck = self._stuck_reason(session)
@@ -2083,6 +2174,9 @@ class PhoneAgent:
 
         if action.thought:
             session.last_thought = action.thought
+            if action.kind != "finish":
+                # 放下手机那句已经带着她最后的想法，结束这一步不再单独冒
+                self._announce(f"💭 {_clip(action.thought, _THOUGHT_BUBBLE_LIMIT)}", thought=True)
         summary = action.summary or action.describe()
         if action.kind in _IN_APP_KINDS:
             # 模型想的这几秒里前台可能换了（广告跳到了别的应用），做之前再看一次，不在白名单里就不做

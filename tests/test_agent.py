@@ -50,6 +50,8 @@ class Harness:
         plan: Union[str, Sequence[str]] = PLAN,
         life: Optional[LifeSource] = None,
         share: bool = False,
+        announce: bool = False,
+        refresh: bool = False,
     ) -> None:
         self.config = config or PhonePlayConfig()
         self.device = device
@@ -57,6 +59,11 @@ class Harness:
         self.vision_messages: List[List[Dict[str, Any]]] = []
         self.plan_prompts: List[str] = []
         self.notified: List[tuple] = []
+        # announce=True 时接上假的桌宠气泡：记下说了什么，announce_error 不为空时抛出
+        self.announced: List[str] = []
+        self.announce_error: Optional[Exception] = None
+        # refresh=True 时接上假的「刷新桌宠按钮」：记下刷新了几次
+        self.refreshes = 0
         # share=True 时接上假的「交给麦生活分享」：记下交过去的记录，share_error 不为空时抛出
         self.shared: List[SessionRecord] = []
         self.share_error: Optional[LifeLinkError] = None
@@ -78,7 +85,22 @@ class Harness:
             sleep=self.fake_sleep,
             life=life,
             life_share=self.share if share else None,
+            announcer=self.announce if announce else None,
+            refresher=self.refresh if refresh else None,
         )
+
+    async def announce(self, text: str) -> None:
+        if self.announce_error is not None:
+            raise self.announce_error
+        self.announced.append(text)
+
+    async def refresh(self) -> None:
+        self.refreshes += 1
+
+    async def settle(self) -> None:
+        """等后台的气泡说完、按钮刷新完。"""
+        while self.agent._pet_tasks:
+            await asyncio.wait(set(self.agent._pet_tasks))
 
     async def share(self, record: SessionRecord) -> str:
         if self.share_error is not None:
@@ -843,6 +865,160 @@ async def test_only_natural_auto_sessions_from_the_schedule_are_shared(tmp_path)
     assert harness.shared == []
 
 
+async def test_she_says_when_she_picks_up_and_puts_down_the_phone(tmp_path):
+    harness = Harness(
+        tmp_path, FakeDevice(), [action(action="finish", summary="看了三只橘猫，圆滚滚的好可爱")], announce=True
+    )
+    record = await harness.run(trigger="pet")
+    await harness.settle()
+    assert harness.announced == ["拿起手机：打开哔哩哔哩，看猫猫视频", f"放下手机：{record.summary}"]
+    assert record.trigger == "桌宠"
+
+
+async def test_slacking_off_is_announced_as_such_and_long_thoughts_are_cut(tmp_path):
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        # 她的总结太短时会拼上她的想法，拼出来可能很长
+        [action(action="finish", summary="看完了", thought="猫" * 100)],
+        config=auto_config(),
+        life=Schedule(life("work", "整理项目文档")),
+        announce=True,
+    )
+    harness.agent._rng = lambda: 0.0
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    await harness.settle()
+    record = harness.store.history[-1]
+    assert len(record.summary) > 80
+    assert harness.announced[0] == "偷偷摸鱼：打开哔哩哔哩，看猫猫视频"
+    assert harness.announced[1] == "放下手机：" + record.summary[:79] + "…"
+
+
+async def test_a_failing_bubble_does_not_get_in_her_way(tmp_path, caplog):
+    harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="看完了")], announce=True)
+    harness.announce_error = RuntimeError("桌宠窗口还没就绪")
+    with caplog.at_level(logging.WARNING, logger="phone_play_test"):
+        record = await harness.run()
+        await harness.settle()
+    assert record.end_reason == "自己不想玩了"
+    assert caplog.text.count("桌宠气泡没显示：桌宠窗口还没就绪") == 2
+
+
+async def test_nothing_is_announced_when_the_plugin_unloads_or_nothing_was_opened(tmp_path):
+    harness = Harness(tmp_path, FakeDevice(installed=set()), [], announce=True)
+    with pytest.raises(PlayRefused):
+        await harness.agent.start(trigger="command")
+        await harness.agent.wait_for_plan(5)
+    await harness.settle()
+    assert harness.announced == []
+
+    harness = Harness(tmp_path, FakeDevice(), [], announce=True)
+    looking = asyncio.Event()
+
+    async def slow_vision(messages: List[Dict[str, Any]]) -> str:
+        looking.set()
+        await asyncio.sleep(3600)
+        return ""
+
+    harness.agent._vision = slow_vision
+    await harness.agent.start(trigger="command")
+    await asyncio.wait_for(looking.wait(), 5)
+    await harness.agent.shutdown()
+    # 拿起手机那句已经说了；插件卸载时不再说放下手机
+    assert harness.announced == ["拿起手机：打开哔哩哔哩，看猫猫视频"]
+
+
+async def test_her_thoughts_pop_up_while_she_plays(tmp_path):
+    config = PhonePlayConfig()
+    config.play.step_interval_seconds = 10
+    config.desktop_pet.thought_bubble_seconds = 5
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [
+            action(action="back", summary="返回", thought="橘猫踩奶的图好可爱"),
+            # 同一句想法不再冒
+            action(action="back", summary="返回", thought="橘猫踩奶的图好可爱"),
+            action(action="back", summary="返回", thought="这篇讲猫咪运动康复，有点学术"),
+            # 结束这一步的想法跟着「放下手机」那句说，不单独冒
+            action(action="finish", summary="看完了", thought="不看了，去睡觉"),
+        ],
+        config=config,
+        announce=True,
+        refresh=True,
+    )
+    record = await harness.run()
+    await harness.settle()
+    assert harness.announced == [
+        "拿起手机：打开哔哩哔哩，看猫猫视频",
+        "💭 橘猫踩奶的图好可爱",
+        "💭 这篇讲猫咪运动康复，有点学术",
+        f"放下手机：{record.summary}",
+    ]
+    # 开始、打开应用、三步各一次、放下手机：按钮跟着刷新
+    assert harness.refreshes == 6
+
+
+async def test_thought_bubbles_are_spaced_out_and_can_be_turned_off(tmp_path):
+    harness = Harness(tmp_path, FakeDevice(), [], announce=True)
+    pet = harness.config.desktop_pet
+    pet.thought_bubble_seconds = 20
+    agent = harness.agent
+    agent._announce("拿起手机：打开哔哩哔哩，看猫猫视频")
+    harness.seconds = 10
+    # 离上一个气泡才 10 秒：前一句可能还没看完，不冒
+    agent._announce("💭 好多猫", thought=True)
+    harness.seconds = 25
+    agent._announce("💭 好多猫", thought=True)
+    harness.seconds = 50
+    agent._announce("💭 好多猫", thought=True)
+    agent._announce("💭 这只是橘猫", thought=True)
+    harness.seconds = 55
+    # 拿起、放下手机的那句不受间隔限制
+    agent._announce("放下手机：看了好多猫")
+    await harness.settle()
+    assert harness.announced == [
+        "拿起手机：打开哔哩哔哩，看猫猫视频",
+        "💭 好多猫",
+        "💭 这只是橘猫",
+        "放下手机：看了好多猫",
+    ]
+
+    pet.thought_bubbles = False
+    harness.seconds = 100
+    agent._announce("💭 又一只猫", thought=True)
+    agent._announce("拿起手机：打开抖音，随便看看")
+    pet.bubbles = False
+    agent._announce("放下手机：看完了")
+    await harness.settle()
+    assert harness.announced[4:] == ["拿起手机：打开抖音，随便看看"]
+
+
+async def test_the_pet_button_refreshes_when_you_pause_or_take_over(tmp_path):
+    harness = Harness(tmp_path, FakeDevice(), [], refresh=True)
+    looking = asyncio.Event()
+
+    async def slow_vision(messages: List[Dict[str, Any]]) -> str:
+        looking.set()
+        await asyncio.sleep(3600)
+        return ""
+
+    harness.agent._vision = slow_vision
+    await harness.agent.start(trigger="command")
+    await asyncio.wait_for(looking.wait(), 5)
+    await harness.settle()
+    started = harness.refreshes
+    assert started == 2
+    for change in (harness.agent.pause, harness.agent.resume, harness.agent.takeover, harness.agent.release):
+        assert change() is True
+    # 状态没变的不刷新
+    assert harness.agent.release() is False
+    await harness.settle()
+    assert harness.refreshes == started + 4
+    await harness.agent.shutdown()
+
+
 class PartnerPhone(FakeDevice):
     """一起玩时的手机：等对方时截了 change_after 张图之后，对方操作了，画面变了。"""
 
@@ -1101,7 +1277,7 @@ async def test_short_finish_summary_is_padded_with_what_she_saw(tmp_path):
         ],
     )
     record = await harness.run()
-    assert record.summary == "结束刷抖音；奶奶找吃的给孙女，看看。；刷得差不多了，奶奶的视频很暖。"
+    assert record.summary == "结束刷抖音；奶奶找吃的给孙女，看看；刷得差不多了，奶奶的视频很暖"
     system_text = harness.vision_messages[0][0]["content"]
     assert "这一步的 summary 不要写「结束」" in system_text
 

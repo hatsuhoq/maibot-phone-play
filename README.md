@@ -4,7 +4,7 @@
 
 # 刷会儿手机
 
-![Plugin Version](https://img.shields.io/badge/Plugin-0.2.2-informational.svg) ![MaiBot](https://img.shields.io/badge/MaiBot-1.3.6%E2%80%931.3.99-blue.svg) ![MaiBot Plugin SDK](https://img.shields.io/badge/Plugin%20SDK-2.12.0%E2%80%932.20.99-blueviolet.svg) ![License](https://img.shields.io/badge/License-GPL--3.0--or--later-green.svg)
+![Plugin Version](https://img.shields.io/badge/Plugin-0.2.2-informational.svg) ![MaiBot](https://img.shields.io/badge/MaiBot-1.4.0%E2%80%931.4.99-blue.svg) ![MaiBot Plugin SDK](https://img.shields.io/badge/Plugin%20SDK-2.21.0%E2%80%932.22.99-blueviolet.svg) ![License](https://img.shields.io/badge/License-GPL--3.0--or--later-green.svg)
 
 让 Bot 用一台安卓手机、模拟器或 iPhone 自己刷视频、逛帖子、听歌、看小说：按人设和心情挑内容，像真人一样看屏幕、点击、滑动、搜索
 
@@ -13,6 +13,7 @@
 - **自己玩手机**：她决定打开哪个应用、想看什么，看着屏幕一步步操作；短视频不喜欢就划走，长视频一段一段看，看过的不再点开
 - **聊天里就能叫她**：「去刷会儿B站」「给我看看你在看什么」「别玩了」，不用记命令；也可以和她在手机上一起玩游戏
 - **WebUI 实时画面**：看她的屏幕、此刻的想法和每一步操作，随时暂停、叫停，或者点「我来操作」接管手机
+- **桌宠上也能看**：MaiBot 内置桌宠的扩展菜单里有个「手机」按钮，按钮上的字跟着她的状态变，点开就是截图、她的想法和开始、停止；玩的时候桌宠还会冒出她的想法
 - **安卓和 iPhone**：模拟器、真机、无线调试、iPhone（WebDriverAgent）都行，多台手机换着用；锁屏会自动解开，玩完自己锁上
 - **记得看过什么**：小说读到哪、听过的歌、你说过的喜好、上次没做完的事，下次接着来
 - **和麦生活联动**：按日程自动玩，上班偶尔摸鱼，玩完把刷到的东西交给麦生活找机会私聊分享
@@ -38,8 +39,8 @@
 ## 安装
 
 **环境要求：**<br>
-**MaiBot** `1.3.6–1.3.99`<br>
-**SDK** `2.12.0–2.20.99`<br>
+**MaiBot** `1.4.0–1.4.99`（1.3 请用插件 0.2.2）<br>
+**SDK** `2.21.0–2.22.99`<br>
 **Python** `≥3.12`<br>
 **一台给她用的手机**：安卓（模拟器或真机，用 adb 控制）或 iPhone（用 WebDriverAgent 控制）
 
@@ -73,6 +74,7 @@ git clone https://github.com/hatsuhoq/maibot-phone-play.git phone_play
 | 直接跟她说 | 「去玩会儿手机吧」「你在看什么？给我看看」「别玩了」 | 她自己决定做不做、怎么回；通过聊天开始的，玩完会回来提一句 |
 | 聊天命令 | `/手机 开始 刷B站看猫猫` | 精确控制，只有管理员能用 |
 | WebUI | 「手机实时画面」里填想做的事，点「开始玩」 | 能登录 WebUI 就能用 |
+| 桌宠 | 桌宠「插件扩展」菜单 →「手机」→「开始玩」 | 在跑 MaiBot 的电脑上用 |
 | 她自己 | 打开 `auto_play.enabled` | 空闲时按概率；装了麦生活按日程，上班偶尔摸鱼 |
 | 一起玩 | 「来手机上一起玩 xx」「来斗地主 2v2，我拉你」 | 同一台手机轮流玩，或各用各的手机联机 |
 

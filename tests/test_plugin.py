@@ -1,13 +1,18 @@
 from dataclasses import replace
 from datetime import datetime
+from io import BytesIO
 from typing import Any, List
 from unittest.mock import AsyncMock
 
 import asyncio
+import base64
 import json
 import re
 import pytest
 
+from PIL import Image
+
+from maibot_sdk import DesktopPetButtonState
 from maibot_sdk.context import PluginContext, PluginPaths
 
 from phone_play import plugin as plugin_module
@@ -52,6 +57,9 @@ def make_plugin(tmp_path, **overrides: Any):
     plugin.set_plugin_config(config.model_dump())
     plugin.ctx.send.text = AsyncMock(return_value=True)
     plugin.ctx.send.image = AsyncMock(return_value=True)
+    # 测试里没有桌宠：气泡跳过，按钮刷新只记下调用
+    plugin.ctx.desktop_pet.status = AsyncMock(return_value={"ready": False, "visible": False})
+    plugin.ctx.desktop_pet.refresh_buttons = AsyncMock(return_value={"success": True})
     plugin.ctx.config.get = AsyncMock(side_effect=lambda key, default=None: {"bot.nickname": "小睦"}.get(key, ""))
     return plugin
 
@@ -809,3 +817,181 @@ async def test_finished_session_is_handed_to_mai_life_for_sharing(tmp_path):
     plugin.ctx.api.call = AsyncMock(side_effect=TimeoutError("等宿主回应超时"))
     with pytest.raises(LifeLinkError, match="交给麦生活失败：等宿主回应超时"):
         await plugin._share_with_life(record)
+
+
+def panel_actions(panel) -> List[str]:
+    return [action["id"] for action in panel["actions"]]
+
+
+async def test_desktop_pet_button_and_panel_follow_her_state(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    plugin = make_plugin(tmp_path)
+    looking = asyncio.Event()
+
+    async def generate(prompt, **kwargs):
+        if isinstance(prompt, str):
+            return {"success": True, "response": PLAN_JSON}
+        # 看屏幕的那一步一直不回来，好在「正在玩」的时候看面板
+        looking.set()
+        await asyncio.sleep(3600)
+
+    plugin.ctx.llm.generate = generate
+    await plugin.on_load()
+    try:
+        assert await plugin.get_desktop_pet_button_states() == {
+            "phone": DesktopPetButtonState(visible=True, text="空闲 · 今天玩了 0 次")
+        }
+        panel = await plugin.on_desktop_pet_button_click("phone")
+        assert panel["title"] == "小睦的手机"
+        # 面板窄、一行只放得下十几个字：空闲时只有一行，还没玩过就不提上一次
+        assert panel["text"] == "空闲 · 今天玩了 0 次"
+        assert panel_actions(panel) == ["start", "takeover", "refresh"]
+        # 假手机的截图整张放进 480×640 的透明画布
+        raw = base64.b64decode(panel["image"], validate=True)
+        assert raw.startswith(b"\x89PNG\r\n\x1a\n") and Image.open(BytesIO(raw)).size == (480, 640)
+
+        panel = await plugin.on_desktop_pet_panel_action("phone", "start")
+        assert panel["text"].startswith("她拿起了手机，正在想玩什么")
+        await asyncio.wait_for(looking.wait(), 5)
+        # 插件用真实时钟，第一步前按步间隔等了几秒，已玩的分钟数不固定
+        assert re.fullmatch(
+            r"正在玩：哔哩哔哩 [\d.]+/8 分钟", (await plugin.get_desktop_pet_button_states())["phone"].text
+        )
+        panel = await plugin.get_desktop_pet_panel("phone")
+        playing, goal = panel["text"].split("\n")
+        assert re.fullmatch(r"正在玩：哔哩哔哩 [\d.]+/8 分钟", playing) and goal == "想做：刷若叶睦的视频"
+        assert panel_actions(panel) == ["pause", "stop", "takeover", "refresh"]
+
+        panel = await plugin.on_desktop_pet_panel_action("phone", "pause")
+        assert panel["text"].startswith("暂停了") and panel_actions(panel)[0] == "resume"
+        panel = await plugin.on_desktop_pet_panel_action("phone", "takeover")
+        assert panel_actions(panel) == ["release", "refresh"]
+        assert (await plugin.get_desktop_pet_button_states())["phone"].text == "你在操作手机"
+        await plugin.on_desktop_pet_panel_action("phone", "release")
+        await plugin.on_desktop_pet_panel_action("phone", "resume")
+        panel = await plugin.on_desktop_pet_panel_action("phone", "stop")
+        assert panel["text"].startswith("她正在放下手机")
+        # 停止在后台进行；会话任务是被取消的，用 wait 等它结束
+        await asyncio.wait({plugin.agent._task}, timeout=5)
+        record = plugin.agent._store.history[-1]
+        assert (record.trigger, record.end_reason) == ("桌宠", "在桌宠上停止")
+        # 放下之后：空闲一行，上一次玩了什么一行，她的感想一行
+        idle, last, *thought = (await plugin.get_desktop_pet_panel("phone"))["text"].split("\n")
+        assert idle == "空闲 · 今天玩了 1 次"
+        assert re.fullmatch(r"上次 \d\d:\d\d · 哔哩哔哩 · 1 分钟", last) and len(thought) <= 1
+        with pytest.raises(ValueError, match="没有这个操作"):
+            await plugin.on_desktop_pet_panel_action("phone", "explode")
+        with pytest.raises(ValueError, match="没有这个桌宠按钮"):
+            await plugin.get_desktop_pet_panel("weather")
+    finally:
+        await plugin.on_unload()
+
+
+def pet_status(**changes: Any) -> dict:
+    status = {
+        "state": "idle",
+        "state_label": "空闲",
+        "controller": "bot",
+        "devices": [{"name": "iPhone"}, {"name": "OPPO"}],
+        "device_name": "iPhone",
+        "app": "",
+        "goal": "",
+        "thought": "",
+        "elapsed_minutes": 0,
+        "max_minutes": 15,
+        "today": {"sessions": 2},
+        "history": [
+            {
+                "started_at": "2026-11-09T19:05:00",
+                "ended_at": "2026-11-09T19:17:10",
+                "app": "哔哩哔哩",
+                # 实际记录里的感想：几句用「；」连着，每句还带句号
+                "summary": "木吉他的声音好舒服，再慢慢听一会儿。；已经接着播到《音一会》了，再安静听一会儿。",
+            }
+        ],
+    }
+    status.update(changes)
+    return status
+
+
+def test_desktop_pet_panel_text_stays_short():
+    assert plugin_module._pet_panel_lines(pet_status()) == [
+        "空闲 · iPhone · 今天玩了 2 次",
+        "上次 11-09 19:05 · 哔哩哔哩 · 12 分钟",
+        "💭 木吉他的声音好舒服，再慢慢听一会儿",
+    ]
+    playing = pet_status(
+        state="playing",
+        state_label="正在玩",
+        app="哔哩哔哩",
+        goal="搜 BanG Dream! MyGO!!!!! 安静的吉他弹唱或乐队现场，避开最近看过的《春日影》，挑一段慢慢看",
+        thought="这首前奏好温柔。",
+        elapsed_minutes=3.2,
+        devices=[{"name": "iPhone"}],
+    )
+    assert plugin_module._pet_panel_lines(playing) == [
+        "正在玩：哔哩哔哩 3.2/15 分钟",
+        "想做：搜 BanG Dream! MyGO!!!!! 安…",
+        "💭 这首前奏好温柔",
+    ]
+    assert plugin_module._pet_panel_lines(pet_status(controller="user", devices=[{"name": "iPhone"}])) == [
+        "你在操作手机，用完点「交还控制」"
+    ]
+
+
+async def test_desktop_pet_button_can_be_hidden(tmp_path):
+    plugin = make_plugin(tmp_path, desktop_pet={"button": False})
+    await plugin.on_load()
+    try:
+        assert await plugin.get_desktop_pet_button_states() == {"phone": DesktopPetButtonState(visible=False, text="")}
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.parametrize(
+    "bubbles,pet_status,expected",
+    [
+        (
+            True,
+            {"ready": True, "visible": True},
+            ["拿起手机：打开哔哩哔哩，刷若叶睦的视频", "放下手机：看了两只小猫，软乎乎的"],
+        ),
+        # 桌宠没开、还没就绪：跳过，不报错
+        (True, {"ready": False, "visible": False}, []),
+        (False, {"ready": True, "visible": True}, []),
+    ],
+)
+async def test_desktop_pet_bubbles(tmp_path, monkeypatch, bubbles, pet_status, expected):
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    plugin = make_plugin(tmp_path, play={"finish_notice": "off"}, desktop_pet={"bubbles": bubbles})
+    wire_llm(plugin, [json.dumps({"action": "finish", "summary": "看了两只小猫，软乎乎的"}, ensure_ascii=False)])
+    plugin.ctx.desktop_pet.status = AsyncMock(return_value=pet_status)
+    plugin.ctx.desktop_pet.say = AsyncMock(return_value={"success": True})
+    await plugin.on_load()
+    plugin.agent._sleep = fast_sleep
+    try:
+        await command(plugin, "/手机 开始")
+        await asyncio.wait_for(plugin.agent._task, 5)
+        while plugin.agent._pet_tasks:
+            await asyncio.wait(set(plugin.agent._pet_tasks))
+        assert [call.args[0] for call in plugin.ctx.desktop_pet.say.await_args_list] == expected
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.parametrize("button,refreshes", [(True, 3), (False, 0)])
+async def test_desktop_pet_button_refreshes_as_she_plays(tmp_path, monkeypatch, button, refreshes):
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    plugin = make_plugin(tmp_path, play={"finish_notice": "off"}, desktop_pet={"button": button})
+    wire_llm(plugin, [json.dumps({"action": "finish", "summary": "看了两只小猫"}, ensure_ascii=False)])
+    await plugin.on_load()
+    plugin.agent._sleep = fast_sleep
+    try:
+        await command(plugin, "/手机 开始")
+        await asyncio.wait_for(plugin.agent._task, 5)
+        while plugin.agent._pet_tasks:
+            await asyncio.wait(set(plugin.agent._pet_tasks))
+        # 拿起手机、打开应用、放下手机各刷新一次；按钮关掉了就不去打扰宿主
+        assert plugin.ctx.desktop_pet.refresh_buttons.await_count == refreshes
+    finally:
+        await plugin.on_unload()

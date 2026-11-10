@@ -409,6 +409,31 @@ class MultiDeviceSettings(PluginConfigBase):
         return value
 
 
+class DesktopPetSettings(PluginConfigBase):
+    """MaiBot 内置桌宠上的按钮和气泡。"""
+
+    __ui_label__ = "桌宠"
+    __ui_icon__ = "cat"
+    __ui_order__ = 10
+
+    button: bool = Field(
+        default=True,
+        description="在桌宠的「插件扩展」菜单里放一个「手机」按钮：上面写着她在不在玩，"
+        "点开能看手机截图和她此刻的想法，还能开始、暂停、停止、接管",
+    )
+    bubbles: bool = Field(
+        default=True,
+        description="她拿起、放下手机时在桌宠上冒一句气泡；只在桌面上显示，不进聊天记录、不调用模型，桌宠没开时跳过",
+    )
+    thought_bubbles: bool = Field(
+        default=True,
+        description="玩的时候把她此刻的想法也冒成气泡（「💭 这只小猫好软」），不打开面板也知道她在看什么；同一句不重复",
+    )
+    thought_bubble_seconds: int = Field(
+        default=20, ge=5, le=600, description="两个气泡之间至少隔多少秒，免得太吵；拿起、放下手机的那句不受限制"
+    )
+
+
 class PhonePlayConfig(PluginConfigBase):
     """刷会儿手机插件配置。"""
 
@@ -422,6 +447,7 @@ class PhonePlayConfig(PluginConfigBase):
     webui: WebUISettings = Field(default_factory=WebUISettings)
     multi_device: MultiDeviceSettings = Field(default_factory=MultiDeviceSettings)
     life_link: LifeLinkSettings = Field(default_factory=LifeLinkSettings)
+    desktop_pet: DesktopPetSettings = Field(default_factory=DesktopPetSettings)
 
     @model_validator(mode="after")
     def validate_device_names(self) -> "PhonePlayConfig":

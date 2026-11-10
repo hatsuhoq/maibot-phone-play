@@ -95,6 +95,31 @@ def draw_element_marks(image: Image.Image, elements: Sequence[UIElement]) -> Ima
     return marked
 
 
+def panel_png_base64(data: bytes, box: tuple[int, int] = (480, 640), max_chars: int = 1_000_000) -> str:
+    """桌宠面板里的截图：整张屏幕居中放进 ``box`` 大小的透明画布，桌宠只收 base64 PNG（不超过 100 万字符）。
+
+    桌宠面板里图片按面板宽度铺满、图片框最高 300 像素，竖长的手机截图只能露出一截要滚动；
+    放进接近图片框比例的画布后一眼就能看到整个屏幕，点开放大再看细节。超限时整体缩小。
+
+    Raises:
+        ValueError: 缩到很小仍然超限时抛出。
+    """
+    image = open_image(data).convert("RGB")
+    width, height = box
+    for _ in range(10):
+        fitted = image.copy()
+        fitted.thumbnail((width, height), Image.Resampling.LANCZOS)
+        canvas = Image.new("RGBA", (width, height), (0, 0, 0, 0))
+        canvas.paste(fitted, ((width - fitted.width) // 2, (height - fitted.height) // 2))
+        buffer = BytesIO()
+        canvas.save(buffer, "PNG", optimize=True)
+        encoded = to_base64(buffer.getvalue())
+        if len(encoded) <= max_chars:
+            return encoded
+        width, height = int(width * 0.8), int(height * 0.8)
+    raise ValueError(f"截图转成 PNG 后仍超过 {max_chars} 个字符")
+
+
 def to_base64(data: bytes) -> str:
     return base64.b64encode(data).decode("ascii")
 
