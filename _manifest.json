@@ -43,11 +43,14 @@
   "capabilities": [
     "api.call",
     "config.get",
+    "desktop_pet.list_animations",
+    "desktop_pet.play_event",
     "desktop_pet.refresh_buttons",
     "desktop_pet.say",
     "desktop_pet.status",
     "llm.generate",
     "maisaka.proactive.trigger",
+    "render.html2png",
     "send.image",
     "send.text"
   ],

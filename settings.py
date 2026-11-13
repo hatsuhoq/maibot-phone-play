@@ -25,7 +25,10 @@ class PluginSettings(PluginConfigBase):
     config_version: str = Field(default="0.1.0", description="配置版本")
     admin_user_ids: List[str] = Field(
         default_factory=list,
-        description="可以使用 /手机 开始、停止 等控制命令的账号；主程序本地控制台始终允许",
+        description=(
+            "可以用 /手机截图（没开 screenshot_for_everyone 时）、在聊天里让她截图给你看、让她换手机的账号；"
+            "/手机 开始、停止这些控制命令的权限改在 MaiBot 后台「命令管理」里设（phone_control）"
+        ),
     )
     screenshot_for_everyone: bool = Field(
         default=False,
@@ -431,6 +434,10 @@ class DesktopPetSettings(PluginConfigBase):
     )
     thought_bubble_seconds: int = Field(
         default=20, ge=5, le=600, description="两个气泡之间至少隔多少秒，免得太吵；拿起、放下手机的那句不受限制"
+    )
+    animations: bool = Field(
+        default=True,
+        description="拿起手机时打个招呼，玩够了放下时高兴一下，卡住、出错结束时摇摇头；具体动作由桌宠皮肤决定，皮肤没有就不做",
     )
 
 

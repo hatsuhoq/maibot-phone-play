@@ -36,6 +36,7 @@ from .life import (
     share_text,
 )
 from .prompts import Persona
+from .report import CARD_WIDTH, report_html
 from .settings import PhonePlayConfig
 from .store import SessionRecord, UsageStore
 
@@ -47,6 +48,8 @@ _HELP_TEXT = (
     "/手机 暂停 · /手机 继续 · /手机 停止\n"
     "/手机 接管 — 你来操作手机，她马上停手、自动玩也不会抢；/手机 交还 — 交还给她，她看看现在的画面再接着玩\n"
     "/手机 设备 — 看有哪些设备、现在用哪台；/手机 切换 名字 — 换一台手机（比如 /手机 切换 OPPO），正在玩时不能换\n"
+    "/手机 周报 — 最近 7 天玩了多久、玩了什么、看了什么，发一张图\n"
+    "开始到切换这些控制命令要有权限：插件管理员能用，其他人在 MaiBot 后台「命令管理」里给 phone_control 放行\n"
     "实时观看：WebUI 侧边栏「插件扩展」里的「手机实时画面」"
 )
 # 看状态时最多这么久查一次麦生活的日程（它的接口只读、很便宜，但 WebUI 每隔几秒就要一次状态）
@@ -65,8 +68,14 @@ _PET_ACTION_LABELS: Dict[str, str] = {
     "release": "交还控制",
     "refresh": "刷新",
 }
-# /手机、/手机截图、/手机 开始 刷B站 都能匹配；/手机号码 这类普通消息不会被拦截
-_COMMAND_PATTERN = r"^/手机\s*(?P<sub>截图|状态|开始|停止|暂停|继续|接管|交还|设备|切换|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
+# 控制手机的子命令：交给宿主当受保护命令，谁能用在 MaiBot 后台「命令管理」里设（插件管理员、本地控制台默认能用）
+_CONTROL_SUBS = "开始|停止|暂停|继续|接管|交还|切换"
+# 谁都能用的 /手机、/手机截图、/手机 设备……；控制子命令归下面那个命令，这里用前瞻让开，两个命令不会同时匹配。
+# /手机号码 这类普通消息不会被拦截
+_COMMAND_PATTERN = (
+    rf"^/手机(?!\s*(?:{_CONTROL_SUBS})(?:\s|$))\s*(?P<sub>截图|状态|设备|周报|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
+)
+_CONTROL_PATTERN = rf"^/手机\s*(?P<sub>{_CONTROL_SUBS})(?:\s+(?P<arg>.+?))?\s*$"
 # 聊天中叫她去玩手机时，等她决定好玩什么再回话，这样她能说出具体打算
 _PLAN_WAIT_SECONDS = 30.0
 # Maisaka 默认把插件工具放进 tool_search 后面，实测她要先搜一轮才会去玩，对方得催一句。
@@ -329,13 +338,15 @@ class PhonePlayPlugin(MaiBotPlugin):
             raise RuntimeError(f"请她主动聊天失败：{result.get('error')}")
 
     # ===== 权限 =====
+    # 开始、停止这些控制命令由宿主的命令权限管（phone_control 是受保护命令）；
+    # admin_user_ids 只管截图和聊天里让她换手机：这两个不是控制命令，宿主管不到
 
     def _is_admin(self, user_id: str, is_local_operator: bool) -> bool:
         return is_local_operator or (bool(user_id) and user_id in self.settings.plugin.admin_user_ids)
 
     @staticmethod
     def _denied(user_id: str) -> str:
-        return f"只有管理员可以使用这个命令。请在插件配置的 admin_user_ids 里添加你的账号（{user_id or '未知'}）"
+        return f"只有管理员可以截图。请在插件配置的 admin_user_ids 里添加你的账号（{user_id or '未知'}）"
 
     # ===== Command 组件 =====
 
@@ -384,6 +395,28 @@ class PhonePlayPlugin(MaiBotPlugin):
             return f"正在{status['app']}：{status['goal']}（第 {status['step']} 步）"
         return ""
 
+    async def _send_weekly_report(self, stream_id: str) -> str:
+        """把最近 7 天的周报卡片交给宿主的浏览器渲染成图发出去，返回需要额外回复的文字（发出图时为空）。"""
+        name = await self._bot_name()
+        report = self.agent.weekly_report(name)
+        if not report.sessions:
+            return f"最近 7 天{name}没玩手机，没有周报可看"
+        try:
+            rendered = await self.ctx.render.html2png(
+                report_html(report),
+                selector=".card",
+                viewport={"width": CARD_WIDTH + 80, "height": 900},
+                device_scale_factor=2.0,
+                omit_background=True,
+            )
+        except Exception as exc:
+            # 和 _call_llm 一样：宿主 RPC 出错时抛出的异常不在 SDK 中导出；原因原样告诉对方，常见的是宿主没开浏览器渲染
+            self.ctx.logger.warning(f"周报渲染失败：{exc}")
+            return f"周报图没生成出来：{exc}（MaiBot 配置里「浏览器渲染」的「启用浏览器渲染」要开着）"
+        if not await self.ctx.send.image(rendered["image_base64"], stream_id):
+            return "周报图发送失败，请查看日志"
+        return ""
+
     def _devices_text(self) -> str:
         lines = ["📱 设备："]
         for device in self.agent.device_list():
@@ -406,6 +439,7 @@ class PhonePlayPlugin(MaiBotPlugin):
         return f"好，{name}之后用{device}玩手机" if changed else f"现在用的就是{device}"
 
     async def _run_command(self, sub: str, arg: str, stream_id: str, user_id: str, is_local_operator: bool) -> str:
+        """谁都能用的子命令：状态、帮助、设备；截图另看 screenshot_for_everyone 和 admin_user_ids。"""
         if not sub and arg:
             return f"不认识的手机命令：{arg}\n\n{_HELP_TEXT}"
         if sub == "帮助":
@@ -414,15 +448,15 @@ class PhonePlayPlugin(MaiBotPlugin):
             return await self._status_text()
         if sub == "设备":
             return self._devices_text()
-
-        is_admin = self._is_admin(user_id, is_local_operator)
-        if sub == "截图":
-            if not (is_admin or self.settings.plugin.screenshot_for_everyone):
-                return self._denied(user_id)
-            return await self._send_screenshot(stream_id)
-
-        if not is_admin:
+        if sub == "周报":
+            return await self._send_weekly_report(stream_id)
+        # 命令正则只允许上面这些子命令，剩下的就是「截图」
+        if not (self._is_admin(user_id, is_local_operator) or self.settings.plugin.screenshot_for_everyone):
             return self._denied(user_id)
+        return await self._send_screenshot(stream_id)
+
+    async def _run_control(self, sub: str, arg: str, stream_id: str) -> str:
+        """控制手机的子命令。谁能用由宿主判断：phone_control 是受保护命令，没权限的到不了这里。"""
         name = await self._bot_name()
         if sub == "开始":
             try:
@@ -454,7 +488,7 @@ class PhonePlayPlugin(MaiBotPlugin):
             return "继续玩"
         return "现在没有暂停"
 
-    @Command("phone", description="手机：截图、状态、开始、停止、暂停、继续、切换设备", pattern=_COMMAND_PATTERN)
+    @Command("phone", description="手机：状态、截图、设备列表、帮助", pattern=_COMMAND_PATTERN)
     async def handle_phone_command(
         self,
         stream_id: str = "",
@@ -463,7 +497,7 @@ class PhonePlayPlugin(MaiBotPlugin):
         matched_groups: Optional[Dict[str, Any]] = None,
         **kwargs: Any,
     ):
-        """处理 /手机 系列命令。"""
+        """处理谁都能用的 /手机 命令。"""
         del kwargs
         groups = matched_groups or {}
         sub = str(groups.get("sub") or "")
@@ -471,7 +505,23 @@ class PhonePlayPlugin(MaiBotPlugin):
         reply = await self._run_command(sub, arg, stream_id, user_id, is_local_operator)
         if reply:
             await self.ctx.send.text(reply, stream_id)
-        return True, reply or "已发送手机截图", True
+        return True, reply or "已发送图片", True
+
+    @Command(
+        "phone_control",
+        description="手机控制：开始、停止、暂停、继续、接管、交还、切换设备",
+        pattern=_CONTROL_PATTERN,
+        permission="operator",
+    )
+    async def handle_phone_control(
+        self, stream_id: str = "", matched_groups: Optional[Dict[str, Any]] = None, **kwargs: Any
+    ):
+        """处理 /手机 开始、停止这些控制命令；受保护命令，宿主先查过权限。"""
+        del kwargs
+        groups = matched_groups or {}
+        reply = await self._run_control(str(groups.get("sub") or ""), str(groups.get("arg") or "").strip(), stream_id)
+        await self.ctx.send.text(reply, stream_id)
+        return True, reply, True
 
     # ===== Tool 组件 =====
     # 宿主只把 description 发给模型，detailed_description 已经不用了：用法都要写进 description。
@@ -730,12 +780,29 @@ class PhonePlayPlugin(MaiBotPlugin):
     # ===== 桌宠 =====
     # 宿主内置桌宠（MaiBot 1.4）：「插件扩展」菜单里的「手机」按钮、点开后的面板，以及玩手机时冒的气泡
 
-    async def _pet_bubble(self, text: str) -> None:
-        """在桌宠上冒一句气泡；桌宠没就绪时跳过。开关和间隔由 agent 判断，出错由 agent 记进日志。"""
+    async def _pet_bubble(self, text: str, event: str = "") -> None:
+        """让桌宠做个动作、冒一句气泡（两者都可以为空）；桌宠没就绪时跳过。
+
+        开关和间隔由 agent 判断，出错由 agent 记日志。先等动作播完再冒气泡：气泡一出来，宿主就把正在播的动作打断了。
+        """
         state = await self.ctx.desktop_pet.status()
         if not state.get("ready"):
             return
-        await self.ctx.desktop_pet.say(text)
+        if event and state.get("visible"):
+            await self._pet_play(event)
+        if text:
+            await self.ctx.desktop_pet.say(text)
+
+    async def _pet_play(self, event: str) -> None:
+        """播一个标准动作并等它播完。
+
+        先查当前皮肤有没有这个动作，没有就不播：宿主会把「皮肤没有这个动作」当成能力异常，记一条带堆栈的错误。
+        """
+        animations = await self.ctx.desktop_pet.list_animations()
+        if not animations.get("events", {}).get(event):
+            return
+        playback = await self.ctx.desktop_pet.play_event(event)
+        await asyncio.sleep(playback["duration_ms"] / 1000)
 
     async def _pet_refresh_buttons(self) -> None:
         """她的状态变了，让宿主重新读一次按钮上的字；按钮关掉了就不打扰宿主。

@@ -1,5 +1,5 @@
 from dataclasses import replace
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import BytesIO
 from typing import Any, List
 from unittest.mock import AsyncMock
@@ -19,7 +19,7 @@ from phone_play import plugin as plugin_module
 from phone_play.actions import Seen
 from phone_play.agent import PlayRefused
 from phone_play.life import LifeLinkError
-from phone_play.plugin import _COMMAND_PATTERN, create_plugin
+from phone_play.plugin import _COMMAND_PATTERN, _CONTROL_PATTERN, create_plugin
 from phone_play.settings import AllowedApp, DeviceSettings, PhonePlayConfig
 from phone_play.store import SessionRecord
 
@@ -60,35 +60,43 @@ def make_plugin(tmp_path, **overrides: Any):
     # 测试里没有桌宠：气泡跳过，按钮刷新只记下调用
     plugin.ctx.desktop_pet.status = AsyncMock(return_value={"ready": False, "visible": False})
     plugin.ctx.desktop_pet.refresh_buttons = AsyncMock(return_value={"success": True})
+    plugin.ctx.desktop_pet.list_animations = AsyncMock(return_value={"events": {}})
     plugin.ctx.config.get = AsyncMock(side_effect=lambda key, default=None: {"bot.nickname": "小睦"}.get(key, ""))
     return plugin
 
 
 @pytest.mark.parametrize(
-    "text,sub,arg",
+    "text,pattern,sub,arg",
     [
-        ("/手机", None, None),
-        ("/手机截图", "截图", None),
-        ("/手机 截图", "截图", None),
-        ("/手机 开始 刷B站看猫猫", "开始", "刷B站看猫猫"),
-        ("/手机开始", "开始", None),
-        ("/手机 停止 ", "停止", None),
-        ("/手机 接管", "接管", None),
-        ("/手机 交还", "交还", None),
-        ("/手机 设备", "设备", None),
-        ("/手机 切换 OPPO", "切换", "OPPO"),
-        ("/手机 乱说", None, "乱说"),
+        ("/手机", _COMMAND_PATTERN, None, None),
+        ("/手机截图", _COMMAND_PATTERN, "截图", None),
+        ("/手机 截图", _COMMAND_PATTERN, "截图", None),
+        ("/手机 设备", _COMMAND_PATTERN, "设备", None),
+        ("/手机 周报", _COMMAND_PATTERN, "周报", None),
+        ("/手机 乱说", _COMMAND_PATTERN, None, "乱说"),
+        # 「开始玩」不是子命令，和以前一样当成不认识的命令
+        ("/手机 开始玩", _COMMAND_PATTERN, None, "开始玩"),
+        ("/手机 开始 刷B站看猫猫", _CONTROL_PATTERN, "开始", "刷B站看猫猫"),
+        ("/手机开始", _CONTROL_PATTERN, "开始", None),
+        ("/手机 停止 ", _CONTROL_PATTERN, "停止", None),
+        ("/手机 接管", _CONTROL_PATTERN, "接管", None),
+        ("/手机 交还", _CONTROL_PATTERN, "交还", None),
+        ("/手机 切换 OPPO", _CONTROL_PATTERN, "切换", "OPPO"),
     ],
 )
-def test_command_pattern(text, sub, arg):
-    match = re.match(_COMMAND_PATTERN, text)
+def test_command_pattern(text, pattern, sub, arg):
+    match = re.match(pattern, text)
     assert match is not None
     assert (match.group("sub"), match.group("arg")) == (sub, arg)
+    # 一条消息只归一个命令：控制命令交给宿主查权限，不能被谁都能用的那个先接走
+    other = _CONTROL_PATTERN if pattern == _COMMAND_PATTERN else _COMMAND_PATTERN
+    assert re.match(other, text) is None
 
 
-@pytest.mark.parametrize("text", ["/手机号码是多少", "手机截图", "/手机截图吧"])
+@pytest.mark.parametrize("text", ["/手机号码是多少", "手机截图", "/手机截图吧", "/手机开始吧"])
 def test_command_pattern_ignores_normal_messages(text):
     assert re.match(_COMMAND_PATTERN, text) is None
+    assert re.match(_CONTROL_PATTERN, text) is None
 
 
 async def test_components_and_lifecycle(tmp_path):
@@ -97,6 +105,7 @@ async def test_components_and_lifecycle(tmp_path):
     assert names == sorted(
         [
             "phone",
+            "phone_control",
             "play_phone",
             "show_phone_screen",
             "remember_for_phone",
@@ -121,6 +130,13 @@ async def test_components_and_lifecycle(tmp_path):
             "webui_switch_device",
         ]
     )
+    # 开始、停止这些控制命令是宿主的受保护命令，谁能用在 MaiBot 后台「命令管理」里设；看状态谁都能用
+    permissions = {
+        component["name"]: component["metadata"].get("permission")
+        for component in plugin.get_components()
+        if component["type"] == "COMMAND"
+    }
+    assert permissions == {"phone": None, "phone_control": "operator"}
     # 去玩、问近况、叫停一直在她的工具列表里，不用先 tool_search；看屏幕按需搜索
     visibility = {
         component["name"]: component["metadata"].get("visibility")
@@ -156,15 +172,18 @@ async def test_components_and_lifecycle(tmp_path):
 
 
 async def command(plugin, text: str, user_id: str = "10001", is_local_operator: bool = False) -> str:
-    match = re.match(_COMMAND_PATTERN, text)
-    assert match is not None
+    """像宿主那样按正则把消息交给对应的命令。控制命令的权限宿主先查过，这里当作已经放行。"""
     plugin.ctx.send.text.reset_mock()
-    await plugin.handle_phone_command(
-        stream_id="stream-1",
-        user_id=user_id,
-        is_local_operator=is_local_operator,
-        matched_groups={key: value for key, value in match.groupdict().items() if value is not None},
-    )
+    control = re.match(_CONTROL_PATTERN, text)
+    match = control or re.match(_COMMAND_PATTERN, text)
+    assert match is not None
+    groups = {key: value for key, value in match.groupdict().items() if value is not None}
+    if control:
+        await plugin.handle_phone_control(stream_id="stream-1", matched_groups=groups)
+    else:
+        await plugin.handle_phone_command(
+            stream_id="stream-1", user_id=user_id, is_local_operator=is_local_operator, matched_groups=groups
+        )
     calls = plugin.ctx.send.text.await_args_list
     return calls[-1].args[0] if calls else ""
 
@@ -176,10 +195,11 @@ async def test_help_status_and_permissions(tmp_path):
         assert "/手机截图" in await command(plugin, "/手机 帮助")
         assert "小睦的手机：空闲" in await command(plugin, "/手机", user_id="anyone")
         assert "不认识的手机命令" in await command(plugin, "/手机 乱说")
-        denied = await command(plugin, "/手机 开始", user_id="20002")
+        assert "命令管理" in await command(plugin, "/手机 帮助")
+        denied = await command(plugin, "/手机截图", user_id="20002")
         assert "admin_user_ids" in denied and "20002" in denied
-        assert "admin_user_ids" in await command(plugin, "/手机截图", user_id="20002")
-        assert "现在没有暂停" in await command(plugin, "/手机 继续", user_id="", is_local_operator=True)
+        assert "已发送" not in denied
+        assert "现在没有暂停" in await command(plugin, "/手机 继续")
     finally:
         await plugin.on_unload()
 
@@ -498,9 +518,9 @@ async def test_takeover_and_release_from_commands_and_webui(tmp_path):
     plugin = make_plugin(tmp_path)
     await plugin.on_load()
     try:
-        reply = await plugin._run_command("接管", "", "stream-1", "10001", False)
+        reply = await command(plugin, "/手机 接管")
         assert reply.startswith("好，手机交给你") and plugin.agent.controller == "user"
-        assert await plugin._run_command("接管", "", "stream-1", "10001", False) == "你已经在操作手机了"
+        assert await command(plugin, "/手机 接管") == "你已经在操作手机了"
         status = await plugin.webui_status()
         assert status["controller"] == "user" and status["controller_label"] == "你在操作"
         with pytest.raises(ValueError, match="已经在操作"):
@@ -509,9 +529,7 @@ async def test_takeover_and_release_from_commands_and_webui(tmp_path):
         with pytest.raises(ValueError, match="本来就在她手里"):
             await plugin.webui_release()
         assert await plugin.webui_takeover() == {"controller": "user"}
-        assert (await plugin._run_command("交还", "", "stream-1", "10001", False)).startswith("已交还给")
-        # 不是管理员不能接管
-        assert "只有管理员" in await plugin._run_command("接管", "", "stream-1", "20002", False)
+        assert (await command(plugin, "/手机 交还")).startswith("已交还给")
     finally:
         await plugin.on_unload()
 
@@ -655,7 +673,6 @@ async def test_devices_can_be_listed_and_switched_by_admins(tmp_path):
         listed = await command(plugin, "/手机 设备", user_id="anyone")
         assert "· iPhone（现在用的）：iPhone · http://127.0.0.1:8100" in listed
         assert "· OPPO：安卓 · 192.168.1.23" in listed
-        assert "admin_user_ids" in await command(plugin, "/手机 切换 OPPO", user_id="20002")
         assert await command(plugin, "/手机 切换 华为") == "没换：没有叫「华为」的设备，能用的有：iPhone、OPPO"
         assert "要换哪台" in await command(plugin, "/手机 切换")
         # 聊天里常说「安卓」：只有一台安卓设备时就是它
@@ -993,5 +1010,101 @@ async def test_desktop_pet_button_refreshes_as_she_plays(tmp_path, monkeypatch, 
             await asyncio.wait(set(plugin.agent._pet_tasks))
         # 拿起手机、打开应用、放下手机各刷新一次；按钮关掉了就不去打扰宿主
         assert plugin.ctx.desktop_pet.refresh_buttons.await_count == refreshes
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.parametrize(
+    "pet_status,events,text,event,expected",
+    [
+        # 先播完动作再冒气泡：气泡一出来宿主就会打断动作
+        (
+            {"ready": True, "visible": True},
+            {"greeting": "happy"},
+            "拿起手机：打开哔哩哔哩",
+            "greeting",
+            [("play", "greeting"), ("say", "拿起手机：打开哔哩哔哩")],
+        ),
+        # 皮肤没有这个动作：不播，免得宿主记一条带堆栈的错误
+        (
+            {"ready": True, "visible": True},
+            {"click": "squish"},
+            "放下手机：看完了",
+            "happy",
+            [("say", "放下手机：看完了")],
+        ),
+        # 桌宠藏起来了：动作播不了，气泡照说
+        (
+            {"ready": True, "visible": False},
+            {"error": "shake"},
+            "放下手机：卡住了",
+            "error",
+            [("say", "放下手机：卡住了")],
+        ),
+        # 关掉了气泡、只做动作
+        ({"ready": True, "visible": True}, {"happy": "happy"}, "", "happy", [("play", "happy")]),
+        ({"ready": False, "visible": False}, {"happy": "happy"}, "放下手机：看完了", "happy", []),
+    ],
+)
+async def test_desktop_pet_plays_the_move_before_the_bubble(tmp_path, pet_status, events, text, event, expected):
+    plugin = make_plugin(tmp_path)
+    pet = plugin.ctx.desktop_pet
+    calls: List[tuple] = []
+
+    async def play_event(name: str) -> dict:
+        calls.append(("play", name))
+        return {"playback_id": "p1", "animation": events[name], "duration_ms": 10}
+
+    async def say(content: str) -> dict:
+        calls.append(("say", content))
+        return {"ready": True}
+
+    pet.status = AsyncMock(return_value=pet_status)
+    pet.list_animations = AsyncMock(return_value={"skin": {"id": "orange-sprout"}, "events": events})
+    pet.play_event = play_event
+    pet.say = say
+    await plugin._pet_bubble(text, event)
+    assert calls == expected
+
+
+async def test_weekly_report_command_renders_a_card_and_sends_it(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        assert await command(plugin, "/手机 周报", user_id="anyone") == "最近 7 天小睦没玩手机，没有周报可看"
+        now = datetime.now()
+        plugin.agent._store.add_record(
+            SessionRecord(
+                started_at=(now - timedelta(minutes=12)).isoformat(timespec="seconds"),
+                ended_at=now.isoformat(timespec="seconds"),
+                trigger="桌宠",
+                app="哔哩哔哩",
+                goal="看猫猫视频",
+                summary="橘猫好圆",
+                steps=8,
+                end_reason="自己不想玩了",
+            )
+        )
+        renders: List[tuple] = []
+
+        async def html2png(html: str, **options: Any) -> dict:
+            renders.append((html, options))
+            return {"image_base64": "aW1n", "mime_type": "image/png", "width": 1440, "height": 1500}
+
+        plugin.ctx.render.html2png = html2png
+        # 谁都能看，和 /手机 状态一样
+        assert await command(plugin, "/手机 周报", user_id="anyone") == ""
+        plugin.ctx.send.image.assert_awaited_with("aW1n", "stream-1")
+        html, options = renders[0]
+        assert "小睦的手机周报" in html and "橘猫好圆" in html
+        assert options["selector"] == ".card" and options["device_scale_factor"] == 2.0
+
+        async def disabled(html: str, **options: Any) -> dict:
+            raise RuntimeError("[E_CAPABILITY_FAILED] 浏览器渲染未启用")
+
+        plugin.ctx.render.html2png = disabled
+        reply = await command(plugin, "/手机 周报")
+        assert reply.startswith("周报图没生成出来：[E_CAPABILITY_FAILED] 浏览器渲染未启用")
     finally:
         await plugin.on_unload()

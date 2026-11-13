@@ -61,6 +61,7 @@ class Harness:
         self.notified: List[tuple] = []
         # announce=True 时接上假的桌宠气泡：记下说了什么，announce_error 不为空时抛出
         self.announced: List[str] = []
+        self.events: List[str] = []
         self.announce_error: Optional[Exception] = None
         # refresh=True 时接上假的「刷新桌宠按钮」：记下刷新了几次
         self.refreshes = 0
@@ -89,10 +90,13 @@ class Harness:
             refresher=self.refresh if refresh else None,
         )
 
-    async def announce(self, text: str) -> None:
+    async def announce(self, text: str, event: str = "") -> None:
         if self.announce_error is not None:
             raise self.announce_error
-        self.announced.append(text)
+        if text:
+            self.announced.append(text)
+        if event:
+            self.events.append(event)
 
     async def refresh(self) -> None:
         self.refreshes += 1
@@ -872,6 +876,8 @@ async def test_she_says_when_she_picks_up_and_puts_down_the_phone(tmp_path):
     record = await harness.run(trigger="pet")
     await harness.settle()
     assert harness.announced == ["拿起手机：打开哔哩哔哩，看猫猫视频", f"放下手机：{record.summary}"]
+    # 拿起手机打个招呼，玩够了放下时高兴一下
+    assert harness.events == ["greeting", "happy"]
     assert record.trigger == "桌宠"
 
 
@@ -902,7 +908,7 @@ async def test_a_failing_bubble_does_not_get_in_her_way(tmp_path, caplog):
         record = await harness.run()
         await harness.settle()
     assert record.end_reason == "自己不想玩了"
-    assert caplog.text.count("桌宠气泡没显示：桌宠窗口还没就绪") == 2
+    assert caplog.text.count("桌宠气泡或动作没显示：桌宠窗口还没就绪") == 2
 
 
 async def test_nothing_is_announced_when_the_plugin_unloads_or_nothing_was_opened(tmp_path):
@@ -990,9 +996,39 @@ async def test_thought_bubbles_are_spaced_out_and_can_be_turned_off(tmp_path):
     agent._announce("💭 又一只猫", thought=True)
     agent._announce("拿起手机：打开抖音，随便看看")
     pet.bubbles = False
-    agent._announce("放下手机：看完了")
+    # 气泡关了，动作照做
+    agent._announce("放下手机：看完了", event="happy")
+    pet.animations = False
+    # 气泡和动作都关了，不打扰桌宠
+    agent._announce("拿起手机：打开抖音，随便看看", event="greeting")
     await harness.settle()
     assert harness.announced[4:] == ["拿起手机：打开抖音，随便看看"]
+    assert harness.events == ["happy"]
+
+
+async def test_the_pet_shakes_its_head_when_she_gets_stuck_but_not_when_you_stop_her(tmp_path):
+    harness = Harness(tmp_path, FakeDevice(), ["我也不知道", "嗯……", '{"action":"jump"}'], announce=True)
+    record = await harness.run()
+    await harness.settle()
+    assert record.end_reason.startswith("连续 3 步操作失败")
+    assert harness.events == ["greeting", "error"]
+
+    harness = Harness(tmp_path, FakeDevice(), [], announce=True)
+    looking = asyncio.Event()
+
+    async def slow_vision(messages: List[Dict[str, Any]]) -> str:
+        looking.set()
+        await asyncio.sleep(3600)
+        return ""
+
+    harness.agent._vision = slow_vision
+    await harness.agent.start(trigger="command")
+    await asyncio.wait_for(looking.wait(), 5)
+    await harness.agent.stop("在 WebUI 中停止")
+    await harness.settle()
+    # 被叫停：照样说一句放下手机，但不做动作
+    assert harness.announced[-1].startswith("放下手机：")
+    assert harness.events == ["greeting"]
 
 
 async def test_the_pet_button_refreshes_when_you_pause_or_take_over(tmp_path):

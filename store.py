@@ -10,6 +10,8 @@ import json
 import threading
 
 _HISTORY_LIMIT = 30
+# 每天的汇总留这么多天：周报看最近 7 天，游玩记录只留最近 30 次、一周都不够
+_DAILY_DAYS = 35
 
 
 @dataclass(frozen=True)
@@ -46,6 +48,16 @@ class SessionRecord:
         names = {item.name for item in fields(cls)}
         return cls(**{key: value for key, value in data.items() if key in names})
 
+    def app_seconds(self) -> Dict[str, float]:
+        """这次在各个应用里待了多少秒；旧记录没有 apps，整次都算在起始应用上。"""
+        if not self.apps:
+            seconds = (datetime.fromisoformat(self.ended_at) - datetime.fromisoformat(self.started_at)).total_seconds()
+            return {self.app: max(0.0, seconds)}
+        spent: Dict[str, float] = {}
+        for item in self.apps:
+            spent[item["name"]] = spent.get(item["name"], 0.0) + float(item["seconds"])
+        return spent
+
     def places_text(self) -> str:
         """这次在哪些应用里玩的，例如「欢乐斗地主（约 3 分钟）、哔哩哔哩（约 1 分钟）」；只去了一个就只写名字。"""
         if len(self.apps) <= 1:
@@ -66,6 +78,8 @@ class UsageStore:
         # 当天调用模型的次数（失败的也算）
         self._model_calls = 0
         self._history: List[SessionRecord] = []
+        # 每天的汇总（周报用）：日期 → {sessions 次数, seconds 秒数, apps 各应用秒数, triggers 各来源次数}
+        self._daily: Dict[str, Dict[str, Any]] = {}
         # 现在用哪台设备（多设备时的名字，空字符串是「设备」那一台），重启后还记得
         self.current_device = ""
         # 加载时发现记录文件损坏、已备份重来的说明，没出问题是空字符串
@@ -80,6 +94,11 @@ class UsageStore:
     def history(self) -> List[SessionRecord]:
         return list(self._history)
 
+    @property
+    def daily(self) -> Dict[str, Dict[str, Any]]:
+        """每天的汇总，见 _add_daily；返回副本。"""
+        return json.loads(json.dumps(self._daily))
+
     def _read(self) -> None:
         if not self._path.exists():
             return
@@ -90,6 +109,15 @@ class UsageStore:
             model_calls = int(data.get("model_calls", 0))
             history = [SessionRecord.from_dict(item) for item in data["history"]]
             current_device = str(data.get("current_device", ""))
+            daily = {
+                str(day): {
+                    "sessions": int(entry["sessions"]),
+                    "seconds": float(entry["seconds"]),
+                    "apps": {str(name): float(seconds) for name, seconds in entry["apps"].items()},
+                    "triggers": {str(label): int(count) for label, count in entry["triggers"].items()},
+                }
+                for day, entry in data.get("daily", {}).items()
+            }
         except (ValueError, KeyError, TypeError, AttributeError) as exc:
             # 一个记录文件坏了不该让整个插件加载失败：留个备份，从空记录重新开始
             backup = self._path.with_name(f"{self._path.name}.broken-{datetime.now():%Y%m%d%H%M%S}")
@@ -100,6 +128,11 @@ class UsageStore:
         self._interactions, self._history = interactions, history
         self._model_calls = model_calls
         self.current_device = current_device
+        self._daily = daily
+        if "daily" not in data:
+            # 0.3.0 及以前没有每天的汇总：用还留着的游玩记录补上，第一次看周报不至于是空的
+            for record in history:
+                self._add_daily(record)
 
     def _snapshot(self) -> Dict[str, Any]:
         return {
@@ -110,6 +143,7 @@ class UsageStore:
             "model_calls": self._model_calls,
             "history": [record.to_dict() for record in self._history],
             "current_device": self.current_device,
+            "daily": self.daily,
         }
 
     def _write(self, version: int, payload: Dict[str, Any]) -> None:
@@ -170,3 +204,17 @@ class UsageStore:
 
     def add_record(self, record: SessionRecord) -> None:
         self._history = [*self._history, record][-_HISTORY_LIMIT:]
+        self._add_daily(record)
+
+    def _add_daily(self, record: SessionRecord) -> None:
+        """把一次记录算进它开始那天的汇总，只留最近 _DAILY_DAYS 天。"""
+        entry = self._daily.setdefault(
+            record.started_at[:10], {"sessions": 0, "seconds": 0.0, "apps": {}, "triggers": {}}
+        )
+        entry["sessions"] += 1
+        for name, seconds in record.app_seconds().items():
+            entry["seconds"] += seconds
+            entry["apps"][name] = entry["apps"].get(name, 0.0) + seconds
+        entry["triggers"][record.trigger] = entry["triggers"].get(record.trigger, 0) + 1
+        for day in sorted(self._daily)[:-_DAILY_DAYS]:
+            del self._daily[day]

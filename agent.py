@@ -50,6 +50,7 @@ from .prompts import (
     build_plan_prompt,
     parse_plan,
 )
+from .report import WeeklyReport, build_report
 from .settings import AllowedApp, DeviceSettings, PhonePlayConfig
 from .store import SessionRecord, UsageStore
 from .ui_tree import UIElement, element_at, find_same
@@ -171,8 +172,9 @@ DeviceFactory = Callable[[DeviceSettings], PhoneDevice]
 LifeSource = Callable[[], Awaitable[Optional[LifeActivity]]]
 # 玩完把这次看到的交给麦生活分享，返回契机编号；没收下抛 LifeLinkError
 LifeShare = Callable[[SessionRecord], Awaitable[str]]
-# 她拿起、放下手机和玩的时候冒一句（桌宠气泡）；在后台跑，出错只记日志，不影响这次玩手机
-Announcer = Callable[[str], Awaitable[None]]
+# 她拿起、放下手机和玩的时候冒一句（桌宠气泡，可以为空），同时让桌宠做个动作（click/happy/error/greeting，
+# 可以为空）；在后台跑，出错只记日志，不影响这次玩手机
+Announcer = Callable[[str, str], Awaitable[None]]
 # 状态变了（开始、每一步、暂停、接管、结束）时让桌宠刷新按钮上的字；同样在后台跑
 Refresher = Callable[[], Awaitable[None]]
 # 自然结束（她自己玩够了、到了时长、步数或预算）的结束原因；出错、卡住、被叫停、接管太久的不算
@@ -911,6 +913,11 @@ class PhoneAgent:
             return description
         return f"{name} · {description}"
 
+    def weekly_report(self, nickname: str) -> WeeklyReport:
+        """最近 7 天的周报数据，见 report.py。"""
+        memory = self._memory.items() if self._memory is not None else []
+        return build_report(nickname, self._store.daily, self._store.history, memory, self._now().date())
+
     def activity_text(self) -> str:
         """给聊天中的 Bot 看的近况，方便她聊起手机上看到的东西。"""
         session = self._session
@@ -1227,12 +1234,12 @@ class PhoneAgent:
             await device.close()
         self._devices.clear()
 
-    def _announce(self, text: str, *, thought: bool = False) -> None:
-        """在后台说一句（桌宠气泡），不等它说完，也不让它的错误打断玩手机。
+    def _announce(self, text: str, *, thought: bool = False, event: str = "") -> None:
+        """在后台说一句（桌宠气泡）、做个动作，不等它做完，也不让它的错误打断玩手机。
 
-        拿起、放下手机的那句只看 bubbles 开关；想法气泡还要打开 thought_bubbles，离上一个气泡至少隔
-        thought_bubble_seconds 秒（桌宠一次只显示一个气泡，太密了前一句还没看完就被顶掉），和上一句想法
-        一样时不再说。
+        拿起、放下手机的那句看 bubbles 开关，动作看 animations 开关，两个都关了就不打扰桌宠；想法气泡还要
+        打开 thought_bubbles，离上一个气泡至少隔 thought_bubble_seconds 秒（桌宠一次只显示一个气泡，太密了
+        前一句还没看完就被顶掉），和上一句想法一样时不再说。
         """
         if self._announcer is None:
             return
@@ -1244,10 +1251,14 @@ class PhoneAgent:
             if self._last_bubble_clock is not None and now - self._last_bubble_clock < settings.thought_bubble_seconds:
                 return
             self._last_thought_bubble = text
-        elif not settings.bubbles:
-            return
-        self._last_bubble_clock = now
-        self._spawn_pet(self._announcer(text), "桌宠气泡没显示")
+        else:
+            text = text if settings.bubbles else ""
+            event = event if settings.animations else ""
+            if not text and not event:
+                return
+        if text:
+            self._last_bubble_clock = now
+        self._spawn_pet(self._announcer(text, event), "桌宠气泡或动作没显示")
 
     def _changed(self) -> None:
         """状态变了：在后台让桌宠刷新按钮上的字（打开着的扩展菜单也会跟着变）。"""
@@ -1444,7 +1455,15 @@ class PhoneAgent:
         if self._should_share(session, end_reason, config):
             await self._share_with_life(session, record)
         if end_reason != _UNLOAD_REASON:
-            self._announce(f"放下手机：{_clip(record.summary, _ANNOUNCE_SUMMARY_LIMIT)}")
+            self._announce(
+                f"放下手机：{_clip(record.summary, _ANNOUNCE_SUMMARY_LIMIT)}", event=self._end_event(end_reason)
+            )
+
+    def _end_event(self, end_reason: str) -> str:
+        """放下手机时桌宠做什么动作：玩够了高兴一下，卡住、出错结束（这时记了最近的错误）摇摇头，被叫停的不做。"""
+        if end_reason == "自己不想玩了" or end_reason.startswith(_NATURAL_END_PREFIXES):
+            return "happy"
+        return "error" if self._last_error else ""
 
     def _should_share(self, session: Session, end_reason: str, config: PhonePlayConfig) -> bool:
         """只交按麦生活日程自动玩、自然结束的那几局。
@@ -1604,7 +1623,9 @@ class PhoneAgent:
         self._enter_app(session, plan.app)
         session.planned.set()
         self._state = "playing"
-        self._announce(f"{'偷偷摸鱼' if session.slack else '拿起手机'}：打开{plan.app.name}，{plan.goal}")
+        self._announce(
+            f"{'偷偷摸鱼' if session.slack else '拿起手机'}：打开{plan.app.name}，{plan.goal}", event="greeting"
+        )
         self._changed()
         # 真正打开应用才算玩了一次；马上存下来，玩到一半宿主崩溃也不会丢
         self._store.add_session(self._today())

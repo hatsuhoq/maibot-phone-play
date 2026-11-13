@@ -8,7 +8,7 @@
 
 | 配置 | 默认值 | 说明 |
 |---|---|---|
-| `plugin.admin_user_ids` | 空 | 管理员账号 ID（例如 QQ 号），能用控制命令、截图、切换设备 |
+| `plugin.admin_user_ids` | 空 | 能截图（`/手机截图`、让她截屏给自己看）、在聊天里让她换手机的账号 ID（例如 QQ 号）。开始、停止这些命令的权限在 MaiBot 后台「命令管理」里设，见[聊天命令](usage.md#聊天命令) |
 | `plugin.screenshot_for_everyone` | 关 | 所有人都能用 `/手机截图`、让她截屏给自己看（截图里可能带有通知等隐私） |
 
 ## 设备
@@ -88,6 +88,7 @@
 | `desktop_pet.bubbles` | 开 | 她拿起、放下手机时在桌宠上冒一句气泡 |
 | `desktop_pet.thought_bubbles` | 开 | 玩的时候把她的新想法冒成气泡（「💭 …」），同一句不重复 |
 | `desktop_pet.thought_bubble_seconds` | 20 | 两个气泡之间至少隔几秒（5–600），免得太吵；拿起、放下手机那句不受限制 |
+| `desktop_pet.animations` | 开 | 拿起手机时打招呼、玩够了放下时高兴一下、出错结束时摇摇头；动作由桌宠皮肤决定 |
 
 ## 每个应用单独设置
 

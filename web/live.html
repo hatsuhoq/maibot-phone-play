@@ -8,9 +8,11 @@
   }
   .header { display: flex; flex-wrap: wrap; align-items: center; gap: 10px; margin-bottom: 16px; }
   .header h1 { margin: 0; font-size: 20px; }
-  .badge-playing { background: var(--maibot-primary, #2563eb); color: var(--maibot-primary-foreground, #fff); }
-  .badge-user { background: #f59e0b; color: #fff; }
-  .badge-bad { background: var(--maibot-danger, #d33); color: #fff; }
+  /* 宿主主题样式插在页面样式后面，同样一层类选择器会被它的 .maibot-badge、.maibot-button 盖掉，这几条要多一层 */
+  .maibot-badge.badge-playing { background: var(--maibot-primary, #2563eb); color: var(--maibot-primary-foreground, #fff);
+    border-color: transparent; }
+  .maibot-badge.badge-user { background: #f59e0b; color: #fff; border-color: transparent; }
+  .maibot-badge.badge-bad { background: var(--maibot-danger, #d33); color: #fff; border-color: transparent; }
   .phone { position: relative; border: 10px solid #1d1d1f; border-radius: 28px; background: #000; overflow: hidden;
     aspect-ratio: 9 / 19.5; display: flex; align-items: center; justify-content: center; }
   .phone img { width: 100%; height: 100%; object-fit: contain; display: none; }
@@ -44,7 +46,7 @@
   .logs .detail { font-size: 12px; margin-left: 4px; }
   .diagnostic { margin-top: 8px; padding: 8px; border-radius: var(--maibot-radius, 10px); background: var(--maibot-soft, #8881); font-size: 12px; }
   .diagnostic img { max-width: 220px; width: 100%; display: block; margin-bottom: 6px; border-radius: 6px; }
-  .small-button { font-size: 12px; padding: 1px 8px; }
+  .maibot-button.small-button { font-size: 12px; padding: 1px 8px; }
   .stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 12px; }
   .stats .value { font-size: 20px; }
   .meta-line { font-size: 12px; margin-top: 6px; overflow-wrap: anywhere; }
@@ -110,7 +112,7 @@
       </div>
       <div id="deviceRow" class="device-row" hidden>
         <label for="deviceSelect" class="maibot-muted">设备</label>
-        <select id="deviceSelect" class="maibot-input"></select>
+        <select id="deviceSelect" class="maibot-select"></select>
         <button id="switchDevice" class="maibot-button">切换</button>
       </div>
       <div id="connectionMeta" class="meta-line maibot-muted"></div>
@@ -175,6 +177,8 @@
 <script>
 (() => {
   const $ = id => document.getElementById(id);
+  // 宿主只给页面内容、不给 body 加类：套上它的页面样式，背景、文字颜色、字体和复古主题的底纹才跟着后台走
+  document.body.classList.add('maibot-page');
   // 宿主同一时间最多允许 2 个请求：轮询只占 1 个，按钮、看诊断、刷新记忆共用另 1 个（busy 时不发）
   const FRAME_DELAY_MS = 1000;
   const STATUS_EVERY = 2;
