@@ -81,18 +81,22 @@ class DecisionContext:
     # 连续做同一个操作的次数（够多了才提醒，否则是 0）和那个操作的说明
     repeated_steps: int = 0
     repeated_action: str = ""
-    # 对方刚在聊天里让她在手机上做的事
+    # 对方刚在聊天里让她在手机上做的事，带编号，例如「#2 放《春日影》」
     requests: Sequence[str] = ()
-    # 这次之前已经交给她的要求（最近几条），操作记录一长就会被挤掉
+    # 之前交给她、还没有结果的要求（最近几条），操作记录一长就会被挤掉；做到了、做不到、被换掉的不再列
     earlier_requests: Sequence[str] = ()
     # 这个应用里最近看过的视频标题，刷到了别再看
     watched: Sequence[str] = ()
+    # 这个应用里看了一部分、可以接着看的长视频，例如「《……》（看了一部分（约 3 分钟））」
+    resumable: Sequence[str] = ()
     # 正在看的视频和已经看了多久，例如「《春日影》（长视频），已经看了约 3 分钟」
     watching: str = ""
     # 当前应用专门的说明（比如 B 站的播放器是什么样的）
     app_tips: str = ""
     # 看过的视频不再看（play.skip_watched_videos）
     skip_watched: bool = True
+    # 这次已经标过的「这一刻」她在想什么；没标过是空的
+    moment: str = ""
 
 
 # 实测 iPhone 上的 B 站（2026 年 11 月）：首页推荐点开的进竖屏播放器，搜索结果点开的进视频详情页，两种页面操作不一样
@@ -290,7 +294,10 @@ def _rules(context: DecisionContext) -> str:
         boundary,
         text_rule,
         "不要下载或保存文件，不要安装应用。遇到登录、付款、权限申请、下载推广、求好评之类的弹窗，"
-        "点关闭、拒绝、跳过、下次再说或返回。弹窗挡在前面时（屏幕中间一个框、后面变暗），后面的东西都点不到，"
+        "点关闭、拒绝、跳过、下次再说或返回；"
+        "关不掉、返回也绕不开、必须有人处理才能接着玩时（要登录或重新登录、验证码或滑块验证、"
+        "只能点允许的系统权限、强制更新），用 ask_help 请对方帮忙，自己绝不输入账号、密码、验证码；"
+        "能关掉的弹窗、能换个内容看的照常自己处理，别动不动就求助。弹窗挡在前面时（屏幕中间一个框、后面变暗），后面的东西都点不到，"
         "要先关掉弹窗；界面元素列表里可能还列着弹窗后面的按钮，别去点它们。"
         "应用刚打开时的开屏广告（角上有「跳过」和倒计时）几秒后会自己消失，用 wait 等几秒就好，"
         "别去点，点到广告会跳到别的应用。",
@@ -310,10 +317,16 @@ def _rules(context: DecisionContext) -> str:
         "看视频的时候画面一直在变，插件不会因为画面变了叫醒你，看完你定的时间才会再问你。"
         "长视频如果是点开后上面播放器、下面简介和评论的页面，上滑只会翻简介和评论，不会换视频；"
         "不想看了就返回到视频列表（首页、搜索结果）点别的，或者点下面推荐的视频。",
-        "看视频时在 seen 里写上画面上的视频标题，插件会记下你看过哪些"
+        "看视频时在 seen 里写上画面上的视频标题，插件会记下你看过哪些、看到哪了"
         + (
-            "；看过的视频不要再点开，刷到了就直接划走，除非对方在聊天里点名要你再看。" if context.skip_watched else "。"
-        ),
+            "；看过的视频不要再点开，刷到了就直接划走，除非对方在聊天里点名要你再看；"
+            "上次只看了一部分的长视频可以点开接着看。"
+            if context.skip_watched
+            else "。"
+        )
+        + "画面上看得出视频、歌已经播完（出现重播按钮、进度条到头、已经自动从头开始下一轮）时，"
+        + 'seen 里加 "progress":"finished"；'
+        '不感兴趣、要划走或返回的视频，seen 里加 "skip":true。只看了一会儿、没看到结尾的不要写看完。',
         "留意最近的操作：同一件事已经做了两三次、画面却没有变化，就换个做法，或者去看别的内容。"
         "一直黑屏或转圈加载时不要干等：往上划到下一个、返回再进或换个入口，实在不行就结束。",
         # 实测和群友打斗地主好友房，她觉得「没等到人」就结束，群友一喊又重开，一上午十一次斗地主有八次这样
@@ -394,6 +407,10 @@ _APP_GUIDE = (
     "看的时候画面变了不会叫醒你，聊天里有新要求或跳到了别的应用才会\n"
 )
 _WAIT_TURN_GUIDE = '{"action":"wait_turn"}：等对方操作（对方操作完、画面变了才继续，等待时不用你做什么）\n'
+_HELP_GUIDE = (
+    '{"action":"ask_help","text":"小红书要重新登录才能看笔记"}：请对方帮忙，'
+    "text 用一句话写清楚卡在哪、要对方做什么；求助后你会停下来，等对方在手机上处理好再接着玩\n"
+)
 _ACTION_OUTRO = (
     '{"action":"finish"}：结束这次玩手机。这一步的 summary 不要写「结束」，改用一两句话写这次看到了什么、有什么感受，'
     "例如「看了好几只小奶猫，那只恐高的最呆」\n"
@@ -403,8 +420,20 @@ _ACTION_OUTRO = (
     '可以加 "seen"：正在看、读、听的内容在画面上清楚写着名字时（书名、视频标题、歌名）才写，下次能接着看；'
     "看视频的 wait 能看清标题就都带上，插件靠它记住看过哪些视频，"
     '例如 {"type":"novel","title":"画面上原样的书名","detail":"第12章","certain":true}；'
-    "type 是 novel、video、music 之一，detail 只写画面上明确写着的章节或集数，没有就不写；看不清、靠猜的不要写。\n"
+    "type 是 novel、video、music 之一，detail 只写画面上明确写着的章节或集数，没有就不写；看不清、靠猜的不要写；"
+    '视频还可以加 "progress":"finished"（画面上看得出播完了）或 "skip":true（不感兴趣）。\n'
+    # 实测写成「特别喜欢才写、普通的好看不用写」时，一局安静的弹琴视频看下来一次都没标
+    '可以加 "moment":true：这次玩手机里你最喜欢、最想给对方看的那一下（很可爱、很好笑、很惊艳、很戳你的画面）'
+    "标一次，真没有喜欢的就不标；之后遇到更喜欢的可以再标，插件只留最后一次的画面。\n"
     '示例：{"thought":"这只橘猫好圆，点开看看","summary":"点开猫猫视频","action":"tap","element":5}'
+)
+# 对方交给她的事：做没做成要靠这一步的截图说话，点了一下、页面还在加载都不算
+_REQUEST_GUIDE = (
+    '对方交给你的事有了结果时，在那一步的 JSON 里加 "request"，'
+    '例如 {"id":2,"result":"done","note":"画面上在播放《春日影》"}：id 是要求前面的编号；'
+    "result 写 done（这张截图上已经能看到做到了：歌在播放、已经退出房间、已经点了准备）"
+    "或 failed（确定做不到，note 写原因，比如找不到这首歌、按钮点不了）；note 用一句话写你在画面上看到的依据。"
+    "只是点了一下、页面还在加载、还没看到结果的不要写 done，接着做；还在做的不用加 request。\n"
 )
 
 
@@ -418,7 +447,8 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
         f"{_rules(context)}\n\n"
         f"{_ACTION_INTRO}{_ACTION_GUIDE}{_IOS_BACK_GUIDE if context.ios else _BACK_GUIDE}{_APP_GUIDE}"
         f"{_interaction_guide(context)}"
-        f"{_WAIT_TURN_GUIDE if context.together else ''}{_ACTION_OUTRO}"
+        f"{_WAIT_TURN_GUIDE if context.together else ''}{_HELP_GUIDE}{_ACTION_OUTRO}"
+        f"{chr(10) + _REQUEST_GUIDE if context.requests or context.earlier_requests else ''}"
     )
 
     history_text = "\n".join(context.history) if context.history else "（刚开始）"
@@ -449,14 +479,20 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
     if context.watched:
         titles = "、".join(f"《{title}》" for title in context.watched)
         video_text += f"这个应用里你最近看过这些视频，再刷到就直接划走，列表里看到也别点开：{titles}\n"
+    if context.resumable:
+        video_text += f"这个应用里上次只看了一部分的长视频，想看可以接着看：{'、'.join(context.resumable)}\n"
     request_text = ""
     if context.earlier_requests:
-        request_text = f"对方这次在聊天里提过：{'；'.join(context.earlier_requests)}。还没做完的接着做。\n"
+        request_text = (
+            f"对方交给你、还没有结果的事：{'；'.join(context.earlier_requests)}。接着做，有结果了就用 request 回报。\n"
+        )
     if context.requests:
         request_text += (
             f"对方刚在聊天里让你：{'；'.join(context.requests)}。"
-            "这比原来的打算优先，先照着做；做不到就在 thought 里说为什么。\n"
+            "这比原来的打算优先，先照着做；做到了、确定做不到时用 request 回报。\n"
         )
+    if context.moment:
+        video_text += f"这次最想给对方看的那一下你已经标过了（{context.moment}），遇到更喜欢的再标。\n"
     state_text = (
         # 目标在系统提示里离截图太远，模型容易只顾眼前画面，这里紧挨着截图再说一次
         f"这次想做的事：{context.goal}\n"

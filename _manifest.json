@@ -42,6 +42,7 @@
   ],
   "capabilities": [
     "api.call",
+    "chat.get_stream_by_user_id",
     "config.get",
     "desktop_pet.list_animations",
     "desktop_pet.play_event",

@@ -28,6 +28,7 @@ ACTION_KINDS = (
     "like",
     "comment",
     "follow",
+    "ask_help",
     "finish",
 )
 # 点在某个位置上的动作：点赞、关注也是点一下，单独列出来是为了让代码能按额度限制
@@ -55,6 +56,7 @@ _ACTION_LABELS: Dict[str, str] = {
     "like": "点赞",
     "comment": "评论",
     "follow": "关注",
+    "ask_help": "找人帮忙",
     "finish": "结束",
 }
 _DIRECTION_LABELS: Dict[str, str] = {"up": "上滑", "down": "下滑", "left": "左滑", "right": "右滑"}
@@ -72,6 +74,11 @@ SEEN_MEDIA: Dict[str, str] = {"novel": "小说", "video": "视频", "music": "�
 # B 站视频标题最长 80 个字；实测 40 字的上限把「剧场版「BanG Dream! …」」这类标题整个丢掉了
 _SEEN_TITLE_LIMIT = 80
 _SEEN_DETAIL_LIMIT = 30
+# 要求的结果：做到了（画面上能看到）、确定做不到
+REQUEST_RESULTS = ("done", "failed")
+_REQUEST_NOTE_LIMIT = 60
+# 找人帮忙时说清楚卡在哪、要对方做什么，一句话；实测 40 个字把「再交还给我」截成了「再交」
+_HELP_TEXT_LIMIT = 60
 
 
 @dataclass(frozen=True)
@@ -82,6 +89,19 @@ class Seen:
     title: str
     # 画面上明确写着的章节、集数，没有就是空
     detail: str = ""
+    # 画面上看得出已经播完（重播按钮、进度条到头、「已看完」）；没有这种依据就是 False，不按看了多久推断
+    finished: bool = False
+    # 她不感兴趣、要划走或返回的
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class RequestReport:
+    """她在这一步回报对方某个要求的结果：编号、done 或 failed、依据或原因。"""
+
+    id: int
+    result: str
+    note: str = ""
 
 
 @dataclass(frozen=True)
@@ -101,6 +121,10 @@ class PhoneAction:
     seen: Optional[Seen] = None
     # wait 时在看的视频：short、long，或空（不是在看视频）
     video: str = ""
+    # 这一步让对方的哪个要求有了结果；没有就是 None
+    request: Optional[RequestReport] = None
+    # 这一刻看到特别喜欢、特别好笑、特别想给对方看的：桌宠开心一下，记下这张画面
+    moment: bool = False
 
     def describe(self) -> str:
         label = _ACTION_LABELS[self.kind]
@@ -115,13 +139,18 @@ class PhoneAction:
             return f"评论「{self.text}」"
         if self.kind == "launch":
             return f"打开 {self.app}"
+        if self.kind == "ask_help":
+            return f"找人帮忙：{self.text}"
         if self.kind == "wait":
             return f"看{VIDEO_KINDS.get(self.video, '')} {self.seconds:g} 秒"
         return label
 
 
 def extract_json_object(response: str) -> Dict[str, Any]:
-    """从模型回复中取出 JSON 对象，兼容 ```json 代码块和前后多余文字。
+    """从模型回复中取出第一个 JSON 对象，兼容 ```json 代码块和前后多余文字。
+
+    实测模型偶尔在一个 JSON 后面再跟一段（又一个 JSON 或解释），以前把第一个 { 到最后一个 } 整段拿去解析，
+    整次都失败；现在只取开头那个完整的对象，后面的不管。
 
     Raises:
         ValueError: 找不到或无法解析 JSON 对象时抛出。
@@ -131,12 +160,12 @@ def extract_json_object(response: str) -> Dict[str, Any]:
     if fenced is not None:
         candidate = fenced.group(1)
     else:
-        start, end = text.find("{"), text.rfind("}")
-        if start < 0 or end <= start:
+        start = text.find("{")
+        if start < 0:
             raise ValueError("回复里没有 JSON 对象")
-        candidate = text[start : end + 1]
+        candidate = text[start:]
     try:
-        data = json.loads(candidate)
+        data, _ = json.JSONDecoder().raw_decode(candidate)
     except json.JSONDecodeError as exc:
         raise ValueError(f"JSON 无法解析：{exc.msg}") from exc
     if not isinstance(data, dict):
@@ -198,8 +227,13 @@ def parse_action(response: str) -> PhoneAction:
     if kind == "swipe" and direction not in SWIPE_DIRECTIONS:
         raise ActionError("swipe 的 direction 必须是 up、down、left、right 之一")
     text = str(data.get("text", ""))
-    if kind in ("type", "comment") and not text.strip():
+    if kind in ("type", "comment", "ask_help") and not text.strip():
         raise ActionError(f"{kind} 需要 text")
+    if kind == "ask_help":
+        # 会放进别的话里（「……：她要帮的事。」），句尾标点去掉；太长时截断加省略号，看得出没说完
+        text = " ".join(text.split()).rstrip("。．.！!；;，,、 ")
+        if len(text) > _HELP_TEXT_LIMIT:
+            text = text[: _HELP_TEXT_LIMIT - 1] + "…"
     app = str(data.get("app", "")).strip()
     if kind == "launch" and not app:
         raise ActionError("launch 需要 app")
@@ -225,11 +259,16 @@ def parse_action(response: str) -> PhoneAction:
         seconds=seconds,
         seen=_parse_seen(data.get("seen")),
         video=video,
+        request=_parse_request(data.get("request")),
+        moment=data.get("moment") is True,
     )
 
 
 def _parse_seen(raw: Any) -> Optional[Seen]:
-    """取出她看到的内容名字；没说确定（certain 不是 true）、类型不对、名字太长都当作没有，不当成事实记下。"""
+    """取出她看到的内容名字；没说确定（certain 不是 true）、类型不对、名字太长都当作没有，不当成事实记下。
+
+    看完了只认 progress 写 finished、不感兴趣只认 skip 写 true，别的写法都当作没说。
+    """
     if not isinstance(raw, dict) or raw.get("certain") is not True:
         return None
     media = str(raw.get("type", "")).strip().lower()
@@ -237,7 +276,26 @@ def _parse_seen(raw: Any) -> Optional[Seen]:
     detail = " ".join(str(raw.get("detail", "")).split())
     if media not in SEEN_MEDIA or not 0 < len(title) <= _SEEN_TITLE_LIMIT or len(detail) > _SEEN_DETAIL_LIMIT:
         return None
-    return Seen(media=media, title=title, detail=detail)
+    return Seen(
+        media=media,
+        title=title,
+        detail=detail,
+        finished=str(raw.get("progress", "")).strip().lower() == "finished",
+        skipped=raw.get("skip") is True,
+    )
+
+
+def _parse_request(raw: Any) -> Optional[RequestReport]:
+    """取出这一步回报的要求结果；编号不是整数、结果不是 done 或 failed 都当作没回报，不把含糊的话当成做到了。"""
+    if not isinstance(raw, dict):
+        return None
+    number = raw.get("id")
+    result = str(raw.get("result", "")).strip().lower()
+    if isinstance(number, bool) or not isinstance(number, int) or result not in REQUEST_RESULTS:
+        return None
+    # 依据会放进括号里给人看，句尾的标点去掉，免得出现「暂停。）」
+    note = " ".join(str(raw.get("note", "")).split())[:_REQUEST_NOTE_LIMIT].rstrip("。．.！!；;，,、 ")
+    return RequestReport(id=number, result=result, note=note)
 
 
 def to_pixels(x: float, y: float, width: int, height: int) -> Tuple[int, int]:

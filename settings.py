@@ -281,6 +281,31 @@ class PlaySettings(PluginConfigBase):
         description="玩完后在发起的聊天里怎么说：natural=让她用自己的语气随口聊两句（也可能不说）；"
         "template=固定格式的通知；off=不说",
     )
+    low_battery_percent: int = Field(
+        default=20,
+        ge=0,
+        le=90,
+        description="手机电量低于这么多、又没插电时，她不会自己去玩，聊天里叫她也会说先充会儿电，"
+        "玩着的到点放下；0 表示不管电量。命令、WebUI、桌宠开始的不受限制，读不到电量的手机照常",
+    )
+    help_wait_minutes: int = Field(
+        default=5,
+        ge=1,
+        le=30,
+        description="她遇到登录、验证码这类自己过不去的画面会停下来请你帮忙，最多等这么多分钟；"
+        "你接管处理时不算，等不到就结束这次",
+    )
+    share_moments: bool = Field(
+        default=True,
+        description="玩的时候看到特别想给对方看的内容，玩完把那个画面发到叫她玩的聊天，她顺口说一句；"
+        "只在叫她的人本来就能看她手机截图时发（admin_user_ids 里的人、开了 screenshot_for_everyone），"
+        "跟着 finish_notice，它是 off 时不发",
+    )
+    report_requests: bool = Field(
+        default=True,
+        description="聊天里交给手机上的她的事（放某首歌、退出房间……）做到了或确定做不到时，回到那个聊天说一声；"
+        "说法跟着 finish_notice，它是 off 时也不说",
+    )
     use_ui_tree: bool = Field(
         default=True,
         description="读取界面元素并编号，普通应用点击更准；游戏、视频画面读不到元素时只用坐标",
@@ -303,6 +328,14 @@ class AutoPlaySettings(PluginConfigBase):
     enabled: bool = Field(default=False, description="开启后 Bot 会在空闲时自己决定要不要玩手机、玩什么")
     check_interval_minutes: int = Field(default=30, ge=1, le=1440, description="每隔多少分钟考虑一次要不要玩")
     play_probability: float = Field(default=0.3, ge=0, le=1, description="每次考虑时去玩的概率")
+    ask_to_charge: bool = Field(
+        default=True,
+        description="她自己想玩、手机却快没电又没插电时，在桌宠上和主人（admin_user_ids 第一个）的私聊里"
+        "问一句能不能帮忙充电；一次没电只问一次，插上电后道个谢",
+    )
+    only_when_charging: bool = Field(
+        default=False, description="只在手机插着电（充电中或已充满）时自动玩；读不到电量的手机照常"
+    )
     active_hours: str = Field(
         default="10:00-23:00",
         description="允许自动玩的时间段，格式 HH:MM-HH:MM，可跨午夜；"

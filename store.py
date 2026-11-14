@@ -14,6 +14,21 @@ _HISTORY_LIMIT = 30
 _DAILY_DAYS = 35
 
 
+def place_and_goal(place: str, goal: str, app: str = "") -> str:
+    """「在哔哩哔哩里看猫猫视频」。
+
+    ``place`` 是去过的应用（SessionRecord.places_text()，只去了一个就是应用名），``app`` 是起始应用，不给时就是 place。
+    她的目标里已经提到这个应用（「在番茄小说里搜索……」「打开网易云听歌」）就不再加，免得说成
+    「在番茄小说里在番茄小说里搜索」；中途还去过别的应用时把去过哪些接在后面。
+    """
+    named = app or place
+    if not place:
+        return goal
+    if named in goal:
+        return goal if place == named else f"{goal}，这次去过{place}"
+    return f"在{place}里{goal}"
+
+
 @dataclass(frozen=True)
 class SessionRecord:
     """一次玩手机的记录。"""
@@ -38,6 +53,10 @@ class SessionRecord:
     stats: Dict[str, Any] = field(default_factory=dict)
     # 用的哪台设备（多设备时的名字）；旧记录没有
     device: str = ""
+    # 这次最想给对方看的那一刻她在想什么；旧记录没有
+    moment: str = ""
+    # 对方这次在聊天里交给她的事和结果 [{"id", "text", "status", "label", "note"}]；旧记录没有
+    requests: List[Dict[str, Any]] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

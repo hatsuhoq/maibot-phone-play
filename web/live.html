@@ -24,6 +24,15 @@
   .maibot-card-header { font-size: 15px; display: flex; align-items: center; justify-content: space-between; gap: 8px; }
   .now-goal { font-size: 16px; font-weight: 600; overflow-wrap: anywhere; }
   .thought { margin-top: 10px; padding: 10px 12px; border-radius: var(--maibot-radius, 10px); background: var(--maibot-soft, #8881); overflow-wrap: anywhere; }
+  .help { margin-top: 10px; padding: 10px 12px; border-radius: var(--maibot-radius, 10px); font-weight: 600;
+    background: #f59e0b22; border: 1px solid #f59e0b; overflow-wrap: anywhere; }
+  .help[hidden] { display: none; }
+  .requests { list-style: none; margin: 10px 0 0; padding: 0; font-size: 13px; }
+  .requests[hidden] { display: none; }
+  .requests li { padding: 3px 0; overflow-wrap: anywhere; }
+  .request-done { color: var(--maibot-primary, #2563eb); }
+  .request-failed, .request-unfinished { color: var(--maibot-danger, #d33); }
+  .request-waiting, .request-doing, .request-replaced { color: var(--maibot-muted, #888); }
   .progress { height: 6px; border-radius: 3px; background: var(--maibot-soft, #8882); overflow: hidden; margin: 10px 0 4px; }
   .progress > div { height: 100%; width: 0; background: var(--maibot-primary, #2563eb); transition: width .3s; }
   .controls { display: flex; flex-wrap: wrap; gap: 8px; }
@@ -70,6 +79,7 @@
   <span id="state" class="maibot-badge">连接中</span>
   <span id="controller" class="maibot-badge"></span>
   <span id="device" class="maibot-muted"></span>
+  <span id="battery" class="maibot-muted"></span>
 </div>
 
 <div class="layout">
@@ -126,7 +136,9 @@
       <div id="visited" class="meta-line maibot-muted"></div>
       <div id="progressText" class="maibot-muted"></div>
       <div class="progress"><div id="progressBar"></div></div>
+      <div id="help" class="help" hidden></div>
       <div id="thought" class="thought" hidden></div>
+      <ul id="requests" class="requests" hidden></ul>
       <div id="sessionStats" class="meta-line maibot-muted"></div>
     </section>
 
@@ -314,6 +326,12 @@
     $('controller').textContent = data.controller_label;
     $('controller').classList.toggle('badge-user', data.controller === 'user');
     $('device').textContent = data.device;
+    // 电量：玩的时候几分钟看一次，空闲时是上次看的；读不到就不显示，不当成 0%
+    const battery = data.battery;
+    $('battery').textContent = battery
+      ? `🔋 ${battery.level}%${battery.charging ? ' 充电中' : battery.low ? ' 快没电了' : ''} · ${battery.checked_at}`
+      : '';
+    $('battery').classList.toggle('error', Boolean(battery && battery.low));
     renderDevices(data);
     $('controlNote').textContent = data.controller === 'user'
       ? '你在操作：她不会发任何操作，自动玩也不会开始；用完点「交还控制」，她会看看现在的画面再接着玩。'
@@ -334,8 +352,18 @@
       ? `第 ${data.step}/${data.max_steps} 步 · 已玩 ${data.elapsed_minutes}/${data.max_minutes} 分钟 · ${data.trigger}`
       : '';
     $('progressBar').style.width = active ? `${Math.min(100, data.step / data.max_steps * 100)}%` : '0';
+    // 她卡住了在等你帮忙：放在最显眼的地方，写清楚要帮什么、怎么帮
+    $('help').hidden = !data.help;
+    $('help').textContent = data.help ? `🙋 在等你帮忙：${data.help}。点「我来操作」在手机上弄好，再点「交还控制」` : '';
     $('thought').hidden = !data.thought;
     $('thought').textContent = data.thought ? `💭 ${data.thought}` : '';
+    // 聊天里交给她的事和结果：做到了要她在画面上看到才算
+    $('requests').hidden = !data.requests.length;
+    $('requests').replaceChildren(...data.requests.map(request => {
+      const row = text('li', `「${request.text}」`);
+      row.append(text('span', ` ${request.label}${request.note ? `：${request.note}` : ''}`, `request-${request.status}`));
+      return row;
+    }));
     $('sessionStats').textContent = active ? statsText(data.session_stats) : '';
     setButtons(data);
 
@@ -398,11 +426,17 @@
       ? work
       : memory.kind === 'unfinished'
         ? `上次没做完：${memory.title}${memory.detail ? `（${memory.detail}）` : ''}`
-        : memory.title;
+        : memory.kind === 'later'
+          ? `有空要看：${memory.title}${memory.app ? `（${memory.app}）` : ''}`
+          : memory.title;
     const meta = [memory.source_label];
+    // 有空要看的：还没看、看了一部分、看完了、不用看了
+    if (memory.kind === 'later') meta.push(memory.watch_state);
     if (memory.kind === 'watched') {
       if (memory.form) meta.push(VIDEO_FORMS[memory.form] || memory.form);
-      if (memory.seconds) meta.push(memory.seconds < 60 ? `看了 ${memory.seconds} 秒` : `看了约 ${Math.round(memory.seconds / 60)} 分钟`);
+      // 看到哪一步（看了一部分、看完了、不感兴趣）；旧记录只知道看过，按停留时间显示
+      if (memory.watch_state) meta.push(memory.watch_state);
+      else if (memory.seconds) meta.push(memory.seconds < 60 ? `看了 ${memory.seconds} 秒` : `看了约 ${Math.round(memory.seconds / 60)} 分钟`);
     }
     meta.push(memory.updated_at.replace('T', ' '));
     const body = document.createElement('div');

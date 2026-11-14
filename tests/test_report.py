@@ -4,7 +4,7 @@ import json
 
 from phone_play.memory import MemoryItem
 from phone_play.report import build_report, report_html
-from phone_play.store import SessionRecord, UsageStore
+from phone_play.store import SessionRecord, UsageStore, place_and_goal
 
 TODAY = date(2026, 11, 13)
 
@@ -122,3 +122,18 @@ def test_weekly_report_card_escapes_text_and_needs_nothing_from_the_network():
     assert "http" not in html
     # 没有看过的内容就不放那一节
     assert "看过的" not in html
+
+
+def test_the_app_is_not_said_twice_when_her_goal_already_names_it():
+    # 实测放下手机后的近况写成了「在番茄小说里在番茄小说里搜索《反转练习生》」
+    assert place_and_goal("番茄小说", "在番茄小说里搜索《反转练习生》") == "在番茄小说里搜索《反转练习生》"
+    assert place_and_goal("网易云音乐", "打开网易云音乐听安静的歌") == "打开网易云音乐听安静的歌"
+    assert place_and_goal("哔哩哔哩", "看猫猫视频") == "在哔哩哔哩里看猫猫视频"
+    assert place_and_goal("", "看猫猫视频") == "看猫猫视频"
+    # 中途去过别的应用：去过哪些接在后面，不再套一层「在……里」
+    places = "欢乐斗地主（约 3 分钟）、哔哩哔哩（约 1 分钟）"
+    assert (
+        place_and_goal(places, "在欢乐斗地主里打一局", "欢乐斗地主")
+        == "在欢乐斗地主里打一局，这次去过欢乐斗地主（约 3 分钟）、哔哩哔哩（约 1 分钟）"
+    )
+    assert place_and_goal(places, "打一局", "欢乐斗地主") == f"在{places}里打一局"

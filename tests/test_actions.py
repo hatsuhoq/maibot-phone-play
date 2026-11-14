@@ -1,6 +1,14 @@
 import pytest
 
-from phone_play.actions import ActionError, find_app, parse_action, resolve_point, swipe_points
+from phone_play.actions import (
+    ActionError,
+    extract_json_object,
+    RequestReport,
+    find_app,
+    parse_action,
+    resolve_point,
+    swipe_points,
+)
 from phone_play.settings import AllowedApp
 from phone_play.ui_tree import UIElement
 
@@ -120,3 +128,53 @@ def test_wait_can_say_it_is_watching_a_short_or_long_video():
     assert parse_action('{"action":"swipe","direction":"up","video":"short"}').video == ""
     with pytest.raises(ActionError, match="short（短视频）或 long"):
         parse_action('{"action":"wait","seconds":5,"video":"movie"}')
+
+
+def test_request_results_and_watch_progress_only_count_when_written_clearly():
+    action = parse_action(
+        '{"action":"wait","seconds":10,"video":"long",'
+        '"seen":{"type":"video","title":"春日影","certain":true,"progress":"finished","skip":true},'
+        '"request":{"id":2,"result":"done","note":"画面上在播放"}}'
+    )
+    assert action.seen is not None and action.seen.finished and action.seen.skipped
+    assert action.request == RequestReport(id=2, result="done", note="画面上在播放")
+    # 含糊的写法都当作没回报，不把「差不多了」当成做到了
+    for raw in ('{"id":"2","result":"done"}', '{"id":2,"result":"ok"}', '{"id":true,"result":"done"}', '"done"'):
+        assert parse_action(f'{{"action":"back","request":{raw}}}').request is None
+    seen = parse_action(
+        '{"action":"back","seen":{"type":"video","title":"春日影","certain":true,"progress":"half","skip":"yes"}}'
+    ).seen
+    assert seen is not None and not seen.finished and not seen.skipped
+
+
+def test_only_the_first_json_object_is_used():
+    # 实测文本模型在计划 JSON 后面又跟了一段，整段解析失败（Extra data），这次就没玩成
+    assert extract_json_object('{"app": "网易云音乐", "minutes": 8}\n{"note": "备选"}') == {
+        "app": "网易云音乐",
+        "minutes": 8,
+    }
+    assert extract_json_object('好的。{"action": "back"} 这样就能返回了') == {"action": "back"}
+    with pytest.raises(ValueError, match="没有 JSON 对象"):
+        extract_json_object("我想想")
+    with pytest.raises(ValueError, match="JSON 无法解析"):
+        extract_json_object('{"action": "back"')
+
+
+def test_asking_for_help_needs_to_say_what_for():
+    action = parse_action('{"action":"ask_help","text":"  小红书要重新登录   才能看笔记 "}')
+    assert (action.kind, action.text, action.describe()) == (
+        "ask_help",
+        "小红书要重新登录 才能看笔记",
+        "找人帮忙：小红书要重新登录 才能看笔记",
+    )
+    # 太长时截断加省略号；句尾标点去掉，放进别的话里不会出现「。。」
+    assert parse_action('{"action":"ask_help","text":"' + "验" * 80 + '"}').text == "验" * 59 + "…"
+    assert parse_action('{"action":"ask_help","text":"麻烦你帮我登录一下。"}').text == "麻烦你帮我登录一下"
+    with pytest.raises(ActionError, match="ask_help 需要 text"):
+        parse_action('{"action":"ask_help"}')
+
+
+def test_moment_only_counts_when_written_as_true():
+    assert parse_action('{"action":"wait","seconds":10,"moment":true}').moment is True
+    for raw in ('"true"', "1", "false"):
+        assert parse_action(f'{{"action":"wait","seconds":10,"moment":{raw}}}').moment is False

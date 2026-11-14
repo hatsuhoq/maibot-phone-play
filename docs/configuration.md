@@ -61,6 +61,10 @@
 | `play.together_minutes` / `turn_wait_seconds` | 30 / 180 | 一起玩时最多玩多久、每次最多等对方多少秒 |
 | `play.allow_chat_trigger` | 开 | 聊天中她能不能自己决定去玩手机（`play_phone` 工具） |
 | `play.finish_notice` | `natural` | 玩完在聊天里怎么说：`natural` 她自己决定说不说、怎么说，`template` 固定通知，`off` 不说 |
+| `play.low_battery_percent` | 20 | 电量低于这么多、又没插电时不自己去玩，聊天里叫她会说先充电，玩着的到点放下；0 表示不管电量。命令、WebUI、桌宠开始的不受限制，见[电量](usage.md#电量) |
+| `play.help_wait_minutes` | 5 | 她遇到登录、验证码这类自己过不去的画面会停下来请你帮忙，最多等这么多分钟（1–30），你接管处理时不算，见[她卡住时会找你帮忙](usage.md#她卡住时会找你帮忙) |
+| `play.share_moments` | 开 | 玩的时候看到特别想给对方看的，玩完把那个画面发到叫她玩的聊天；只在对方能看她手机截图时发，跟着 `finish_notice`，见[直接跟她说](usage.md#直接跟她说) |
+| `play.report_requests` | 开 | 聊天里交代的事做到了或做不到时，回到那个聊天说一声；说法跟着 `finish_notice`，见[直接跟她说](usage.md#直接跟她说) |
 | `play.fresh_start` | 开 | 每次开始先关掉应用再打开，从应用首页开始，不会接着上次停下的视频 |
 | `play.go_home_after` | 开 | 玩完回到桌面，视频不会在后台一直播放 |
 | `play.lock_after` | 开 | 玩完锁屏（iPhone 和安卓真机，模拟器不锁），下次玩时自动解开；设了锁屏密码就关掉，见[锁屏和解锁](devices.md#锁屏和解锁) |
@@ -74,6 +78,8 @@
 | `auto_play.enabled` | 关 | 空闲时自己决定要不要玩 |
 | `auto_play.check_interval_minutes` | 30 | 每隔多少分钟考虑一次 |
 | `auto_play.play_probability` | 0.3 | 每次考虑时去玩的概率 |
+| `auto_play.ask_to_charge` | 开 | 她自己想玩、手机却快没电又没插电时，在桌宠上和主人（`admin_user_ids` 第一个）的私聊里问能不能帮忙充电；一次没电只问一次，见[电量](usage.md#电量) |
+| `auto_play.only_when_charging` | 关 | 只在手机插着电时自动玩；读不到电量的手机照常 |
 | `auto_play.active_hours` | `10:00-23:00` | 允许自动玩的时间段，可跨午夜；查得到麦生活的日程时按日程 |
 
 ## 生活联动

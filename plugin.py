@@ -18,8 +18,17 @@ from maibot_sdk import (
 )
 from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo, ToolParamType
 
-from .agent import AgentError, ModelReply, PhoneAgent, PlayRefused, SwitchRefused
-from .devices import DeviceError, create_device
+from .agent import (
+    REQUEST_LABELS,
+    AgentError,
+    ModelReply,
+    PhoneAgent,
+    PhoneRequest,
+    PlayRefused,
+    ScreenDark,
+    SwitchRefused,
+)
+from .devices import Battery, DeviceError, create_device
 from .diagnostics import DiagnosticStore
 from .memory import MemoryStore
 from .imaging import jpeg_data_url, panel_png_base64, to_base64
@@ -38,7 +47,7 @@ from .life import (
 from .prompts import Persona
 from .report import CARD_WIDTH, report_html
 from .settings import PhonePlayConfig
-from .store import SessionRecord, UsageStore
+from .store import SessionRecord, UsageStore, place_and_goal
 
 _HELP_TEXT = (
     "📱 手机命令：\n"
@@ -76,6 +85,8 @@ _COMMAND_PATTERN = (
     rf"^/手机(?!\s*(?:{_CONTROL_SUBS})(?:\s|$))\s*(?P<sub>截图|状态|设备|周报|帮助)?(?:\s+(?P<arg>.+?))?\s*$"
 )
 _CONTROL_PATTERN = rf"^/手机\s*(?P<sub>{_CONTROL_SUBS})(?:\s+(?P<arg>.+?))?\s*$"
+# 拼进话里之前去掉的句尾标点
+_END_MARKS = "。．.！!？?，,、；;：: "
 # 聊天中叫她去玩手机时，等她决定好玩什么再回话，这样她能说出具体打算
 _PLAN_WAIT_SECONDS = 30.0
 # Maisaka 默认把插件工具放进 tool_search 后面，实测她要先搜一轮才会去玩，对方得催一句。
@@ -95,6 +106,9 @@ def _pet_panel_lines(status: Dict[str, Any]) -> List[str]:
     playing = status["state"] in ("playing", "paused")
     if status["controller"] == "user":
         lines = [f"你在操作手机{device}，用完点「交还控制」"]
+    elif status["help"]:
+        # 她卡住了在等你：说清楚要帮什么、怎么帮，别的先不提
+        return [f"🙋 等你帮忙：{_first_clause(status['help'], 24)}", "点「我来操作」弄好，再点「交还控制」"]
     elif playing:
         progress = f"{status['elapsed_minutes']:g}/{status['max_minutes']} 分钟"
         lines = [f"{status['state_label']}{device}：{status['app']} {progress}"]
@@ -102,8 +116,14 @@ def _pet_panel_lines(status: Dict[str, Any]) -> List[str]:
         lines = [f"正在拿起手机{device}…"]
     else:
         lines = [f"空闲{device} · 今天玩了 {status['today']['sessions']} 次"]
+        if status["battery"]:
+            lines[0] += f" · 🔋{status['battery']['level']}%"
     if playing:
-        if status["goal"]:
+        # 你交代的事还没结果时先说它：比她自己的打算优先
+        asked = [request for request in status["requests"] if request["status"] in ("waiting", "doing")]
+        if asked:
+            lines.append(f"你让她：{_first_clause(asked[-1]['text'], 24)}")
+        elif status["goal"]:
             lines.append(f"想做：{_first_clause(status['goal'], 26)}")
         if status["thought"]:
             lines.append(f"💭 {_first_clause(status['thought'], 34)}")
@@ -118,10 +138,18 @@ def _pet_panel_lines(status: Dict[str, Any]) -> List[str]:
     return lines
 
 
+def _battery_text(battery: Dict[str, Any]) -> str:
+    """「85%（充电中，12:30 看的）」；电量低又没插电时说快没电了。"""
+    state = "充电中" if battery["charging"] else ("快没电了，没插电" if battery["low"] else "没插电")
+    return f"{battery['level']}%（{state}，{battery['checked_at']} 看的）"
+
+
 def _pet_actions(status: Dict[str, Any]) -> List[str]:
     """桌宠面板上按现在的状态能做的操作。"""
     if status["controller"] == "user":
         return ["release", "refresh"]
+    if status["help"]:
+        return ["takeover", "stop", "refresh"]
     if status["state"] == "idle":
         return ["start", "takeover", "refresh"]
     if status["state"] == "playing":
@@ -145,6 +173,10 @@ def _finish_reason_text(end_reason: str) -> str:
         return "在手机上卡住了，怎么点都没反应，就先放下了"
     if end_reason.startswith("暂停或接管"):
         return "中途停下来太久，这次就先不玩了"
+    if end_reason.startswith("手机快没电了"):
+        return "手机快没电了，先放下充电"
+    if end_reason.startswith("等你帮忙"):
+        return "在手机上卡住了要人帮忙，等了一会儿没人来，就先放下了"
     return "被叫停了"
 
 
@@ -204,6 +236,9 @@ class PhonePlayPlugin(MaiBotPlugin):
             life_share=self._share_with_life,
             announcer=self._pet_bubble,
             refresher=self._pet_refresh_buttons,
+            request_notifier=self._notify_request,
+            help_notifier=self._notify_help,
+            charge_asker=self._ask_to_charge,
         )
         self._agent.restart_auto_play()
 
@@ -309,15 +344,20 @@ class PhonePlayPlugin(MaiBotPlugin):
         if self.settings.auto_play.enabled:
             await self.agent.refresh_life(max_age=_LIFE_REFRESH_SECONDS)
 
-    async def _notify_finished(self, record: SessionRecord, stream_id: str) -> None:
+    async def _notify_finished(self, record: SessionRecord, stream_id: str, moment: Optional[bytes] = None) -> None:
         """在发起的聊天里告知玩完了（只有真正打开过应用的那次才会通知）：默认请 Maisaka 让她自己决定说不说、怎么说。"""
         style = self.settings.play.finish_notice
         if style == "off":
             return
+        # 她最想给对方看的那一刻：先把截图发过去，她再顺口说一句（发不出去就不提）
+        shown = moment is not None and await self.ctx.send.image(to_base64(moment), stream_id)
         interactions = "、".join(record.interactions)
+        asked = "；".join(f"「{item['text']}」{item['label']}" for item in record.requests)
         if style == "template":
             name = await self._bot_name()
             extra = f"\n互动：{interactions}" if interactions else ""
+            extra += f"\n交代的事：{asked}" if asked else ""
+            extra += f"\n📷 {record.moment}" if shown and record.moment else ""
             await self.ctx.send.text(
                 f"📱 {name}放下手机了：{record.places_text()} · {record.goal}\n"
                 f"{record.summary}（{record.steps} 步，{record.end_reason}）{extra}",
@@ -325,15 +365,125 @@ class PhonePlayPlugin(MaiBotPlugin):
             )
             return
 
-        place = f"和对方一起在{record.places_text()}里" if record.together else f"在{record.places_text()}里"
+        # 目标和感想常带句号，拼进话里会变成「看几话。，」「挺有意思。。」
+        place = place_and_goal(record.places_text(), record.goal.rstrip(_END_MARKS), record.app)
+        # 目标里已经说了和对方一起（「和对方轮流玩……」）就不再加，免得说成「和对方一起和对方轮流玩」
+        if record.together and "对方" not in record.goal:
+            place = f"和对方一起{place}"
         did = f"用自己的账号{interactions}。" if interactions else ""
+        # 已经单独说过结果的不用再说一遍；放下手机那一步才有结果的（或者关了单独说）在这里一起说；
+        # 没做完的要说清楚，别让对方以为做好了
+        report = self.settings.play.report_requests
+        settled = [
+            item
+            for item in record.requests
+            if item["status"] in ("done", "failed") and not (report and item.get("reported"))
+        ]
+        if settled:
+            results = "；".join(
+                f"「{item['text']}」{item['label']}" + (f"（{item['note']}）" if item["note"] else "")
+                for item in settled
+            )
+            did += f"对方交代你在手机上做的事：{results}，顺便告诉对方结果。"
+        # 对方之前让她有空看的，这次看了：顺便提一句（只算这次玩的时候更新的）
+        if self._memory is not None:
+            watched = [
+                f"{item.title}{item.watch_state()}"
+                for item in self._memory.items()
+                if item.kind == "later"
+                and item.progress
+                and item.verdict != "cancelled"
+                and record.started_at <= item.updated_at <= record.ended_at
+            ]
+            if watched:
+                did += f"对方之前让你有空看的，这次{'；'.join(watched)}，可以顺便提一句。"
+        if shown:
+            did += (
+                f"这次玩的时候你最喜欢的那个画面（你当时想：{record.moment.rstrip(_END_MARKS)}），"
+                "这张截图刚发给对方了，提的时候可以说「你看这个」之类的，照着你当时的感受说。"
+            )
+        undone = "；".join(f"「{item['text']}」" for item in record.requests if item["status"] == "unfinished")
+        did += f"对方交代你在手机上做的{undone}没做完你就放下了手机，提的时候照实说。" if undone else ""
         intent = (
-            f"你刚放下手机。这次{place}{record.goal}，{_finish_reason_text(record.end_reason)}。"
-            f"玩的时候的感受：{record.summary}。{did}"
+            f"你刚放下手机。这次{place}，{_finish_reason_text(record.end_reason)}。"
+            f"玩的时候的感受：{record.summary.rstrip(_END_MARKS)}。{did}"
             "如果合适，就用你平时说话的语气在这里随口提一两句刚才在手机上看到的东西；不想说也可以不说。"
             "不要用通知、汇报的口吻，也不要提插件、步数这些。"
         )
         result = await self.ctx.maisaka.proactive.trigger(stream_id, intent, reason="玩手机结束")
+        if not result.get("success"):
+            raise RuntimeError(f"请她主动聊天失败：{result.get('error')}")
+
+    async def _notify_help(self, help_text: str, stream_id: str) -> None:
+        """她在手机上卡住了、停下来等人帮忙：回发起的聊天请对方帮一下，说法跟着 finish_notice，它是 off 时不说。"""
+        style = self.settings.play.finish_notice
+        if style == "off":
+            return
+        if style == "template":
+            name = await self._bot_name()
+            await self.ctx.send.text(
+                f"📱 {name}需要你帮忙：{help_text}\n发 /手机 接管，在手机上处理好后发 /手机 交还", stream_id
+            )
+            return
+        intent = (
+            f"手机上的你卡住了，自己过不去，停下来等对方帮忙：{help_text}。"
+            "用你平时说话的语气请对方帮一下，一两句就好；告诉对方发 /手机 接管"
+            "（或者在 WebUI「手机实时画面」点「我来操作」）在手机上弄好，再交还给你。"
+            "别说你会自己去输账号、密码、验证码，也不要提插件。"
+        )
+        result = await self.ctx.maisaka.proactive.trigger(stream_id, intent, reason="手机上要人帮忙")
+        if not result.get("success"):
+            raise RuntimeError(f"请她主动聊天失败：{result.get('error')}")
+
+    async def _ask_to_charge(self, battery: Battery) -> None:
+        """她想玩手机，可手机快没电了：桌宠上冒一句，再去主人的私聊里问能不能帮忙充电。
+
+        主人是 admin_user_ids 里的第一个；没有、或者没和她私聊过找不到聊天时只冒桌宠气泡。私聊的说法跟着 finish_notice，
+        它是 off 时不说。
+        """
+        if self.settings.desktop_pet.bubbles:
+            await self._pet_bubble(f"🔌 手机快没电了（剩 {battery.level}%），能帮我充一下电吗？")
+        style = self.settings.play.finish_notice
+        owner = next(iter(self.settings.plugin.admin_user_ids), "")
+        if style == "off" or not owner:
+            return
+        stream = await self.ctx.chat.get_stream_by_user_id(owner)
+        if not isinstance(stream, dict) or not stream.get("session_id"):
+            return
+        stream_id = str(stream["session_id"])
+        if style == "template":
+            name = await self._bot_name()
+            await self.ctx.send.text(f"📱 {name}：手机快没电了（剩 {battery.level}%），能帮我充一下电吗？", stream_id)
+            return
+        intent = (
+            # 实测她会添一句「刚看完视频」，其实还没开始玩
+            f"你刚想拿起手机玩一会儿，还没开始就发现手机快没电了（只剩 {battery.level}%），也没插电。"
+            "用你平时说话的语气问问对方能不能帮你把手机充上电，一两句就好；你这次还没在手机上看任何东西，"
+            "别编刚才在手机上做了什么；不要用通知的口吻，也不要提插件。"
+        )
+        result = await self.ctx.maisaka.proactive.trigger(stream_id, intent, reason="手机快没电了")
+        if not result.get("success"):
+            raise RuntimeError(f"请她主动聊天失败：{result.get('error')}")
+
+    async def _notify_request(self, request: PhoneRequest, stream_id: str) -> None:
+        """对方交给手机上的她的事做到了或做不到：回发起的聊天说一声，说法跟着 finish_notice。"""
+        style = self.settings.play.finish_notice
+        if not self.settings.play.report_requests or style == "off":
+            return
+        done = request.status == "done"
+        if style == "template":
+            name = await self._bot_name()
+            note = f"（{request.note}）" if request.note else ""
+            await self.ctx.send.text(f"📱 {name}：「{request.text}」{REQUEST_LABELS[request.status]}{note}", stream_id)
+            return
+        seen = f"，手机上看到的是：{request.note}" if request.note else ""
+        intent = (
+            f"刚才对方让你在手机上「{request.text}」，手机上的你{'已经做到了' if done else '没能做成'}{seen}。"
+            "用你平时说话的语气跟对方说一声结果，一两句就好；只说手机上真的发生了的，"
+            + ("" if done else "做不成就照实说原因，")
+            + "不要用汇报的口吻，也不要提插件、编号这些。"
+        )
+        result = await self.ctx.maisaka.proactive.trigger(stream_id, intent, reason="手机上的事有结果了")
         if not result.get("success"):
             raise RuntimeError(f"请她主动聊天失败：{result.get('error')}")
 
@@ -372,6 +522,8 @@ class PhonePlayPlugin(MaiBotPlugin):
         lines.append(
             f"今天：{today['sessions']}/{today['session_limit']} 次 · {today['steps']}/{today['step_limit']} 步"
         )
+        if status["battery"]:
+            lines.append(f"电量：{_battery_text(status['battery'])}")
         if status["auto_play"]:
             next_check = f"，下次考虑在 {status['next_auto_check']}" if status["next_auto_check"] else ""
             lines.append(f"自动玩：已开启{next_check}")
@@ -386,6 +538,9 @@ class PhonePlayPlugin(MaiBotPlugin):
         """发送截图，返回需要额外回复的文字（成功时为空或当前在做的事）。"""
         try:
             jpeg = await self.agent.chat_screenshot()
+        except ScreenDark as exc:
+            # 黑图发过去没用，照实说
+            return f"没发截图：{exc}"
         except DeviceError as exc:
             return f"截图失败：{exc}"
         if not await self.ctx.send.image(to_base64(jpeg), stream_id):
@@ -460,7 +615,13 @@ class PhonePlayPlugin(MaiBotPlugin):
         name = await self._bot_name()
         if sub == "开始":
             try:
-                await self.agent.start(trigger="command", hint=arg, origin_stream=stream_id)
+                # 能用控制命令的人本来就管着这台手机：她标了「这一刻」的画面玩完发过来
+                await self.agent.start(
+                    trigger="command",
+                    hint=arg,
+                    origin_stream=stream_id,
+                    share_moments=self.settings.play.share_moments,
+                )
                 plan = await self.agent.wait_for_plan(_PLAN_WAIT_SECONDS)
             except PlayRefused as exc:
                 return f"现在不能玩手机：{exc}"
@@ -560,30 +721,52 @@ class PhonePlayPlugin(MaiBotPlugin):
                 ),
                 required=False,
             ),
+            ToolParameterInfo(
+                name="replace",
+                param_type=ToolParamType.BOOLEAN,
+                description="正在玩时对方改主意了、让你别做刚才那件事改做这个，填 true；只是再加一件事就不填",
+                required=False,
+            ),
         ],
         visibility=_ALWAYS_VISIBLE,
     )
     async def tool_play_phone(
-        self, goal: str = "", minutes: int = 0, together: bool = False, stream_id: str = "", **kwargs: Any
+        self,
+        goal: str = "",
+        minutes: int = 0,
+        together: bool = False,
+        replace: bool = False,
+        stream_id: str = "",
+        user_id: str = "",
+        **kwargs: Any,
     ) -> Dict[str, Any]:
         """聊天中去玩手机；等她决定好玩什么再返回，方便她说出具体打算。"""
         del kwargs
         if self.agent.state != "idle":
             # 实测玩的时候对方在聊天里说「退出房间」「点准备」，她嘴上说做了，手机上的她根本不知道
-            if self.agent.add_request(goal, minutes):
+            request = self.agent.add_request(goal, minutes, replace=replace)
+            if request is not None:
+                dropped = "，刚才那件不做了" if replace else ""
                 return {
                     "success": True,
                     "content": (
-                        f"已经告诉手机上的你：{goal.strip()}。手机上的你下一步会先去做；"
-                        "做没做成要过一会儿用 phone_activity 看了再说，别直接说已经做好了。"
+                        f"已经告诉手机上的你：{request.text}{dropped}。手机上的你下一步会先去做，"
+                        "做到了或做不到会回到这里告诉你；在那之前只能说正在弄，别说已经做好了。"
                     ),
                 }
             return {"success": True, "content": f"你已经在玩手机了。{self.agent.activity_text()}"}
         if not self.settings.play.allow_chat_trigger:
             return {"success": False, "error": "插件配置不允许在聊天中自己去玩手机"}
         try:
+            # 截图里可能有通知等隐私：叫她玩的人本来就能看她手机截图，才把「这一刻」的画面发过来
+            can_see = self._is_admin(user_id, False) or self.settings.plugin.screenshot_for_everyone
             await self.agent.start(
-                trigger="chat", hint=goal, origin_stream=stream_id, minutes=minutes, together=together
+                trigger="chat",
+                hint=goal,
+                origin_stream=stream_id,
+                minutes=minutes,
+                together=together,
+                share_moments=self.settings.play.share_moments and can_see,
             )
             plan = await self.agent.wait_for_plan(_PLAN_WAIT_SECONDS)
         except PlayRefused as exc:
@@ -646,25 +829,68 @@ class PhonePlayPlugin(MaiBotPlugin):
         description=(
             "记住对方亲口说的、和你玩手机有关的兴趣或要求，下次玩手机时会想起来。"
             "比如对方说「我喜欢看种田小说」「下次接着看那本《XX》」时使用；"
+            "对方让你有空、回头去看某个视频、小说、歌（「这个视频你有空看看」「回头听听这首」）时 later 填 true，"
+            "之后玩手机会去找来看，看完了你会知道；对方说那个不用看了，cancel 填 true。"
             "只记对方明确说的话，不要记你自己猜的，也不要记手机画面上看到的（那些手机上的你会自己记）。"
         ),
         parameters=[
             ToolParameterInfo(
                 name="note",
                 param_type=ToolParamType.STRING,
-                description="对方说的兴趣或要求，用一句话写清楚，例如「对方喜欢看种田小说」",
+                description=(
+                    "对方说的兴趣或要求，用一句话写清楚，例如「对方喜欢看种田小说」；"
+                    "later、cancel 时只写要看的东西的名字，书名、标题加上书名号，例如「《迷途之子》第三话」；"
+                    "不要写成「对方让我有空看……」这样的一整句"
+                ),
                 required=True,
-            )
+            ),
+            ToolParameterInfo(
+                name="later",
+                param_type=ToolParamType.BOOLEAN,
+                description="对方让你有空、回头去看、去听某个东西时填 true",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="app",
+                param_type=ToolParamType.STRING,
+                description="later 时对方说了在哪个应用看（比如「B站」「网易云」）就写上，没说就不填",
+                required=False,
+            ),
+            ToolParameterInfo(
+                name="cancel",
+                param_type=ToolParamType.BOOLEAN,
+                description="对方说之前让你看的那个不用看了时填 true",
+                required=False,
+            ),
         ],
     )
-    async def tool_remember_for_phone(self, note: str = "", **kwargs: Any) -> Dict[str, Any]:
-        """把对方亲口说的兴趣记进内容记忆，来源标成「对方说过」。"""
+    async def tool_remember_for_phone(
+        self, note: str = "", later: bool = False, app: str = "", cancel: bool = False, **kwargs: Any
+    ) -> Dict[str, Any]:
+        """把对方亲口说的兴趣、让她有空看的东西记进内容记忆，来源标成「对方说过」；也能取消有空看的。"""
         del kwargs
         if self._memory is None:
             return {"success": False, "error": "插件还没加载完"}
         if not note.strip():
             return {"success": False, "error": "没有要记的内容"}
-        item = self._memory.remember_interest(note, datetime.now())
+        now = datetime.now()
+        if cancel:
+            item = self._memory.cancel_later(note, now)
+            if item is None:
+                return {"success": False, "error": "没找到对方让你有空看的这个，可能没记过或者已经看完了"}
+            await self._memory.save()
+            return {"success": True, "content": f"好，{item.title}不用看了。"}
+        if later:
+            item = self._memory.add_later(note, app, now)
+            await self._memory.save()
+            return {
+                "success": True,
+                "content": (
+                    f"记下了：有空去看{item.title}。下次玩手机时会去找来看，看到哪了你会知道；"
+                    "现在还没看，别说已经看了。"
+                ),
+            }
+        item = self._memory.remember_interest(note, now)
         await self._memory.save()
         return {"success": True, "content": f"记住了：{item.title}。下次玩手机时会想起来。"}
 
@@ -686,6 +912,9 @@ class PhonePlayPlugin(MaiBotPlugin):
             return {"success": False, "error": "对方不在可以看你手机的名单里，婉拒就好"}
         try:
             jpeg = await self.agent.chat_screenshot()
+        except ScreenDark as exc:
+            # 实测她把黑图发了过去，说「截是截了 但黑屏」：不给她黑图，让她照实说
+            return {"success": False, "error": f"{exc}，没东西可看；照实跟对方说屏幕黑着，别说截到了什么"}
         except DeviceError as exc:
             self.ctx.logger.warning(f"手机截图失败：{exc}")
             return {"success": False, "error": "手机连不上，截不了图"}
@@ -817,6 +1046,8 @@ class PhonePlayPlugin(MaiBotPlugin):
         status = self.agent.status()
         if status["controller"] == "user":
             return "你在操作手机"
+        if status["help"]:
+            return "等你帮忙"
         if status["state"] in ("playing", "paused"):
             prefix = "暂停中" if status["state"] == "paused" else "正在玩"
             return f"{prefix}：{status['app']} {status['elapsed_minutes']:g}/{status['max_minutes']} 分钟"
@@ -845,10 +1076,16 @@ class PhonePlayPlugin(MaiBotPlugin):
         except TimeoutError:
             stale = True
         jpeg, frame_error = agent.latest_frame()
-        image = await asyncio.to_thread(panel_png_base64, jpeg) if jpeg is not None else None
         status = agent.status()
+        # 她没在玩、屏幕关着（锁屏、熄屏）时截出来是黑的：不放黑图，说一句屏幕关着
+        screen_off = agent.frame_dark and status["state"] == "idle" and status["controller"] == "bot"
+        image = None
+        if jpeg is not None and not screen_off:
+            image = await asyncio.to_thread(panel_png_base64, jpeg)
         lines = [notice] if notice else []
         lines.extend(_pet_panel_lines(status))
+        if screen_off:
+            lines.append("📴 手机屏幕关着")
         # 有问题时才多一行；生活联动、步数这些细节在 WebUI 里看
         connection = status["connection"]
         if connection["state"] not in ("ok", "unknown"):

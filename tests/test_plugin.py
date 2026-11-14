@@ -17,7 +17,7 @@ from maibot_sdk.context import PluginContext, PluginPaths
 
 from phone_play import plugin as plugin_module
 from phone_play.actions import Seen
-from phone_play.agent import PlayRefused
+from phone_play.agent import PhoneRequest, PlayRefused
 from phone_play.life import LifeLinkError
 from phone_play.plugin import _COMMAND_PATTERN, _CONTROL_PATTERN, create_plugin
 from phone_play.settings import AllowedApp, DeviceSettings, PhonePlayConfig
@@ -327,7 +327,7 @@ async def test_play_phone_tool_together_mode(tmp_path, monkeypatch):
         assert "不要编造进展" in result["content"] and "phone_activity" in result["content"]
         await asyncio.wait_for(plugin.agent._task, 5)
         _, intent = plugin.ctx.maisaka.proactive.trigger.await_args.args
-        assert "这次和对方一起在双人小游戏里和对方轮流玩双人小游戏" in intent and "玩完了，我赢了一局" in intent
+        assert "这次和对方轮流玩双人小游戏，" in intent and "玩完了，我赢了一局" in intent
     finally:
         await plugin.on_unload()
 
@@ -500,12 +500,13 @@ async def test_chat_sees_phone_state_and_passes_requests_while_playing(tmp_path,
 
         # 玩的时候再调用 play_phone：不重新开始，把要求交给手机上的她
         result = await plugin.tool_play_phone(goal="换个视频", stream_id="stream-1")
-        assert result["content"].startswith("已经告诉手机上的你：换个视频。") and "phone_activity" in result["content"]
+        assert result["content"].startswith("已经告诉手机上的你：换个视频。")
+        assert "做到了或做不到会回到这里告诉你" in result["content"]
         gate.set()
         await asyncio.wait_for(plugin.agent._task, 5)
         # 本来要看 30 秒，有了新要求马上醒来，下一步先照着做
-        assert "对方刚在聊天里让你：换个视频。这比原来的打算优先" in states[1]
-        assert "第2步前，对方在聊天里让你：换个视频" in states[1]
+        assert "对方刚在聊天里让你：#1 换个视频。这比原来的打算优先" in states[1]
+        assert "第2步前，对方在聊天里让你（#1）：换个视频" in states[1]
 
         # 玩完后的一段时间里，提醒她现在没在玩
         after = await plugin.inject_planner_context(items=items, session_id="stream-1")
@@ -914,6 +915,9 @@ def pet_status(**changes: Any) -> dict:
         "app": "",
         "goal": "",
         "thought": "",
+        "requests": [],
+        "help": "",
+        "battery": None,
         "elapsed_minutes": 0,
         "max_minutes": 15,
         "today": {"sessions": 2},
@@ -971,7 +975,7 @@ async def test_desktop_pet_button_can_be_hidden(tmp_path):
         (
             True,
             {"ready": True, "visible": True},
-            ["拿起手机：打开哔哩哔哩，刷若叶睦的视频", "放下手机：看了两只小猫，软乎乎的"],
+            ["拿起手机：打开哔哩哔哩，刷若叶睦的视频", "放下手机：看了两只小猫"],
         ),
         # 桌宠没开、还没就绪：跳过，不报错
         (True, {"ready": False, "visible": False}, []),
@@ -989,8 +993,8 @@ async def test_desktop_pet_bubbles(tmp_path, monkeypatch, bubbles, pet_status, e
     try:
         await command(plugin, "/手机 开始")
         await asyncio.wait_for(plugin.agent._task, 5)
-        while plugin.agent._pet_tasks:
-            await asyncio.wait(set(plugin.agent._pet_tasks))
+        while plugin.agent._side_tasks:
+            await asyncio.wait(set(plugin.agent._side_tasks))
         assert [call.args[0] for call in plugin.ctx.desktop_pet.say.await_args_list] == expected
     finally:
         await plugin.on_unload()
@@ -1006,8 +1010,8 @@ async def test_desktop_pet_button_refreshes_as_she_plays(tmp_path, monkeypatch, 
     try:
         await command(plugin, "/手机 开始")
         await asyncio.wait_for(plugin.agent._task, 5)
-        while plugin.agent._pet_tasks:
-            await asyncio.wait(set(plugin.agent._pet_tasks))
+        while plugin.agent._side_tasks:
+            await asyncio.wait(set(plugin.agent._side_tasks))
         # 拿起手机、打开应用、放下手机各刷新一次；按钮关掉了就不去打扰宿主
         assert plugin.ctx.desktop_pet.refresh_buttons.await_count == refreshes
     finally:
@@ -1106,5 +1110,352 @@ async def test_weekly_report_command_renders_a_card_and_sends_it(tmp_path, monke
         plugin.ctx.render.html2png = disabled
         reply = await command(plugin, "/手机 周报")
         assert reply.startswith("周报图没生成出来：[E_CAPABILITY_FAILED] 浏览器渲染未启用")
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.parametrize(
+    "style,report,expected",
+    [
+        ("natural", True, "proactive"),
+        ("template", True, "📱 小睦：「放春日影」做到了（画面上在播放）"),
+        ("natural", False, None),
+        ("off", True, None),
+    ],
+)
+async def test_she_reports_back_when_a_request_is_done(tmp_path, style, report, expected):
+    plugin = make_plugin(tmp_path, play={"finish_notice": style, "report_requests": report})
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    request = PhoneRequest(id=1, text="放春日影", status="done", note="画面上在播放")
+    await plugin._notify_request(request, "stream-1")
+    if expected == "proactive":
+        stream, intent = plugin.ctx.maisaka.proactive.trigger.await_args.args
+        assert stream == "stream-1" and "「放春日影」" in intent and "已经做到了" in intent and "画面上在播放" in intent
+        plugin.ctx.send.text.assert_not_awaited()
+    elif expected:
+        plugin.ctx.send.text.assert_awaited_once_with(expected, "stream-1")
+    else:
+        plugin.ctx.maisaka.proactive.trigger.assert_not_awaited()
+        plugin.ctx.send.text.assert_not_awaited()
+
+
+def test_desktop_pet_panel_shows_what_you_asked_her_to_do():
+    playing = pet_status(
+        state="playing",
+        state_label="正在玩",
+        app="网易云音乐",
+        goal="随便听听歌",
+        requests=[
+            {"id": 1, "text": "退出房间", "status": "done", "label": "做到了", "note": ""},
+            {"id": 2, "text": "放一首春日影", "status": "doing", "label": "在做", "note": ""},
+        ],
+        devices=[{"name": "iPhone"}],
+    )
+    assert plugin_module._pet_panel_lines(playing)[1] == "你让她：放一首春日影"
+
+
+@pytest.mark.parametrize(
+    "report,expected", [(True, ["「切回春日影听完」做到了（已经播完一轮）"]), (False, ["放上了", "播完一轮"])]
+)
+async def test_finish_notice_tells_results_she_has_not_told_yet(tmp_path, report, expected):
+    plugin = make_plugin(tmp_path, play={"report_requests": report})
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    record = SessionRecord(
+        started_at="2026-11-14T01:26:41",
+        ended_at="2026-11-14T01:39:43",
+        trigger="聊天中决定",
+        app="网易云音乐",
+        goal="听安静的歌",
+        summary="春日影还是很温柔",
+        steps=56,
+        end_reason="自己不想玩了",
+        requests=[
+            {"id": 1, "text": "放春日影", "status": "done", "label": "做到了", "note": "放上了", "reported": True},
+            {
+                "id": 2,
+                "text": "切回春日影听完",
+                "status": "done",
+                "label": "做到了",
+                "note": "已经播完一轮",
+                "reported": False,
+            },
+        ],
+    )
+    await plugin._notify_finished(record, "stream-1")
+    intent = plugin.ctx.maisaka.proactive.trigger.await_args.args[1]
+    for text in expected:
+        assert text in intent
+    if report:
+        # 已经单独说过的不再说一遍
+        assert "放上了" not in intent
+
+
+def test_desktop_pet_shows_when_she_needs_help():
+    waiting = pet_status(state="playing", state_label="正在玩", app="小红书", help="小红书要重新登录才能看笔记")
+    assert plugin_module._pet_panel_lines(waiting) == [
+        "🙋 等你帮忙：小红书要重新登录才能看笔记",
+        "点「我来操作」弄好，再点「交还控制」",
+    ]
+    assert plugin_module._pet_actions(waiting) == ["takeover", "stop", "refresh"]
+
+
+@pytest.mark.parametrize("style", ["natural", "template", "off"])
+async def test_she_asks_for_help_in_the_chat(tmp_path, style):
+    plugin = make_plugin(tmp_path, play={"finish_notice": style})
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    await plugin._notify_help("小红书要重新登录才能看笔记", "stream-1")
+    if style == "natural":
+        intent = plugin.ctx.maisaka.proactive.trigger.await_args.args[1]
+        assert "小红书要重新登录才能看笔记" in intent and "/手机 接管" in intent and "密码" in intent
+    elif style == "template":
+        plugin.ctx.send.text.assert_awaited_once_with(
+            "📱 小睦需要你帮忙：小红书要重新登录才能看笔记\n发 /手机 接管，在手机上处理好后发 /手机 交还", "stream-1"
+        )
+    else:
+        plugin.ctx.maisaka.proactive.trigger.assert_not_awaited()
+        plugin.ctx.send.text.assert_not_awaited()
+
+
+async def test_desktop_pet_button_says_she_is_waiting_for_help(tmp_path):
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        plugin.agent.status = lambda: pet_status(state="playing", help="要滑块验证")
+        assert (await plugin.get_desktop_pet_button_states())["phone"].text == "等你帮忙"
+    finally:
+        await plugin.on_unload()
+
+
+async def test_finish_notice_has_no_doubled_punctuation(tmp_path):
+    plugin = make_plugin(tmp_path)
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    record = SessionRecord(
+        started_at="2026-11-14T01:53:27",
+        ended_at="2026-11-14T02:03:27",
+        trigger="聊天中决定",
+        app="番茄小说",
+        goal="在番茄小说里搜《反转练习生》，找到后看几话。",
+        summary="看了好几话，剧情还挺有意思。",
+        steps=20,
+        end_reason="自己不想玩了",
+    )
+    await plugin._notify_finished(record, "stream-1")
+    intent = plugin.ctx.maisaka.proactive.trigger.await_args.args[1]
+    assert "这次在番茄小说里搜《反转练习生》，找到后看几话，你玩够了自己放下的。" in intent
+    assert "玩的时候的感受：看了好几话，剧情还挺有意思。" in intent
+    assert "。，" not in intent and "。。" not in intent
+
+
+async def test_she_remembers_what_you_ask_her_to_watch_later(tmp_path):
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        added = await plugin.tool_remember_for_phone(note="《迷途之子》第三话", later=True, app="B站")
+        assert added["success"] and "现在还没看，别说已经看了" in added["content"]
+        later = [item for item in plugin._memory.items() if item.kind == "later"]
+        assert [(item.title, item.app, item.watch_state()) for item in later] == [
+            ("《迷途之子》第三话", "B站", "还没看")
+        ]
+        # WebUI「她记得的」里能看到
+        listed = await plugin.webui_memory()
+        assert listed["items"][0]["kind"] == "later" and listed["items"][0]["watch_state"] == "还没看"
+        assert (await plugin.tool_remember_for_phone(note="《迷途之子》第三话", cancel=True))["success"]
+        assert later[0].watch_state() == "不用看了"
+        missing = await plugin.tool_remember_for_phone(note="春日影", cancel=True)
+        assert missing["success"] is False and "没找到" in missing["error"]
+        # 不填 later 照旧是记兴趣
+        await plugin.tool_remember_for_phone(note="对方喜欢看种田小说")
+        assert any(item.kind == "interest" for item in plugin._memory.items())
+    finally:
+        await plugin.on_unload()
+
+
+async def test_finish_notice_mentions_what_you_asked_her_to_watch(tmp_path):
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+        memory = plugin._memory
+        before = datetime(2026, 11, 14, 1, 0)
+        during = datetime(2026, 11, 14, 2, 10)
+        memory.add_later("迷途之子 第3话", "", before)
+        memory.add_later("春日影", "", before)
+        memory.remember_watched(Seen("video", "【MyGO】迷途之子 第3话", finished=True), "哔哩哔哩", "long", during)
+        record = SessionRecord(
+            started_at="2026-11-14T02:00:00",
+            ended_at="2026-11-14T02:20:00",
+            trigger="自己想玩",
+            app="哔哩哔哩",
+            goal="看对方推荐的迷途之子",
+            summary="第三话好虐",
+            steps=30,
+            end_reason="自己不想玩了",
+        )
+        await plugin._notify_finished(record, "stream-1")
+        intent = plugin.ctx.maisaka.proactive.trigger.await_args.args[1]
+        assert "对方之前让你有空看的，这次迷途之子 第3话看完了，可以顺便提一句。" in intent
+        # 这次没看的不提
+        assert "春日影" not in intent
+    finally:
+        await plugin.on_unload()
+
+
+@pytest.mark.parametrize("style", ["natural", "template", "off"])
+async def test_finish_notice_shows_the_moment_she_wanted_you_to_see(tmp_path, style):
+    plugin = make_plugin(tmp_path, play={"finish_notice": style})
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    record = SessionRecord(
+        started_at="2026-11-14T11:00:00",
+        ended_at="2026-11-14T11:10:00",
+        trigger="聊天中决定",
+        app="哔哩哔哩",
+        goal="看猫猫视频",
+        summary="看了好几只猫",
+        steps=10,
+        end_reason="自己不想玩了",
+        moment="这只猫在踩奶！太可爱了",
+    )
+    await plugin._notify_finished(record, "stream-1", b"\xff\xd8jpeg")
+    if style == "off":
+        plugin.ctx.send.image.assert_not_awaited()
+        return
+    plugin.ctx.send.image.assert_awaited_once_with(base64.b64encode(b"\xff\xd8jpeg").decode(), "stream-1")
+    if style == "natural":
+        intent = plugin.ctx.maisaka.proactive.trigger.await_args.args[1]
+        assert "你当时想：这只猫在踩奶！太可爱了" in intent and "你看这个" in intent
+    else:
+        assert "📷 这只猫在踩奶！太可爱了" in plugin.ctx.send.text.await_args.args[0]
+
+
+async def test_finish_notice_does_not_mention_a_moment_that_was_not_sent(tmp_path):
+    plugin = make_plugin(tmp_path)
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    plugin.ctx.send.image = AsyncMock(return_value=False)
+    record = SessionRecord(
+        started_at="2026-11-14T11:00:00",
+        ended_at="2026-11-14T11:10:00",
+        trigger="聊天中决定",
+        app="哔哩哔哩",
+        goal="看猫猫视频",
+        summary="看了好几只猫",
+        steps=10,
+        end_reason="自己不想玩了",
+        moment="这只猫在踩奶",
+    )
+    await plugin._notify_finished(record, "stream-1", b"\xff\xd8jpeg")
+    assert "你看这个" not in plugin.ctx.maisaka.proactive.trigger.await_args.args[1]
+
+
+@pytest.mark.parametrize("user_id,expected", [("10001", True), ("20002", False)])
+async def test_moments_are_only_shown_to_people_who_can_see_her_screen(tmp_path, monkeypatch, user_id, expected):
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    plugin = make_plugin(tmp_path)
+    wire_llm(plugin, [json.dumps({"action": "finish", "summary": "看完了"}, ensure_ascii=False)])
+    await plugin.on_load()
+    plugin.agent._sleep = fast_sleep
+    try:
+        started = plugin.agent.start
+
+        seen: List[bool] = []
+
+        async def start(**kwargs):
+            seen.append(kwargs["share_moments"])
+            await started(**kwargs)
+
+        plugin.agent.start = start
+        await plugin.tool_play_phone(goal="看猫", stream_id="stream-1", user_id=user_id)
+        assert seen == [expected]
+    finally:
+        await plugin.on_unload()
+
+
+def test_battery_shows_up_in_the_pet_panel_and_status_words():
+    battery = {"level": 15, "charging": False, "low": True, "checked_at": "12:30"}
+    assert plugin_module._pet_panel_lines(pet_status(battery=battery, history=[]))[0] == (
+        "空闲 · iPhone · 今天玩了 2 次 · 🔋15%"
+    )
+    assert plugin_module._battery_text(battery) == "15%（快没电了，没插电，12:30 看的）"
+    charging = {"level": 80, "charging": True, "low": False, "checked_at": "12:30"}
+    assert plugin_module._battery_text(charging) == "80%（充电中，12:30 看的）"
+    assert plugin_module._finish_reason_text("手机快没电了（剩 15%），先放下充会儿电") == "手机快没电了，先放下充电"
+
+
+@pytest.mark.parametrize("style", ["natural", "template", "off"])
+async def test_she_asks_the_owner_to_charge_the_phone(tmp_path, style):
+    from phone_play.devices import Battery
+
+    plugin = make_plugin(tmp_path, play={"finish_notice": style})
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    plugin.ctx.chat.get_stream_by_user_id = AsyncMock(return_value={"session_id": "owner-stream"})
+    plugin.ctx.desktop_pet.status = AsyncMock(return_value={"ready": True, "visible": True})
+    plugin.ctx.desktop_pet.say = AsyncMock(return_value={"ready": True})
+    await plugin._ask_to_charge(Battery(level=12, charging=False))
+    plugin.ctx.desktop_pet.say.assert_awaited_once_with("🔌 手机快没电了（剩 12%），能帮我充一下电吗？")
+    if style == "natural":
+        plugin.ctx.chat.get_stream_by_user_id.assert_awaited_once_with("10001")
+        stream, intent = plugin.ctx.maisaka.proactive.trigger.await_args.args
+        assert stream == "owner-stream" and "只剩 12%" in intent and "充上电" in intent
+    elif style == "template":
+        plugin.ctx.send.text.assert_awaited_once_with(
+            "📱 小睦：手机快没电了（剩 12%），能帮我充一下电吗？", "owner-stream"
+        )
+    else:
+        plugin.ctx.chat.get_stream_by_user_id.assert_not_awaited()
+        plugin.ctx.maisaka.proactive.trigger.assert_not_awaited()
+
+
+async def test_asking_to_charge_without_an_owner_chat_only_uses_the_pet(tmp_path):
+    from phone_play.devices import Battery
+
+    plugin = make_plugin(tmp_path)
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    plugin.ctx.chat.get_stream_by_user_id = AsyncMock(return_value=None)
+    await plugin._ask_to_charge(Battery(level=12, charging=False))
+    plugin.ctx.maisaka.proactive.trigger.assert_not_awaited()
+
+    plugin = make_plugin(tmp_path, plugin={"admin_user_ids": []})
+    plugin.ctx.chat.get_stream_by_user_id = AsyncMock(return_value={"session_id": "x"})
+    await plugin._ask_to_charge(Battery(level=12, charging=False))
+    plugin.ctx.chat.get_stream_by_user_id.assert_not_awaited()
+
+
+async def test_asking_to_charge_does_not_make_up_what_she_was_doing(tmp_path):
+    from phone_play.devices import Battery
+
+    plugin = make_plugin(tmp_path)
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    plugin.ctx.chat.get_stream_by_user_id = AsyncMock(return_value={"session_id": "owner-stream"})
+    await plugin._ask_to_charge(Battery(level=3, charging=False))
+    intent = plugin.ctx.maisaka.proactive.trigger.await_args.args[1]
+    # 实测她添了一句「刚看完视频」，其实还没开始玩
+    assert "还没开始" in intent and "别编刚才在手机上做了什么" in intent
+
+
+async def test_black_screenshots_are_not_sent_to_chat_or_the_pet(tmp_path, monkeypatch):
+    from io import BytesIO
+
+    from phone_play.agent import ScreenDark
+
+    device = FakeDevice()
+    buffer = BytesIO()
+    Image.new("RGB", (540, 1200), "black").save(buffer, "PNG")
+    device.png = buffer.getvalue()
+
+    async def screen_off():
+        return False
+
+    device.screen_viewable = screen_off
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: device)
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        reply = await command(plugin, "/手机截图")
+        assert reply.startswith("没发截图：手机屏幕关着") and "没在玩手机" in reply
+        plugin.ctx.send.image.assert_not_awaited()
+        tool = await plugin.tool_show_phone_screen(user_id="10001")
+        assert tool["success"] is False and "照实跟对方说屏幕黑着" in tool["error"]
+        panel = await plugin.get_desktop_pet_panel("phone")
+        assert panel["image"] is None and "📴 手机屏幕关着" in panel["text"]
+        assert issubclass(ScreenDark, Exception)
     finally:
         await plugin.on_unload()

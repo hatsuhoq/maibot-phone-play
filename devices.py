@@ -117,6 +117,14 @@ class Foreground:
     unsupported: bool = False
 
 
+@dataclass(frozen=True)
+class Battery:
+    """手机电量：百分比和是不是插着电（充电中或已充满）。读不到时不造一个出来，用 None 表示不知道。"""
+
+    level: int
+    charging: bool
+
+
 class AppNotInstalledError(DeviceError):
     """要打开的应用没有安装在手机上（iPhone 只有打开时才知道）。"""
 
@@ -191,6 +199,14 @@ class PhoneDevice(ABC):
 
     async def focused_input_text(self) -> Optional[str]:
         """当前获得焦点的输入框里的文字；没有点开输入框时是空字符串，这台设备查不了时返回 None。"""
+        return None
+
+    async def battery(self) -> Optional[Battery]:
+        """电量；这台设备查不了、系统没给出时返回 None（不当成 0%）。不点亮屏幕、不解锁。"""
+        return None
+
+    async def screen_viewable(self) -> Optional[bool]:
+        """屏幕亮着又没锁、截图看得到内容；熄屏或锁着是 False，这台设备查不了是 None。不点亮、不解锁。"""
         return None
 
     # 能不能锁屏、自动解锁：iPhone 和安卓真机支持，模拟器不查锁屏、也不锁屏
@@ -284,6 +300,22 @@ def _network_target(serial: str) -> Optional[Tuple[str, str]]:
     if _BARE_IP_SERIAL.match(serial):
         return serial, ""
     return None
+
+
+def parse_android_battery(text: str) -> Optional[Battery]:
+    """解析 ``dumpsys battery``：level / scale 算百分比；插着交流电、USB、无线充电，或者 status 是充电中（2）、
+    已充满（5）都算插着电。没有 level 时返回 None。"""
+    fields: Dict[str, str] = {}
+    for line in text.splitlines():
+        key, sep, value = line.partition(":")
+        if sep:
+            fields[key.strip().lower()] = value.strip().lower()
+    level, scale = fields.get("level", ""), fields.get("scale", "100")
+    if not level.isdigit():
+        return None
+    percent = round(int(level) * 100 / int(scale)) if scale.isdigit() and int(scale) > 0 else int(level)
+    powered = any(fields.get(f"{source} powered") == "true" for source in ("ac", "usb", "wireless", "dock"))
+    return Battery(level=max(0, min(100, percent)), charging=powered or fields.get("status") in ("2", "5"))
 
 
 def parse_android_lock(text: str) -> Tuple[Optional[bool], Optional[bool]]:
@@ -543,6 +575,15 @@ class AdbDevice(PhoneDevice):
             if self._is_locked(await self._lock_state()):
                 return True
         return False
+
+    async def battery(self) -> Optional[Battery]:
+        return parse_android_battery(await self._shell("dumpsys battery"))
+
+    async def screen_viewable(self) -> Optional[bool]:
+        awake, locked = await self._lock_state()
+        if awake is False or locked is True:
+            return False
+        return True if awake and locked is False else None
 
     async def ui_elements(self, width: int, height: int, limit: int) -> List[UIElement]:
         output = await self._shell(f"uiautomator dump {_UI_DUMP_PATH}", timeout=max(self._timeout, 15.0))
@@ -831,6 +872,14 @@ class WdaDevice(PhoneDevice):
         value = await self._session_request("GET", f"/element/{element_id}/attribute/value")
         return str(value or "")
 
+    async def screen_viewable(self) -> Optional[bool]:
+        """锁着就是看不到；没锁时当作亮着（屏幕关着却没锁的少见情况由 unlock_if_locked 点亮）。"""
+        return not await self._request("GET", "/wda/locked")
+
+    async def battery(self) -> Optional[Battery]:
+        """WDA 的 batteryInfo：level 是 0~1（读不到是负数），state 1 没插电、2 充电中、3 已充满、0 不知道。"""
+        return parse_wda_battery(await self._session_request("GET", "/wda/batteryInfo"))
+
     async def close(self) -> None:
         if self._client is not None:
             await self._client.aclose()
@@ -845,6 +894,16 @@ class WdaDevice(PhoneDevice):
             return await asyncio.to_thread(parse_wda_xml, xml_text, width, height, scale, limit)
         except ValueError as exc:
             raise DeviceError(str(exc)) from exc
+
+
+def parse_wda_battery(value: Any) -> Optional[Battery]:
+    """解析 WDA 的 batteryInfo；level 不是 0~1 的数（模拟器、读不到时是 -1）返回 None。"""
+    if not isinstance(value, dict):
+        return None
+    level, state = value.get("level"), value.get("state")
+    if isinstance(level, bool) or not isinstance(level, (int, float)) or not 0 <= level <= 1:
+        return None
+    return Battery(level=round(level * 100), charging=state in (2, 3))
 
 
 def create_device(settings: DeviceSettings) -> PhoneDevice:

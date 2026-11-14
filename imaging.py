@@ -17,6 +17,11 @@ _MIN_JPEG_QUALITY = 30
 _SIGNATURE_SIZE = (24, 24)
 # 屏幕关着时截图是纯黑的（实测 iPhone 每个像素都是 0），留一点余量
 _DARK_MAX = 8
+# 几乎全黑：缩小后比这个亮的像素不到这么多。实测 OPPO 熄屏时截出来是黑的，只有状态栏一条红色电量边，
+# 最亮的像素并不暗，按「最亮的像素」认不出来
+_MOSTLY_DARK_SIZE = (60, 130)
+_MOSTLY_DARK_LEVEL = 40
+_MOSTLY_DARK_SHARE = 0.03
 
 
 def open_image(data: bytes) -> Image.Image:
@@ -29,6 +34,16 @@ def is_dark_screen(data: bytes) -> bool:
     """截图是不是全黑（屏幕关着）：亮着的屏幕至少有状态栏的时间、电量，最亮的像素不会这么暗。"""
     with Image.open(BytesIO(data)) as image:
         return image.convert("L").getextrema()[1] <= _DARK_MAX
+
+
+def mostly_dark(image: Image.Image) -> bool:
+    """截图几乎全黑：亮的地方不到 3%（熄屏、锁屏时的黑图，顶多剩状态栏一点点）。
+
+    深色模式的页面、视频黑场也可能算进来，所以只当作「可能是屏幕关着」，要不要当真还得问手机屏幕的状态。
+    """
+    small = image.convert("L").resize(_MOSTLY_DARK_SIZE)
+    bright = sum(small.point(lambda value: 255 if value > _MOSTLY_DARK_LEVEL else 0).histogram()[255:])
+    return bright <= _MOSTLY_DARK_SHARE * _MOSTLY_DARK_SIZE[0] * _MOSTLY_DARK_SIZE[1]
 
 
 def screen_signature(image: Image.Image) -> bytes:

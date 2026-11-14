@@ -416,3 +416,37 @@ async def test_android_lock_turns_the_screen_off_and_checks():
     device, _, slept = make_lock_device([lock_state("Awake", "false")])
     assert await device.lock() is False
     assert len(slept) == 4
+
+
+def test_battery_is_read_from_dumpsys_and_wda_without_guessing():
+    from phone_play.devices import Battery, parse_android_battery, parse_wda_battery
+
+    unplugged = (
+        "Current Battery Service state:\n  AC powered: false\n  USB powered: false\n"
+        "  status: 3\n  level: 15\n  scale: 100\n"
+    )
+    assert parse_android_battery(unplugged) == Battery(level=15, charging=False)
+    assert parse_android_battery(unplugged.replace("USB powered: false", "USB powered: true")).charging
+    assert parse_android_battery("  status: 5\n  level: 100\n  scale: 100\n") == Battery(level=100, charging=True)
+    assert parse_android_battery("  level: 30\n  scale: 50\n").level == 60
+    # 没有 level 就是不知道，不当成 0%
+    assert parse_android_battery("Can't find service: battery") is None
+    # 实测 iPhone 14 插着线：{"level": 1, "state": 2}
+    assert parse_wda_battery({"level": 1, "state": 2}) == Battery(level=100, charging=True)
+    assert parse_wda_battery({"level": 0.42, "state": 1}) == Battery(level=42, charging=False)
+    assert parse_wda_battery({"level": -1, "state": 0}) is None
+    assert parse_wda_battery(None) is None
+
+
+@pytest.mark.parametrize(
+    "state,expected",
+    [((False, None), False), ((True, True), False), ((True, False), True), ((None, None), None), ((True, None), None)],
+)
+async def test_android_screen_viewable_follows_wakefulness_and_keyguard(state, expected):
+    device = AdbDevice(DeviceSettings(serial="emulator-5554"))
+
+    async def lock_state():
+        return state
+
+    device._lock_state = lock_state
+    assert await device.screen_viewable() is expected

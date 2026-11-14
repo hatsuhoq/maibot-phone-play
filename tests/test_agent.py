@@ -16,6 +16,7 @@ from phone_play.agent import (
     PlayRefused,
     Session,
     SwitchRefused,
+    _first_clause,
     in_active_hours,
     match_device,
 )
@@ -59,6 +60,7 @@ class Harness:
         self.vision_messages: List[List[Dict[str, Any]]] = []
         self.plan_prompts: List[str] = []
         self.notified: List[tuple] = []
+        self.moments: List[Optional[bytes]] = []
         # announce=True 时接上假的桌宠气泡：记下说了什么，announce_error 不为空时抛出
         self.announced: List[str] = []
         self.events: List[str] = []
@@ -103,8 +105,8 @@ class Harness:
 
     async def settle(self) -> None:
         """等后台的气泡说完、按钮刷新完。"""
-        while self.agent._pet_tasks:
-            await asyncio.wait(set(self.agent._pet_tasks))
+        while self.agent._side_tasks:
+            await asyncio.wait(set(self.agent._side_tasks))
 
     async def share(self, record: SessionRecord) -> str:
         if self.share_error is not None:
@@ -123,8 +125,9 @@ class Harness:
     async def persona(self) -> Persona:
         return Persona(nickname="小睦", personality="安静的猫娘")
 
-    async def notifier(self, record: SessionRecord, stream_id: str) -> None:
+    async def notifier(self, record: SessionRecord, stream_id: str, moment: Optional[bytes] = None) -> None:
         self.notified.append((record, stream_id))
+        self.moments.append(moment)
 
     async def fake_sleep(self, seconds: float) -> None:
         self.seconds += seconds
@@ -875,7 +878,8 @@ async def test_she_says_when_she_picks_up_and_puts_down_the_phone(tmp_path):
     )
     record = await harness.run(trigger="pet")
     await harness.settle()
-    assert harness.announced == ["拿起手机：打开哔哩哔哩，看猫猫视频", f"放下手机：{record.summary}"]
+    # 气泡只说第一小句：她的感想「看了三只橘猫，圆滚滚的好可爱」只冒前半句
+    assert harness.announced == ["拿起手机：打开哔哩哔哩，看猫猫视频", "放下手机：看了三只橘猫"]
     # 拿起手机打个招呼，玩够了放下时高兴一下
     assert harness.events == ["greeting", "happy"]
     assert record.trigger == "桌宠"
@@ -898,7 +902,8 @@ async def test_slacking_off_is_announced_as_such_and_long_thoughts_are_cut(tmp_p
     record = harness.store.history[-1]
     assert len(record.summary) > 80
     assert harness.announced[0] == "偷偷摸鱼：打开哔哩哔哩，看猫猫视频"
-    assert harness.announced[1] == "放下手机：" + record.summary[:79] + "…"
+    # 拼出来很长的感想只冒第一小句
+    assert harness.announced[1] == "放下手机：看完了"
 
 
 async def test_a_failing_bubble_does_not_get_in_her_way(tmp_path, caplog):
@@ -954,13 +959,13 @@ async def test_her_thoughts_pop_up_while_she_plays(tmp_path):
         announce=True,
         refresh=True,
     )
-    record = await harness.run()
+    await harness.run()
     await harness.settle()
     assert harness.announced == [
         "拿起手机：打开哔哩哔哩，看猫猫视频",
         "💭 橘猫踩奶的图好可爱",
-        "💭 这篇讲猫咪运动康复，有点学术",
-        f"放下手机：{record.summary}",
+        "💭 这篇讲猫咪运动康复",
+        "放下手机：看完了",
     ]
     # 开始、打开应用、三步各一次、放下手机：按钮跟着刷新
     assert harness.refreshes == 6
@@ -1487,13 +1492,15 @@ async def test_new_request_wakes_the_session_while_it_is_watching(tmp_path):
     assert not nap.done()
     assert agent.add_request("点准备")
     await asyncio.wait_for(nap, 1)
-    assert agent._session.requests == ["点准备"]
+    assert [(request.id, request.text, request.status) for request in agent._session.requests] == [
+        (1, "点准备", "waiting")
+    ]
 
 
 async def test_chat_context_only_for_the_chat_that_started_and_not_long_after(tmp_path):
     harness = Harness(tmp_path, FakeDevice(), [action(action="finish", summary="看了两只猫，好圆")])
     assert harness.agent.chat_context("s") == ""
-    assert harness.agent.add_request("换一个") is False
+    assert harness.agent.add_request("换一个") is None
     await harness.run(origin_stream="s")
     assert harness.agent.chat_context("s").startswith("【手机上的实际情况】现在没在玩手机。")
     assert harness.agent.chat_context("other") == ""
@@ -1693,8 +1700,8 @@ async def test_earlier_requests_stay_visible_after_history_scrolls(tmp_path):
 
     harness.agent._vision = vision
     await harness.run()
-    assert "对方刚在聊天里让你：退出房间，再打一局" in harness.state_texts()[1]
-    assert "对方这次在聊天里提过：退出房间，再打一局。还没做完的接着做" in harness.state_texts()[3]
+    assert "对方刚在聊天里让你：#1 退出房间，再打一局" in harness.state_texts()[1]
+    assert "对方交给你、还没有结果的事：#1 退出房间，再打一局。接着做" in harness.state_texts()[3]
 
 
 async def test_cancelled_save_never_overwrites_newer_data(tmp_path):
@@ -2525,16 +2532,21 @@ async def test_videos_she_watched_are_not_opened_again(tmp_path):
         [
             action(action="tap", element=1, summary="点开春日影"),
             action(action="wait", seconds=40, video="long", seen=kitten_seen()),
-            # 同一个视频，她这次写的标题少了括号：接着看，不拦
-            action(action="wait", seconds=60, video="long", seen=kitten_seen("要乐奈唱春日影 吉他弹唱")),
+            # 同一个视频，她这次写的标题少了括号：接着看，不拦；这次看到了结尾
+            action(
+                action="wait",
+                seconds=60,
+                video="long",
+                seen={**kitten_seen("要乐奈唱春日影 吉他弹唱"), "progress": "finished"},
+            ),
             action(action="finish", summary="听完了春日影"),
         ],
     )
     harness.agent._memory = memory
     await harness.run()
     watched = [item for item in memory.items() if item.kind == "watched"]
-    assert [(item.title, item.form, item.seconds, item.app) for item in watched] == [
-        ("【要乐奈】唱春日影 吉他弹唱", "long", 100, "哔哩哔哩")
+    assert [(item.title, item.form, item.seconds, item.app, item.progress) for item in watched] == [
+        ("【要乐奈】唱春日影 吉他弹唱", "long", 100, "哔哩哔哩", "finished")
     ]
     assert "正在看：《【要乐奈】唱春日影 吉他弹唱》（长视频），已经看了约 2 分钟" in harness.state_texts()[3]
     # 视频不再记成「看过的内容」，规划只在最后一行提一下
@@ -2614,7 +2626,7 @@ async def test_long_video_titles_are_kept_and_shortened_in_the_list(tmp_path):
         tmp_path,
         FakeDevice(),
         [
-            action(action="wait", seconds=20, video="long", seen=kitten_seen(title)),
+            action(action="wait", seconds=20, video="long", seen={**kitten_seen(title), "progress": "finished"}),
             action(action="finish", summary="看了预告"),
         ],
     )
@@ -2891,3 +2903,629 @@ async def test_device_label_names_the_device_once(tmp_path):
     await harness.agent.switch_device("iPhone")
     harness.agent._get_device()
     assert harness.agent.status()["device"] == "iPhone · url"
+
+
+async def test_her_requests_are_tracked_until_she_sees_them_done(tmp_path):
+    notified: List[Tuple[int, str, str, str]] = []
+
+    async def notify(request, stream_id: str) -> None:
+        notified.append((request.id, request.status, request.note, stream_id))
+
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [
+            action(action="wait", seconds=1),
+            # 点了一下还不算做到，接着做
+            action(action="tap", x=500, y=500, summary="点播放"),
+            action(action="wait", seconds=1, request={"id": 1, "result": "done", "note": "画面上在播放春日影"}),
+            # 已经有结果的要求再说一遍不算数
+            action(action="wait", seconds=1, request={"id": 1, "result": "failed", "note": "找不到"}),
+            action(action="finish", summary="听了春日影"),
+        ],
+    )
+    harness.agent._request_notifier = notify
+    original = harness.vision
+
+    async def vision(messages):
+        if len(harness.vision_messages) == 0:
+            harness.agent.add_request("放春日影")
+        return await original(messages)
+
+    harness.agent._vision = vision
+    record = await harness.run(origin_stream="s")
+    await harness.settle()
+    assert record.requests == [
+        {
+            "id": 1,
+            "text": "放春日影",
+            "status": "done",
+            "label": "做到了",
+            "note": "画面上在播放春日影",
+            "reported": True,
+        }
+    ]
+    assert notified == [(1, "done", "画面上在播放春日影", "s")]
+    systems = [messages[0]["content"] for messages in harness.vision_messages]
+    # 有要求时才讲怎么回报，没要求的那几步不多占 token
+    assert '"request"' not in systems[0] and '"request"' in systems[1] and '"request"' not in systems[3]
+    states = harness.state_texts()
+    assert "对方刚在聊天里让你：#1 放春日影" in states[1]
+    assert "对方交给你、还没有结果的事：#1 放春日影" in states[2]
+    assert "放春日影" not in states[3].split("最近的操作")[0]
+    assert "对方的要求做到了：放春日影" in [log["summary"] for log in harness.agent.status()["logs"]]
+    assert "那次对方交给你的事：「放春日影」做到了。" in harness.agent.activity_text()
+
+
+async def test_replaced_and_unfinished_requests_and_late_results(tmp_path):
+    notified: List[int] = []
+
+    async def notify(request, stream_id: str) -> None:
+        notified.append(request.id)
+
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [
+            action(action="wait", seconds=1),
+            # 想这一步的时候对方改主意了：这个「做到了」是晚到的，不算数
+            action(action="wait", seconds=1, request={"id": 1, "result": "done", "note": "退出了"}),
+            action(action="finish", summary="不玩了"),
+        ],
+    )
+    harness.agent._request_notifier = notify
+    original = harness.vision
+
+    async def vision(messages):
+        if len(harness.vision_messages) == 0:
+            harness.agent.add_request("退出房间")
+        elif len(harness.vision_messages) == 1:
+            status = harness.agent.status()["requests"]
+            assert [(item["text"], item["label"]) for item in status] == [("退出房间", "在做")]
+            # 玩的时候聊天这边看得到要求走到哪了
+            assert "对方交给你的事：「退出房间」在做。" in harness.agent.activity_text()
+            harness.agent.add_request("再开一局", replace=True)
+        return await original(messages)
+
+    harness.agent._vision = vision
+    record = await harness.run(origin_stream="s")
+    await harness.settle()
+    assert [(item["text"], item["status"], item["note"]) for item in record.requests] == [
+        ("退出房间", "replaced", "换成了「再开一局」"),
+        ("再开一局", "unfinished", "自己不想玩了"),
+    ]
+    assert notified == []
+
+
+async def test_watch_time_counts_the_part_before_she_is_woken(tmp_path):
+    memory = MemoryStore(tmp_path / "memory.json")
+    item = memory.remember_watched(Seen("video", "要乐奈唱春日影"), "哔哩哔哩", "long", datetime.now())
+    harness = Harness(tmp_path, FakeDevice(), [])
+    agent = harness.agent
+    agent._memory = memory
+    agent._sleep = asyncio.sleep
+    agent._clock = time.monotonic
+    agent._session = Session(
+        trigger="chat", hint="", origin_stream="s", minutes_override=0, started_at=datetime.now(), started_clock=0.0
+    )
+    agent._session.watch_item = item.id
+    watching = asyncio.create_task(agent._watch_video(agent._session, 30, harness.device))
+    await asyncio.sleep(0.3)
+    agent.add_request("换一个")
+    await asyncio.wait_for(watching, 1)
+    # 以前叫醒前那一小段不算，看了 0.3 秒记成 0 秒
+    assert 0.2 < agent._session.watch_seconds < 1.0
+    assert item.progress == "opened" and item.seconds == 0
+    agent._session.requests.clear()
+    watching = asyncio.create_task(agent._watch_video(agent._session, 30, harness.device))
+    await asyncio.sleep(0.8)
+    agent.add_request("换一个")
+    await asyncio.wait_for(watching, 1)
+    assert item.progress == "partial" and item.seconds == 1
+
+
+async def test_she_goes_back_to_long_videos_she_only_watched_part_of(tmp_path):
+    memory = MemoryStore(tmp_path / "memory.json")
+    song = memory.remember_watched(Seen("video", "【要乐奈】唱春日影 吉他弹唱"), "哔哩哔哩", "long", datetime.now())
+    memory.add_watched_seconds(song.id, 100)
+    harness = Harness(
+        tmp_path,
+        FakeDevice(elements=[SONG_CARD, KITTEN_CARD]),
+        [action(action="tap", element=1, summary="接着看春日影"), action(action="finish", summary="看完了")],
+    )
+    harness.agent._memory = memory
+    await harness.run()
+    # 看了一部分的长视频不拦，还告诉她可以接着看
+    assert [call for call in harness.device.actions() if call[0] == "tap"] == [("tap", 135, 250)]
+    state = harness.state_texts()[0]
+    assert "上次只看了一部分的长视频，想看可以接着看：《【要乐奈】唱春日影 吉他弹唱》（看了一部分，约 2 分钟）" in state
+    assert "最近看过这些视频" not in state
+
+    # 不感兴趣的、看完了的就不再点
+    memory.remember_watched(
+        Seen("video", "【要乐奈】唱春日影 吉他弹唱", skipped=True), "哔哩哔哩", "long", datetime.now()
+    )
+    harness.device.calls.clear()
+    harness.responses = [action(action="tap", element=1, summary="点春日影"), action(action="finish", summary="不看了")]
+    await harness.run()
+    assert [call for call in harness.device.actions() if call[0] == "tap"] == []
+    assert "没点：《【要乐奈】唱春日影 吉他弹唱》" in harness.state_texts()[-1]
+
+
+def test_bubbles_only_say_the_first_clause():
+    assert _first_clause("这首前奏好温柔，像在耳边轻轻说话", 24) == "这首前奏好温柔"
+    assert (
+        _first_clause("找一份适合深夜助眠的安静慢歌歌单，挑没听过的温柔曲子", 16) == "找一份适合深夜助眠的安静慢歌歌单"
+    )
+    # 一整句没有标点：截到上限
+    assert _first_clause("猫" * 40, 24) == "猫" * 23 + "…"
+    assert _first_clause("，开头就是逗号", 24) == "，开头就是逗号"
+
+
+async def test_a_result_on_the_last_step_is_told_with_the_finish_notice(tmp_path):
+    notified: List[int] = []
+
+    async def notify(request, stream_id: str) -> None:
+        notified.append(request.id)
+
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [
+            action(action="wait", seconds=1),
+            # 实测她在放下手机那一步才回报「听完了」，结果连着冒了「做到了」和「玩完了」两段话
+            action(
+                action="finish", summary="听完了春日影", request={"id": 1, "result": "done", "note": "已经播完一轮。"}
+            ),
+        ],
+    )
+    harness.agent._request_notifier = notify
+    original = harness.vision
+
+    async def vision(messages):
+        if len(harness.vision_messages) == 0:
+            harness.agent.add_request("切回春日影听完")
+        return await original(messages)
+
+    harness.agent._vision = vision
+    record = await harness.run(origin_stream="s")
+    await harness.settle()
+    assert notified == []
+    # 依据句尾的标点去掉了，放进括号里不会出现「。）」
+    assert record.requests == [
+        {
+            "id": 1,
+            "text": "切回春日影听完",
+            "status": "done",
+            "label": "做到了",
+            "note": "已经播完一轮",
+            "reported": False,
+        }
+    ]
+
+
+def help_harness(tmp_path, responses: Sequence[str], **kwargs: Any) -> "Harness":
+    harness = Harness(tmp_path, FakeDevice(), responses, announce=True, **kwargs)
+    harness.helps: List[Tuple[str, str]] = []
+    return harness
+
+
+async def test_she_stops_and_waits_when_she_needs_your_help(tmp_path):
+    harness = help_harness(
+        tmp_path,
+        [
+            action(action="ask_help", text="小红书要重新登录才能看笔记", thought="要登录啊，我自己弄不了"),
+            action(action="finish", summary="登录好了，看了两篇笔记"),
+        ],
+    )
+    agent = harness.agent
+    steps_when_asked: List[int] = []
+
+    async def notify(text: str, stream_id: str) -> None:
+        harness.helps.append((text, stream_id))
+        steps_when_asked.append(len(harness.vision_messages))
+        # 她停着等：这期间不再问模型、不再操作手机
+        for _ in range(20):
+            await asyncio.sleep(0)
+        assert len(harness.vision_messages) == steps_when_asked[0]
+        assert agent.status()["help"] == "小红书要重新登录才能看笔记"
+        assert "正停下来等对方帮忙：小红书要重新登录才能看笔记" in agent.activity_text()
+        # 实测求助赶上她在回对方上一句，两件事并成一轮，她只说了「正往里点」：等帮忙时第一行就写清楚
+        context = agent.chat_context("s")
+        assert context.startswith(
+            "【手机上的实际情况】手机上的你卡住了，停下来等对方帮忙：小红书要重新登录才能看笔记。\n这一轮先请对方帮一下"
+        )
+        assert "别说还在点" in context
+        # 你接管、在手机上弄好、交还
+        assert agent.takeover() and agent.release()
+
+    agent._help_notifier = notify
+    record = await harness.run(origin_stream="s")
+    await harness.settle()
+    assert harness.helps == [("小红书要重新登录才能看笔记", "s")]
+    assert "🙋 帮我一下：小红书要重新登录才能看笔记" in harness.announced
+    assert record.end_reason == "自己不想玩了" and len(harness.vision_messages) == 2
+    summaries = [log["summary"] for log in agent.status()["logs"]]
+    assert "帮好了，她看看现在的画面接着玩" in summaries
+
+
+async def test_a_new_request_in_chat_also_ends_the_wait(tmp_path):
+    harness = help_harness(
+        tmp_path,
+        [
+            action(action="ask_help", text="要滑块验证"),
+            action(action="finish", summary="换了个视频看"),
+        ],
+    )
+
+    async def notify(text: str, stream_id: str) -> None:
+        harness.agent.add_request("不用管它了，换个视频看")
+
+    harness.agent._help_notifier = notify
+    record = await harness.run(origin_stream="s")
+    assert record.end_reason == "自己不想玩了"
+    assert "对方刚在聊天里让你：#1 不用管它了，换个视频看" in harness.state_texts()[1]
+
+
+async def test_she_gives_up_when_nobody_comes_to_help(tmp_path):
+    config = PhonePlayConfig()
+    config.play.help_wait_minutes = 1
+    harness = help_harness(tmp_path, [action(action="ask_help", text="要输入验证码")], config=config)
+    record = await harness.run()
+    await harness.settle()
+    assert record.end_reason == "等你帮忙等太久了（要输入验证码）"
+    # 没人帮也不再问模型、不会再求助一遍；没有发起的聊天就只冒桌宠气泡
+    assert len(harness.vision_messages) == 1
+    assert harness.announced.count("🙋 帮我一下：要输入验证码") == 1
+
+
+async def test_a_moment_she_loves_makes_the_pet_happy_and_is_kept_to_show_you(tmp_path):
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [
+            action(action="wait", seconds=10, thought="这只猫在踩奶！太可爱了", moment=True),
+            # 一分钟内又标一次：桌宠不再蹦，画面换成最新这张
+            action(action="wait", seconds=10, thought="它还翻肚皮了", moment=True),
+            action(action="finish", summary="看了好几只猫"),
+        ],
+        announce=True,
+    )
+    harness.agent._sleep = harness.fake_sleep
+    await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
+    await harness.wait_done()
+    await harness.settle()
+    record = harness.store.history[-1]
+    assert record.moment == "它还翻肚皮了"
+    # 标过以后每一步提醒她已经标过了，遇到更喜欢的才换
+    states = harness.state_texts()
+    assert "已经标过了" not in states[0]
+    assert "这次最想给对方看的那一下你已经标过了（这只猫在踩奶！太可爱了）" in states[1]
+    assert harness.events.count("happy") == 2  # 「这一刻」一次，玩够了放下时一次
+    jpeg = harness.moments[-1]
+    assert jpeg is not None and jpeg.startswith(b"\xff\xd8")
+    assert "想给对方看这个" in [log["summary"] for log in harness.agent.status()["logs"]]
+
+
+async def test_moments_are_not_kept_when_they_cannot_be_shown(tmp_path):
+    # 叫她玩的人不能看她手机截图（或者没有发起的聊天）：只记她在想什么，不留截图
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [action(action="wait", seconds=10, thought="这只猫好圆", moment=True), action(action="finish")],
+    )
+    record = await harness.run(origin_stream="s")
+    assert record.moment == "这只猫好圆" and harness.moments == [None]
+
+
+async def test_the_video_she_watched_longest_becomes_the_moment(tmp_path):
+    # 实测她两局都没自己标「这一刻」：连着看得最久、至少 30 秒的那段就当作她最想给对方看的
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [
+            action(action="wait", seconds=20, video="short", thought="这只猫有点呆"),
+            action(action="swipe", direction="up", summary="下一个"),
+            action(action="wait", seconds=40, video="long", thought="祥子弹琴好温柔"),
+            action(action="wait", seconds=40, video="long", thought="这段旋律太好听了"),
+            action(action="swipe", direction="up", summary="下一个"),
+            action(action="wait", seconds=30, video="short", thought="还行"),
+            action(action="finish", summary="看了祥子弹琴"),
+        ],
+        announce=True,
+    )
+    harness.agent._sleep = harness.fake_sleep
+    await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
+    await harness.wait_done()
+    await harness.settle()
+    record = harness.store.history[-1]
+    assert record.moment == "这段旋律太好听了"
+    assert harness.moments[-1] is not None and harness.moments[-1].startswith(b"\xff\xd8")
+    # 连着看满一分钟的那段让桌宠开心了一次；玩够了放下时又开心一次
+    assert harness.events.count("happy") == 2
+    # 插件替她挑的不说成是她标的
+    assert all("已经标过了" not in state for state in harness.state_texts())
+
+
+async def test_short_peeks_are_not_moments_and_her_own_mark_wins(tmp_path):
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [action(action="wait", seconds=20, video="long", thought="一般"), action(action="finish")],
+    )
+    record = await harness.run(origin_stream="s")
+    assert record.moment == "" and harness.moments == [None]
+
+    harness = Harness(
+        tmp_path,
+        FakeDevice(),
+        [
+            action(action="wait", seconds=10, video="short", thought="笑死这只猫", moment=True),
+            action(action="swipe", direction="up", summary="下一个"),
+            action(action="wait", seconds=60, video="long", thought="这个也不错"),
+            action(action="finish"),
+        ],
+    )
+    harness.agent._sleep = harness.fake_sleep
+    await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
+    await harness.wait_done()
+    assert harness.store.history[-1].moment == "笑死这只猫"
+
+
+def battery_device(level: int, charging: bool = False) -> FakeDevice:
+    from phone_play.devices import Battery
+
+    device = FakeDevice()
+    device.battery_state = Battery(level=level, charging=charging)
+
+    async def battery():
+        return device.battery_state
+
+    device.battery = battery
+    return device
+
+
+async def test_she_will_not_pick_up_a_nearly_dead_phone_when_asked_in_chat(tmp_path):
+    harness = Harness(tmp_path, battery_device(12), [action(action="finish")])
+    with pytest.raises(PlayRefused) as refused:
+        await harness.agent.start(trigger="chat", origin_stream="s")
+        await harness.agent.wait_for_plan(5)
+    assert refused.value.chat_text == "手机快没电了（剩 12%），先充会儿电再玩"
+    await harness.wait_done()
+    harness.assert_not_counted()
+    status = harness.agent.status()["battery"]
+    assert (status["level"], status["charging"], status["low"]) == (12, False, True)
+    assert "手机快没电了（剩 12%），没插电。" not in harness.agent.activity_text()  # 没玩过时只说没玩过
+
+    # 插着电、或者是你用命令开始的：照常玩
+    harness = Harness(tmp_path, battery_device(12, charging=True), [action(action="finish", summary="看完了")])
+    assert (await harness.run(trigger="chat", origin_stream="s")).end_reason == "自己不想玩了"
+    harness = Harness(tmp_path, battery_device(12), [action(action="finish", summary="看完了")])
+    record = await harness.run(trigger="command", origin_stream="s")
+    assert record.end_reason == "自己不想玩了"
+    assert "手机快没电了（剩 12%），没插电。" in harness.agent.activity_text()
+
+
+async def test_she_puts_the_phone_down_when_it_runs_low_while_playing(tmp_path):
+    device = battery_device(40)
+    # 计划玩 15 分钟：电量五分钟看一次，别还没看到就先玩够了
+    plan = json.dumps({"app": "tv.danmaku.bili", "goal": "看猫猫视频", "minutes": 15}, ensure_ascii=False)
+    harness = Harness(tmp_path, device, [action(action="wait", seconds=120)] * 6 + [action(action="finish")], plan=plan)
+    original = harness.vision
+
+    async def vision(messages):
+        # 玩着玩着电量掉下去了
+        if len(harness.vision_messages) == 2:
+            device.battery_state = device.battery_state.__class__(level=15, charging=False)
+        return await original(messages)
+
+    harness.agent._vision = vision
+    record = await harness.run(trigger="chat", origin_stream="s")
+    assert record.end_reason == "手机快没电了（剩 15%），先放下充会儿电"
+    # 几分钟才看一次电量，不是每一步都问
+    assert len(harness.vision_messages) < 7
+
+
+async def test_auto_play_checks_the_battery_before_picking_up_the_phone(tmp_path):
+    config = auto_config()
+    harness = Harness(tmp_path, battery_device(10), [action(action="finish")], config=config)
+    await harness.agent._auto_decide()
+    assert harness.agent._task is None
+
+    config.play.low_battery_percent = 0
+    config.auto_play.only_when_charging = True
+    await harness.agent._auto_decide()
+    assert harness.agent._task is None
+
+    harness = Harness(tmp_path, battery_device(10, charging=True), [action(action="finish")], config=config)
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    assert harness.store.history[-1].trigger == "自己想玩"
+
+
+async def test_she_asks_you_to_charge_the_phone_once_when_she_wants_to_play(tmp_path):
+    from phone_play.devices import Battery
+
+    device = battery_device(10)
+    asked: List[int] = []
+
+    async def asker(battery) -> None:
+        asked.append(battery.level)
+
+    harness = Harness(
+        tmp_path, device, [action(action="finish", summary="看完了")], config=auto_config(), announce=True
+    )
+    harness.agent._charge_asker = asker
+    await harness.agent._auto_decide()
+    await harness.settle()
+    assert asked == [10] and harness.agent._task is None
+    # 一次没电只问一次，不会每次想玩都问
+    await harness.agent._auto_decide()
+    await harness.settle()
+    assert asked == [10]
+
+    # 插上电了：道个谢，照常去玩
+    device.battery_state = Battery(level=11, charging=True)
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    await harness.settle()
+    assert "🔌 充上电啦，谢谢～" in harness.announced
+    assert harness.store.history[-1].trigger == "自己想玩"
+
+    # 后来又没电了：可以再问
+    device.battery_state = Battery(level=8, charging=False)
+    await harness.agent._auto_decide()
+    await harness.settle()
+    assert asked == [10, 8]
+
+    # 关掉开关就不问
+    harness.config.auto_play.ask_to_charge = False
+    device.battery_state = Battery(level=30, charging=False)
+    await harness.agent._auto_decide()
+    device.battery_state = Battery(level=8, charging=False)
+    harness.agent._task = None
+    await harness.agent._auto_decide()
+    await harness.settle()
+    assert asked == [10, 8]
+
+
+async def test_switching_phones_forgets_the_charge_she_asked_for(tmp_path):
+    from phone_play.devices import Battery
+
+    harness, phones = two_device_harness(tmp_path, [action(action="finish", summary="看完了")])
+    harness.config.auto_play.enabled = True
+    harness.config.auto_play.play_probability = 1.0
+    harness.config.auto_play.active_hours = "00:00-00:00"
+    harness.agent._announcer = harness.announce
+
+    async def asker(battery) -> None:
+        return None
+
+    harness.agent._charge_asker = asker
+    for name, battery in (("OPPO", Battery(level=3, charging=False)), ("iPhone", Battery(level=100, charging=True))):
+
+        async def read(battery=battery):
+            return battery
+
+        phones[name].battery = read
+    await harness.agent.switch_device("OPPO")
+    await harness.agent._auto_decide()
+    assert harness.agent._charge_asked
+    # 实测切回 iPhone 后，读到 iPhone 在充电会以为主人帮她充上了 OPPO
+    await harness.agent.switch_device("iPhone")
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    await harness.settle()
+    assert "🔌 充上电啦，谢谢～" not in harness.announced
+
+
+def dark_png(red_edge: bool = True) -> bytes:
+    from io import BytesIO
+
+    from PIL import Image, ImageDraw
+
+    image = Image.new("RGB", (540, 1200), "black")
+    if red_edge:
+        ImageDraw.Draw(image).rectangle((450, 10, 530, 25), fill="#ff3b30")
+    buffer = BytesIO()
+    image.save(buffer, "PNG")
+    return buffer.getvalue()
+
+
+async def test_a_black_screenshot_of_a_screen_that_is_off_is_not_sent(tmp_path):
+    from phone_play.agent import ScreenDark
+
+    device = FakeDevice()
+    device.png = dark_png()
+    harness = Harness(tmp_path, device, [])
+    viewable: List[Optional[bool]] = [False]
+
+    async def screen_viewable():
+        return viewable[0]
+
+    device.screen_viewable = screen_viewable
+    # 实测她没玩时截图给对方，发过去一张黑图，只剩电量条的红边
+    with pytest.raises(ScreenDark, match="手机屏幕关着（锁屏或者熄屏了），截出来是黑的，她现在没在玩手机"):
+        await harness.agent.chat_screenshot()
+    assert harness.agent.frame_dark
+    # 屏幕亮着、只是画面暗（视频黑场、深色页面）：照常发
+    viewable[0] = True
+    assert (await harness.agent.chat_screenshot()).startswith(b"\xff\xd8")
+    # 正常画面不用问屏幕状态
+    device.png = make_png()
+    viewable[0] = False
+    assert (await harness.agent.chat_screenshot()).startswith(b"\xff\xd8")
+    assert not harness.agent.frame_dark
+
+
+class ShotsPhone(FakeDevice):
+    """按截图顺序出画面（每一步截一张），用完了一直停在最后一张。"""
+
+    def __init__(self, pngs: List[bytes]) -> None:
+        super().__init__()
+        self.pngs = pngs
+        self.shots = 0
+
+    async def screenshot(self) -> bytes:
+        self.png = self.pngs[min(self.shots, len(self.pngs) - 1)]
+        self.shots += 1
+        return await super().screenshot()
+
+
+async def test_the_picked_moment_skips_black_frames(tmp_path):
+    from io import BytesIO
+
+    from PIL import Image
+
+    from phone_play.imaging import mostly_dark
+
+    # 看到最后一步正好是黑场（或者还在加载的黑播放器）：拿前面那张能看的当「这一刻」，配它当时的想法
+    harness = Harness(
+        tmp_path,
+        ShotsPhone([make_png(), dark_png(), make_png()]),
+        [
+            action(action="wait", seconds=40, video="long", thought="祥子弹琴好温柔"),
+            action(action="wait", seconds=40, video="long", thought="画面黑了一下"),
+            action(action="finish"),
+        ],
+    )
+    harness.agent._sleep = harness.fake_sleep
+    await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
+    await harness.wait_done()
+    assert harness.store.history[-1].moment == "祥子弹琴好温柔"
+    assert not mostly_dark(Image.open(BytesIO(harness.moments[-1])))
+
+    # 这段从头到尾只截到黑场：不挑「这一刻」，看满一分钟桌宠照样开心
+    harness = Harness(
+        tmp_path,
+        ShotsPhone([dark_png(), dark_png(), make_png()]),
+        [
+            action(action="wait", seconds=40, video="long", thought="好黑"),
+            action(action="wait", seconds=40, video="long", thought="还是黑的"),
+            action(action="finish"),
+        ],
+        announce=True,
+    )
+    harness.agent._sleep = harness.fake_sleep
+    await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
+    await harness.wait_done()
+    await harness.settle()
+    assert harness.store.history[-1].moment == "" and harness.moments == [None]
+    assert harness.events.count("happy") == 2
+
+
+async def test_her_own_moment_on_a_black_frame_keeps_only_the_thought(tmp_path):
+    harness = Harness(
+        tmp_path,
+        ShotsPhone([make_png(), dark_png(), make_png()]),
+        [
+            action(action="wait", seconds=10, thought="这只猫在踩奶", moment=True),
+            # 后来又标了一次，正好截到黑屏：不发黑图，也不拿上一张配新的想法
+            action(action="wait", seconds=10, thought="它跑出画面了", moment=True),
+            action(action="finish"),
+        ],
+    )
+    harness.agent._sleep = harness.fake_sleep
+    await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
+    await harness.wait_done()
+    assert harness.store.history[-1].moment == "它跑出画面了" and harness.moments == [None]
