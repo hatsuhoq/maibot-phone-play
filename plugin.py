@@ -239,6 +239,7 @@ class PhonePlayPlugin(MaiBotPlugin):
             request_notifier=self._notify_request,
             help_notifier=self._notify_help,
             charge_asker=self._ask_to_charge,
+            unreachable_teller=self._tell_unreachable,
         )
         self._agent.restart_auto_play()
 
@@ -441,8 +442,39 @@ class PhonePlayPlugin(MaiBotPlugin):
         主人是 admin_user_ids 里的第一个；没有、或者没和她私聊过找不到聊天时只冒桌宠气泡。私聊的说法跟着 finish_notice，
         它是 off 时不说。
         """
+        text = f"手机快没电了（剩 {battery.level}%），能帮我充一下电吗？"
+        await self._tell_owner(
+            f"🔌 {text}",
+            text,
+            # 实测她会添一句「刚看完视频」，其实还没开始玩
+            f"你刚想拿起手机玩一会儿，还没开始就发现手机快没电了（只剩 {battery.level}%），也没插电。"
+            "用你平时说话的语气问问对方能不能帮你把手机充上电，一两句就好；你这次还没在手机上看任何东西，"
+            "别编刚才在手机上做了什么；不要用通知的口吻，也不要提插件。",
+            "手机快没电了",
+        )
+
+    async def _tell_unreachable(self, error: str) -> None:
+        """她想玩手机，可手机连不上：桌宠上冒一句，再去主人的私聊里请主人看看。
+
+        主人、私聊的说法同 ``_ask_to_charge``；模板说法带上连不上的原因，方便主人去查，她自己说时不带，免得照着编。
+        """
+        await self._tell_owner(
+            "📵 手机连不上了，能帮我看看吗？",
+            f"手机连不上了，能帮我看看吗？（{error}）",
+            "你刚想拿起手机玩一会儿，可手机连不上（看不到画面，也点不动），玩不了。"
+            "用你平时说话的语气请对方帮你看看手机和电脑的连接，一两句就好；你这次没在手机上看任何东西，"
+            "别编刚才在手机上做了什么，也别猜是哪里坏了；不要用通知的口吻，也不要提插件。",
+            "手机连不上",
+        )
+
+    async def _tell_owner(self, bubble: str, template: str, intent: str, reason: str) -> None:
+        """她自己想玩时遇到要主人帮忙的事：桌宠上冒 ``bubble``，再去主人的私聊里说。
+
+        主人是 admin_user_ids 里的第一个；没有、或者没和她私聊过找不到聊天时只冒桌宠气泡。私聊的说法跟着 finish_notice：
+        template 发 ``template``，maisaka 请她照着 ``intent`` 自己说，off 不说。
+        """
         if self.settings.desktop_pet.bubbles:
-            await self._pet_bubble(f"🔌 手机快没电了（剩 {battery.level}%），能帮我充一下电吗？")
+            await self._pet_bubble(bubble)
         style = self.settings.play.finish_notice
         owner = next(iter(self.settings.plugin.admin_user_ids), "")
         if style == "off" or not owner:
@@ -453,15 +485,9 @@ class PhonePlayPlugin(MaiBotPlugin):
         stream_id = str(stream["session_id"])
         if style == "template":
             name = await self._bot_name()
-            await self.ctx.send.text(f"📱 {name}：手机快没电了（剩 {battery.level}%），能帮我充一下电吗？", stream_id)
+            await self.ctx.send.text(f"📱 {name}：{template}", stream_id)
             return
-        intent = (
-            # 实测她会添一句「刚看完视频」，其实还没开始玩
-            f"你刚想拿起手机玩一会儿，还没开始就发现手机快没电了（只剩 {battery.level}%），也没插电。"
-            "用你平时说话的语气问问对方能不能帮你把手机充上电，一两句就好；你这次还没在手机上看任何东西，"
-            "别编刚才在手机上做了什么；不要用通知的口吻，也不要提插件。"
-        )
-        result = await self.ctx.maisaka.proactive.trigger(stream_id, intent, reason="手机快没电了")
+        result = await self.ctx.maisaka.proactive.trigger(stream_id, intent, reason=reason)
         if not result.get("success"):
             raise RuntimeError(f"请她主动聊天失败：{result.get('error')}")
 

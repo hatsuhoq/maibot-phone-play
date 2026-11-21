@@ -130,6 +130,8 @@ _RECONNECT_INTERVAL = 5.0
 _RECONNECT_SECONDS = 45.0
 # 开始玩时手机暂时连不上（WDA 刚重启、Wi-Fi 抖了一下）最多等这么久；要比聊天里等计划的 30 秒短
 _START_CONNECT_SECONDS = 20.0
+# 模型调用失败（服务器负载过高、超时）后先等这么久再看，连着失败一次比一次等得久，最多等 PLAIN_WAIT_SECONDS
+_MODEL_RETRY_SECONDS = 15.0
 # 暂停、人工接管不算进这次的游玩时长，但从开始到结束最多比计划多这么久，免得忘了交还一直挂着
 _PAUSE_ALLOWANCE_MINUTES = 30
 _PIXEL_SWIPE = re.compile(r"已从 \(\d+, \d+\) 滑到 \(\d+, \d+\)")
@@ -212,6 +214,8 @@ RequestNotifier = Callable[["PhoneRequest", str], Awaitable[None]]
 HelpNotifier = Callable[[str, str], Awaitable[None]]
 # 她自己想玩、手机却快没电了：去问主人能不能帮忙充电（桌宠和主人的私聊）；同样在后台跑
 ChargeAsker = Callable[[Battery], Awaitable[None]]
+# 她自己想玩、手机却连不上：告诉主人一声请主人看看（桌宠和主人的私聊，带上连不上的原因）；同样在后台跑
+UnreachableTeller = Callable[[str], Awaitable[None]]
 # 自然结束（她自己玩够了、到了时长、步数或预算）的结束原因；出错、卡住、被叫停、接管太久的不算
 _NATURAL_END_PREFIXES = ("玩够", "达到", "今天的操作步数", "这次的模型调用", "今天的模型调用")
 
@@ -531,6 +535,8 @@ class Session:
     # 这一步做的操作和失败，_play 收进 trace 后清空
     step_kind: str = ""
     step_failure: str = ""
+    # 连着几次调用模型都失败了：决定下一步前等多久按它算，调用成功就清零
+    model_failures: int = 0
     # 决定好玩什么（或会话提前结束）时置位，供聊天工具等待计划
     planned: asyncio.Event = field(default_factory=asyncio.Event)
 
@@ -736,6 +742,7 @@ class PhoneAgent:
         request_notifier: Optional[RequestNotifier] = None,
         help_notifier: Optional[HelpNotifier] = None,
         charge_asker: Optional[ChargeAsker] = None,
+        unreachable_teller: Optional[UnreachableTeller] = None,
     ) -> None:
         self._config = config
         self._diagnostics = diagnostics
@@ -749,6 +756,9 @@ class PhoneAgent:
         self._charge_asker = charge_asker
         # 这次没电已经问过主人了：一次没电只问一次，看到插上电或者电量回来才重新算
         self._charge_asked = False
+        self._unreachable_teller = unreachable_teller
+        # 这次连不上已经告诉过主人了：一次断开只说一次，连上了才重新算
+        self._unreachable_told = False
         # 桌宠气泡、按钮刷新、告诉对方要求结果这些后台小事：不等它们做完，插件卸载时一起取消
         self._side_tasks: Set[asyncio.Task[None]] = set()
         # 上一个气泡什么时候冒的、上一句想法气泡说的什么：想法气泡隔开一段时间，同一句不重复
@@ -971,6 +981,8 @@ class PhoneAgent:
         self._battery, self._battery_at = None, None
         # 问过充电的是上一台：换了手机就不算，免得读到这台在充电就向主人道谢
         self._charge_asked = False
+        # 说过连不上的也是上一台：这台连上了不用说「连上啦」，这台连不上要另外说
+        self._unreachable_told = False
         await self._save_usage()
         return name, True
 
@@ -2165,9 +2177,10 @@ class PhoneAgent:
             return "今天的操作步数用完了"
         return ""
 
-    async def _connect(self, device: PhoneDevice, seconds: float) -> bool:
+    async def _connect(self, device: PhoneDevice, seconds: float, unlock: bool = True) -> bool:
         """确认手机能用，锁着屏就解开，返回解没解过锁。暂时连不上（网络抖动、WDA 重启）就在 ``seconds`` 秒内
-        每隔几秒再试，配置错误、要人处理（解不开锁、允许调试）的不重试。开始玩和玩到一半断开都用这一个。
+        每隔几秒再试，配置错误、要人处理（解不开锁、允许调试）的不重试。开始玩和玩到一半断开都用这一个；
+        自动玩拿起手机之前只看连不连得上，``unlock`` 为假，不解锁（这次不一定玩）。
 
         按真实时间算总时长，每次连接最多等剩下的时间（一次请求最多要等 20 秒）；被叫停时随会话任务一起取消。
 
@@ -2180,7 +2193,7 @@ class PhoneAgent:
             attempt += 1
             try:
                 unlocked = await asyncio.wait_for(
-                    self._ready_and_unlocked(device), timeout=max(deadline - self._clock(), 0.001)
+                    self._ready_and_unlocked(device, unlock), timeout=max(deadline - self._clock(), 0.001)
                 )
             except DeviceError as exc:
                 error = exc
@@ -2197,9 +2210,9 @@ class PhoneAgent:
             self._connection.attempt, self._connection.deadline = attempt, deadline
             await self._sleep(_RECONNECT_INTERVAL)
 
-    async def _ready_and_unlocked(self, device: PhoneDevice) -> bool:
+    async def _ready_and_unlocked(self, device: PhoneDevice, unlock: bool) -> bool:
         await device.ensure_ready()
-        return await self._unlock(device)
+        return await self._unlock(device) if unlock else False
 
     async def _unlock(self, device: PhoneDevice) -> bool:
         """锁着屏就解开，返回解没解过；解不开时记下这台手机（玩完不再锁屏），连接状态改成要解锁。
@@ -2223,6 +2236,10 @@ class PhoneAgent:
         connection = self._connection
         connection.state, connection.error, connection.attempt, connection.deadline = "ok", "", 0, 0.0
         connection.last_ok_at = self._now()
+        if self._unreachable_told:
+            # 告诉过主人连不上，现在连上了：说一声；以后再断开可以再说
+            self._unreachable_told = False
+            self._announce("📱 手机连上啦")
 
     def _connection_payload(self, config: PhonePlayConfig) -> Dict[str, Any]:
         connection = self._connection
@@ -2422,10 +2439,23 @@ class PhoneAgent:
 
         epoch = session.control_epoch
         try:
-            action = parse_action(
-                await self._call_model(session, "vision", self._vision, build_decision_messages(context))
-            )
-        except (AgentError, ActionError) as exc:
+            reply = await self._call_model(session, "vision", self._vision, build_decision_messages(context))
+        except AgentError as exc:
+            # 实测「服务器负载过高」连着三次，隔几秒重试一下就用完了次数，这局就结束了：模型那边临时出问题
+            # 不是她写错了格式，等一会儿再看，一次比一次等得久；等的时候不截图比对，免得视频一动就醒
+            session.model_failures += 1
+            wait = min(_MODEL_RETRY_SECONDS * 2 ** (session.model_failures - 1), PLAIN_WAIT_SECONDS)
+            diagnostic = await self._record_failure(session, step, image, None, elements, f"没能决定下一步：{exc}")
+            self._log(step, f"没能决定下一步，等 {wait:g} 秒再看", ok=False, result=str(exc), diagnostic=diagnostic)
+            history.append(f"第{step}步：模型调用失败（{exc}），这一步什么也没做")
+            # 模型那边的问题不是她在手机上卡住了：只给用户看，不算进「同一个问题出现好几次」的卡住判断；
+            # 连着失败太多次照样按 max_consecutive_errors 结束
+            session.last_failure = f"没能决定下一步：{exc}"
+            return False, False, wait
+        session.model_failures = 0
+        try:
+            action = parse_action(reply)
+        except ActionError as exc:
             diagnostic = await self._record_failure(session, step, image, None, elements, f"没能决定下一步：{exc}")
             self._log(step, "没能决定下一步", ok=False, result=str(exc), diagnostic=diagnostic)
             history.append(f"第{step}步：没有得到有效动作（{exc}），请严格按格式只输出一个 JSON")
@@ -2940,7 +2970,15 @@ class PhoneAgent:
         if self._rng() >= probability:
             return
         life = check.activity if mode is not None and check is not None else None
-        battery = await self._read_battery(self._get_device())
+        device = self._get_device()
+        try:
+            # 实测 WDA 断了两天，她每次想玩都开一局再连不上，没人知道：先看连不连得上，连不上就不开局。
+            # 跟玩到一半断开一样等一会儿，偶尔断开十几秒就恢复的不算
+            await self._connect(device, _RECONNECT_SECONDS, unlock=False)
+        except DeviceError as exc:
+            self._phone_unreachable(exc)
+            return
+        battery = await self._read_battery(device)
         low = self._battery_low(battery, config)
         if low:
             if config.auto_play.ask_to_charge and self._charge_asker is not None and not self._charge_asked:
@@ -2957,6 +2995,15 @@ class PhoneAgent:
             await self.start(trigger="auto", life=life, slack=mode == "slack")
         except PlayRefused as exc:
             self._logger.info(f"这次不自动玩手机：{exc}")
+
+    def _phone_unreachable(self, error: DeviceError) -> None:
+        """自动玩想玩时手机连不上：这次不玩；告诉主人一声请主人看看，一次断开只说一次，连上了才重新算。"""
+        if self._unreachable_teller is not None and not self._unreachable_told:
+            self._unreachable_told = True
+            self._logger.info(f"这次不自动玩手机：手机连不上（{error}），告诉主人一声")
+            self._spawn_side(self._unreachable_teller(str(error)), "告诉主人手机连不上的话没说出去")
+            return
+        self._logger.info(f"这次不自动玩手机：手机连不上（{error}）")
 
     async def _read_battery(self, device: PhoneDevice) -> Optional[Battery]:
         """问手机现在的电量并记下来；读不到（设备不支持、这次没连上）就当不知道，不拦着玩。"""

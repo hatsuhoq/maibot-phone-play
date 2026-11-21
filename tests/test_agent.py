@@ -3529,3 +3529,111 @@ async def test_her_own_moment_on_a_black_frame_keeps_only_the_thought(tmp_path):
     await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
     await harness.wait_done()
     assert harness.store.history[-1].moment == "它跑出画面了" and harness.moments == [None]
+
+
+async def test_she_tells_the_owner_once_when_the_phone_cannot_be_reached(tmp_path):
+    # 实测 WDA 断了两天：她每次想玩都开一局再连不上，桌宠和聊天里都没说，没人知道
+    device = FakeDevice(ready_error="连不上 iPhone 上的 WebDriverAgent")
+    told: List[str] = []
+
+    async def teller(error: str) -> None:
+        told.append(error)
+
+    harness = Harness(
+        tmp_path, device, [action(action="finish", summary="看完了")], config=auto_config(), announce=True
+    )
+    harness.agent._unreachable_teller = teller
+    await harness.agent._auto_decide()
+    await harness.settle()
+    # 不开局、不调模型；跟玩到一半断开一样等了一会儿才算连不上，WebUI 上看得到连不上
+    assert harness.agent._task is None and harness.plan_prompts == []
+    assert told == ["连不上 iPhone 上的 WebDriverAgent"] and harness.seconds >= 40
+    assert harness.agent.status()["connection"]["state"] == "failed"
+    # 一次断开只说一次
+    await harness.agent._auto_decide()
+    await harness.settle()
+    assert len(told) == 1
+
+    # 连上了：说一声，照常去玩
+    device.ready_error = ""
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    await harness.settle()
+    assert "📱 手机连上啦" in harness.announced
+    assert harness.store.history[-1].trigger == "自己想玩"
+
+    # 后来又断了：可以再说
+    device.ready_error = "又连不上了"
+    await harness.agent._auto_decide()
+    await harness.settle()
+    assert told == ["连不上 iPhone 上的 WebDriverAgent", "又连不上了"]
+    assert len(harness.store.history) == 1
+
+
+async def test_checking_whether_the_phone_is_reachable_does_not_unlock_it(tmp_path):
+    # 看完连得上，这次却因为没电不玩：锁着的屏不能被解开
+    device = battery_device(10)
+    device.locked = True
+    harness = Harness(tmp_path, device, [], config=auto_config())
+    await harness.agent._auto_decide()
+    assert device.locked and harness.agent._task is None
+
+
+async def test_switching_phones_forgets_that_she_said_the_phone_was_unreachable(tmp_path):
+    harness, phones = two_device_harness(tmp_path, [action(action="finish", summary="看完了")])
+    harness.config.auto_play.enabled = True
+    harness.config.auto_play.play_probability = 1.0
+    harness.config.auto_play.active_hours = "00:00-00:00"
+    harness.agent._announcer = harness.announce
+    told: List[str] = []
+
+    async def teller(error: str) -> None:
+        told.append(error)
+
+    harness.agent._unreachable_teller = teller
+    phones["OPPO"].ready_error = "adb 连不上"
+    await harness.agent.switch_device("OPPO")
+    await harness.agent._auto_decide()
+    await harness.settle()
+    assert told == ["adb 连不上"]
+    # 换回连得上的 iPhone：不说「连上啦」，说过连不上的是另一台
+    await harness.agent.switch_device("iPhone")
+    await harness.agent._auto_decide()
+    await harness.wait_done()
+    await harness.settle()
+    assert "📱 手机连上啦" not in harness.announced
+
+
+async def test_she_waits_longer_each_time_the_model_fails_instead_of_giving_up_at_once(tmp_path):
+    # 实测「服务器负载过高」连着三次，隔几秒重试一下就用完了次数，这局就结束了
+    overloaded = AgentError("视觉模型调用失败：服务器负载过高")
+    replies: List[Any] = [overloaded] * 4 + [action(action="finish", summary="看完了")]
+    config = PhonePlayConfig()
+    config.play.max_consecutive_errors = 5
+    harness = Harness(tmp_path, FakeDevice(), [], config=config)
+
+    async def vision(messages):
+        harness.vision_messages.append(messages)
+        reply = replies.pop(0)
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+    harness.agent._vision = vision
+    record = await harness.run()
+    assert record.end_reason == "自己不想玩了"
+    # 一次比一次等得久，最多等 30 秒（日志新的在前）；等的时候不截图比对，每步只截一张
+    logs = reversed(harness.agent.status()["logs"])
+    waits = [log["summary"] for log in logs if log["summary"].startswith("没能决定下一步")]
+    assert waits == [f"没能决定下一步，等 {seconds} 秒再看" for seconds in (15, 30, 30, 30)]
+    assert harness.device.calls.count(("screenshot",)) == 5
+    # 给她的记录里写的是模型调用失败，不让她以为是自己格式写错了
+    last = json.dumps(harness.vision_messages[-1], ensure_ascii=False)
+    assert "模型调用失败（视觉模型调用失败：服务器负载过高），这一步什么也没做" in last
+    assert "请严格按格式只输出一个 JSON" not in last
+
+    # 真是格式写错了：照旧提醒她按格式写，不多等
+    harness = Harness(tmp_path, FakeDevice(), ["这不是 JSON", action(action="finish", summary="看完了")])
+    await harness.run()
+    assert "请严格按格式只输出一个 JSON" in json.dumps(harness.vision_messages[-1], ensure_ascii=False)
+    assert "没能决定下一步" in [log["summary"] for log in harness.agent.status()["logs"]]

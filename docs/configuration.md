@@ -127,3 +127,5 @@ step_interval_seconds = 1.5
 每一步是一次带截图的视觉模型调用。实测 gpt-6.1-terra 每步约 5 秒、约 3700 tokens；她看视频、听歌时一次停 15～30 秒，平均每分钟不到 4 步，玩 10 分钟大约 35～40 步、十三四万 tokens。
 
 想控制花费：调低 `play.daily_session_limit`、`max_session_minutes`，或者用 `play.daily_model_call_limit` 直接限制每天的模型调用次数。
+
+模型调用失败（服务器负载过高、超时）时这一步不操作，等 15 秒再看，连着失败就等 30 秒；失败的调用也算进次数。连着失败 `play.max_consecutive_errors` 次（默认 3）就结束这次，结束原因写「连续 3 步操作失败」，不会当成她在手机上卡住了。

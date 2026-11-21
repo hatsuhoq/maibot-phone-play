@@ -1459,3 +1459,40 @@ async def test_black_screenshots_are_not_sent_to_chat_or_the_pet(tmp_path, monke
         assert issubclass(ScreenDark, Exception)
     finally:
         await plugin.on_unload()
+
+
+@pytest.mark.parametrize("style", ["natural", "template", "off"])
+async def test_she_tells_the_owner_when_the_phone_cannot_be_reached(tmp_path, style):
+    plugin = make_plugin(tmp_path, play={"finish_notice": style})
+    plugin.ctx.maisaka.proactive.trigger = AsyncMock(return_value={"success": True})
+    plugin.ctx.chat.get_stream_by_user_id = AsyncMock(return_value={"session_id": "owner-stream"})
+    plugin.ctx.desktop_pet.status = AsyncMock(return_value={"ready": True, "visible": True})
+    plugin.ctx.desktop_pet.say = AsyncMock(return_value={"ready": True})
+    error = "连不上 iPhone 上的 WebDriverAgent（http://127.0.0.1:8100）"
+    await plugin._tell_unreachable(error)
+    plugin.ctx.desktop_pet.say.assert_awaited_once_with("📵 手机连不上了，能帮我看看吗？")
+    if style == "natural":
+        stream, intent = plugin.ctx.maisaka.proactive.trigger.await_args.args
+        assert stream == "owner-stream" and "手机连不上" in intent and "别猜是哪里坏了" in intent
+        assert plugin.ctx.maisaka.proactive.trigger.await_args.kwargs["reason"] == "手机连不上"
+        # 她自己说时不带技术细节，免得照着编
+        assert "WebDriverAgent" not in intent
+    elif style == "template":
+        # 模板说法带上原因，方便主人去查
+        plugin.ctx.send.text.assert_awaited_once_with(
+            f"📱 小睦：手机连不上了，能帮我看看吗？（{error}）", "owner-stream"
+        )
+    else:
+        plugin.ctx.chat.get_stream_by_user_id.assert_not_awaited()
+        plugin.ctx.maisaka.proactive.trigger.assert_not_awaited()
+
+
+async def test_the_agent_tells_the_owner_through_the_plugin(tmp_path, monkeypatch):
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        assert plugin._agent._unreachable_teller == plugin._tell_unreachable
+        assert plugin._agent._charge_asker == plugin._ask_to_charge
+    finally:
+        await plugin.on_unload()
