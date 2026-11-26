@@ -57,6 +57,8 @@ class SessionRecord:
     moment: str = ""
     # 对方这次在聊天里交给她的事和结果 [{"id", "text", "status", "label", "note"}]；旧记录没有
     requests: List[Dict[str, Any]] = field(default_factory=list)
+    # 看视频时她写下的画面、字幕上真看到的，例如「《番茄炒蛋》：挑偏粉的番茄、去皮切块」；旧记录没有
+    saw: List[str] = field(default_factory=list)
 
     def to_dict(self) -> Dict[str, Any]:
         return asdict(self)

@@ -4,9 +4,9 @@
 """
 
 from io import BytesIO
-from typing import Optional, Sequence
+from typing import List, Optional, Sequence, Tuple
 
-from PIL import Image, ImageDraw, ImageFont
+from PIL import Image, ImageChops, ImageDraw, ImageFont
 
 import base64
 
@@ -22,6 +22,12 @@ _DARK_MAX = 8
 _MOSTLY_DARK_SIZE = (60, 130)
 _MOSTLY_DARK_LEVEL = 40
 _MOSTLY_DARK_SHARE = 0.03
+# 找视频在哪：缩成 1/8 比；一个像素差这么多算变了；一行里变了的像素超过这个比例算视频的一行；
+# 两段之间隔不到这么多行（缩小后）就并成一段（实测字幕和画面之间常有一条没怎么变的缝）
+_AREA_SCALE = 8
+_AREA_PIXEL_CHANGE = 24
+_AREA_ROW_SHARE = 0.1
+_AREA_ROW_GAP = 8
 
 
 def open_image(data: bytes) -> Image.Image:
@@ -68,6 +74,66 @@ def resize_to_edge(image: Image.Image, max_edge: int) -> Image.Image:
     if scale >= 1:
         return image
     return image.resize((max(1, round(width * scale)), max(1, round(height * scale))), Image.Resampling.LANCZOS)
+
+
+def video_rows(frames: Sequence[Image.Image]) -> Optional[Tuple[int, int]]:
+    """几张同样大小的截图里视频占的那几行（上边、下边）：多数相邻两张之间都在变的行，取最高的一段。
+
+    时钟、轮播广告只是偶尔变，投票时刷掉；视频左右一般占满屏幕，只找上下。
+    实测 B 站详情页三个视频（竖屏做菜、横屏讲课、横屏延时摄影）都正好框到播放器。
+    全都没怎么变（暂停、黑场、只有一张）时返回 None。
+    """
+    if len(frames) < 2:
+        return None
+    width, height = frames[0].size
+    size = (max(1, width // _AREA_SCALE), max(1, height // _AREA_SCALE))
+    small = [frame.convert("L").resize(size) for frame in frames]
+    votes = None
+    for before, after in zip(small, small[1:], strict=False):
+        changed = ImageChops.difference(before, after).point(lambda value: 1 if value > _AREA_PIXEL_CHANGE else 0)
+        votes = changed if votes is None else ImageChops.add(votes, changed)
+    assert votes is not None
+    # 一半以上的相邻两张之间都变了才算（四张加看完时那张，比四次，要变两次）
+    need = max(1, len(small) // 2)
+    mask = votes.point(lambda value: 255 if value >= need else 0)
+    rows = mask.resize((1, mask.height), Image.Resampling.BOX).tobytes()
+    bands: List[Tuple[int, int]] = []
+    start: Optional[int] = None
+    for index, value in enumerate([*rows, 0]):
+        if value > 255 * _AREA_ROW_SHARE:
+            if start is None:
+                start = index
+        elif start is not None:
+            if bands and start - bands[-1][1] <= _AREA_ROW_GAP:
+                bands[-1] = (bands[-1][0], index)
+            else:
+                bands.append((start, index))
+            start = None
+    if not bands:
+        return None
+    top, bottom = max(bands, key=lambda band: band[1] - band[0])
+    return max(0, (top - 1) * _AREA_SCALE), min(height, (bottom + 1) * _AREA_SCALE)
+
+
+def video_keyframes(
+    frames: Sequence[Tuple[float, Image.Image]], current: Image.Image, max_edge: int, quality: int
+) -> List[Tuple[float, bytes]]:
+    """看视频时中途截的几张（看到第几秒、截图），只留视频那几行、缩小后编码成 JPEG，从早到晚。
+
+    ``current`` 是看完这段时的截图：一起用来找视频在哪，自己不编码（它整张另外发）。
+    中途转了屏幕的那几张和最后一张大小不一样，丢掉；认不出视频在哪时返回空列表。
+    """
+    if not frames:
+        return []
+    size = frames[-1][1].size
+    kept = [(at, frame) for at, frame in frames if frame.size == size]
+    same_shape = abs(current.width * size[1] - current.height * size[0]) <= max(size)
+    compared = [frame for _, frame in kept] + ([current.resize(size)] if same_shape else [])
+    rows = video_rows(compared)
+    if rows is None:
+        return []
+    top, bottom = rows
+    return [(at, encode_jpeg(frame.crop((0, top, size[0], bottom)), max_edge, quality)) for at, frame in kept]
 
 
 def encode_jpeg(image: Image.Image, max_edge: int, quality: int, max_bytes: Optional[int] = None) -> bytes:

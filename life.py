@@ -123,6 +123,9 @@ def _clip(text: str, limit: int) -> str:
 def share_text(record: SessionRecord) -> Tuple[str, str]:
     """玩完交给麦生活的契机：话题是在哪看到了什么（她自己的总结），动机说明是她自己玩的、可以不说。"""
     seen = record.summary or record.goal
+    if record.saw:
+        # 她看视频时写下的画面、字幕上真有的内容，比她的感受更有可聊的
+        seen = f"{seen}（{record.saw[-1]}）"
     if record.trigger == SLACK_LABEL:
         topic = _clip(f"刚才摸鱼偷偷刷{record.places_text()}看到的：{seen}", _TOPIC_LIMIT)
         motive = "上班或上课中途偷偷摸鱼刷到的，觉得有意思可以当见闻随口聊聊；不想说也可以不说"

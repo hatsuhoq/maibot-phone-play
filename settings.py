@@ -314,6 +314,13 @@ class PlaySettings(PluginConfigBase):
     max_elements: int = Field(default=40, ge=5, le=120, description="每步最多列出多少个界面元素")
     history_steps: int = Field(default=6, ge=0, le=30, description="决策时附带最近几步操作记录")
     model_image_max_edge: int = Field(default=1280, ge=480, le=2560, description="发给视觉模型的截图最长边像素")
+    video_keyframes: int = Field(
+        default=4,
+        ge=0,
+        le=6,
+        description="看视频时中途最多截几张（至少隔 10 秒一张），下一步只裁出视频那块给她看，"
+        "她能说出这段里画面和字幕上真有什么；每张约多 250 个 token，不多调用模型。0 不截，只看最后一张",
+    )
     use_bot_personality: bool = Field(default=True, description="决策时带上 Bot 的人设，让玩法更像她自己")
     extra_persona: str = Field(default="", description="额外的兴趣或性格补充，例如 喜欢猫猫视频和轻音乐")
 
@@ -335,6 +342,12 @@ class AutoPlaySettings(PluginConfigBase):
     )
     only_when_charging: bool = Field(
         default=False, description="只在手机插着电（充电中或已充满）时自动玩；读不到电量的手机照常"
+    )
+    game_wishes: bool = Field(
+        default=False,
+        description="她自己想玩时，偶尔想装一款手机上没装的游戏：先在桌宠和主人（admin_user_ids 第一个）的私聊里问，"
+        "主人同意了她自己去应用商店装（只装免费的，要密码、确认、登录时请主人帮忙）；一天最多问一次。"
+        "会在手机上装应用，默认关",
     )
     active_hours: str = Field(
         default="10:00-23:00",

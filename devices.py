@@ -193,6 +193,10 @@ class PhoneDevice(ABC):
     async def installed_packages(self, packages: Sequence[str]) -> Set[str]:
         """``packages`` 里已经安装在手机上的那些（iPhone 查不出来，打开时才知道，见 AppNotInstalledError）。"""
 
+    async def all_packages(self) -> Optional[Set[str]]:
+        """手机上装着的所有应用；这台设备查不了（iPhone）是 None。下载游戏时用来认出新装的那个。"""
+        return None
+
     @abstractmethod
     async def ui_elements(self, width: int, height: int, limit: int) -> List[UIElement]:
         """当前界面的可交互元素。"""
@@ -207,6 +211,13 @@ class PhoneDevice(ABC):
 
     async def screen_viewable(self) -> Optional[bool]:
         """屏幕亮着又没锁、截图看得到内容；熄屏或锁着是 False，这台设备查不了是 None。不点亮、不解锁。"""
+        return None
+
+    async def screen_size(self) -> Optional[Tuple[int, int]]:
+        """现在屏幕的宽高（截图像素，跟着横竖屏转）；这台设备查不了是 None。
+
+        比截图便宜，用来在点、滑之前看屏幕转没转。
+        """
         return None
 
     # 能不能锁屏、自动解锁：iPhone 和安卓真机支持，模拟器不查锁屏、也不锁屏
@@ -300,6 +311,15 @@ def _network_target(serial: str) -> Optional[Tuple[str, str]]:
     if _BARE_IP_SERIAL.match(serial):
         return serial, ""
     return None
+
+
+def parse_android_screen_size(text: str) -> Optional[Tuple[int, int]]:
+    """从 ``dumpsys window displays`` 里取现在的屏幕宽高：``cur=2400x1080`` 跟着屏幕方向转，横屏时宽比高大。
+
+    取第一块屏幕（主屏）的；输出里没有 ``cur=`` 时返回 None。
+    """
+    match = re.search(r"\bcur=(\d+)x(\d+)\b", text)
+    return (int(match.group(1)), int(match.group(2))) if match else None
 
 
 def parse_android_battery(text: str) -> Optional[Battery]:
@@ -535,10 +555,12 @@ class AdbDevice(PhoneDevice):
         return packages
 
     async def installed_packages(self, packages: Sequence[str]) -> Set[str]:
+        return await self.all_packages() & set(packages)
+
+    async def all_packages(self) -> Set[str]:
         text = await self._shell("pm list packages")
         lines = (line.strip() for line in text.splitlines())
-        installed = {line[len("package:") :] for line in lines if line.startswith("package:")}
-        return installed & set(packages)
+        return {line[len("package:") :] for line in lines if line.startswith("package:")}
 
     async def _lock_state(self) -> Tuple[Optional[bool], Optional[bool]]:
         return parse_android_lock(await self._shell(_LOCK_STATE_COMMAND))
@@ -578,6 +600,9 @@ class AdbDevice(PhoneDevice):
 
     async def battery(self) -> Optional[Battery]:
         return parse_android_battery(await self._shell("dumpsys battery"))
+
+    async def screen_size(self) -> Optional[Tuple[int, int]]:
+        return parse_android_screen_size(await self._shell("dumpsys window displays"))
 
     async def screen_viewable(self) -> Optional[bool]:
         awake, locked = await self._lock_state()
@@ -875,6 +900,11 @@ class WdaDevice(PhoneDevice):
     async def screen_viewable(self) -> Optional[bool]:
         """锁着就是看不到；没锁时当作亮着（屏幕关着却没锁的少见情况由 unlock_if_locked 点亮）。"""
         return not await self._request("GET", "/wda/locked")
+
+    async def screen_size(self) -> Optional[Tuple[int, int]]:
+        """``/wda/screen`` 的宽高（点）乘以倍率。实测横屏时宽高跟着对调，截图也是横的，两个横屏方向都一样。"""
+        scale, (width, height) = _parse_screen(await self._request("GET", "/wda/screen"))
+        return round(width * scale), round(height * scale)
 
     async def battery(self) -> Optional[Battery]:
         """WDA 的 batteryInfo：level 是 0~1（读不到是负数），state 1 没插电、2 充电中、3 已充满、0 不知道。"""

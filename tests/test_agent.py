@@ -29,7 +29,16 @@ from phone_play.memory import MemoryStore
 from phone_play.store import SessionRecord, UsageStore
 from phone_play.ui_tree import UIElement
 
-from conftest import BILI_DETAIL, BILI_PLAYER, BILI_SCREEN, BILI_SEARCH, FakeDevice, make_png, scene_png
+from conftest import (
+    BILI_DETAIL,
+    BILI_PLAYER,
+    BILI_SCREEN,
+    BILI_SEARCH,
+    BILI_SEARCH_COMMENT,
+    FakeDevice,
+    make_png,
+    scene_png,
+)
 
 PLAN = json.dumps({"app": "tv.danmaku.bili", "goal": "看猫猫视频", "minutes": 5}, ensure_ascii=False)
 
@@ -1574,7 +1583,8 @@ async def test_long_wait_watches_the_screen_without_calling_the_model(tmp_path, 
     assert len(harness.vision_messages) == 2
     # 开头打开应用后等 3 秒；没变化时等满 120 秒，画面变了第三次比对（9 秒）就醒
     assert harness.seconds == (3 + 9 if woke_early else 3 + 120)
-    assert "在联机游戏的房间里（好友房、组队房间）等别人进来" in harness.vision_messages[0][0]["content"]
+    # 这局在 B 站（视频应用）：联机房间怎么等用不上，不发；游戏里才说（见 test_prompt_scope）
+    assert "在联机游戏的房间里（好友房、组队房间）等别人进来" not in harness.vision_messages[0][0]["content"]
 
 
 class SlowHomePhone(FakeDevice):
@@ -2493,8 +2503,8 @@ class VideoPhone(FakeDevice):
         return self.default_foreground
 
 
-@pytest.mark.parametrize("ad_at,expected", [(None, 3 + 90), (10, 3 + 10)])
-async def test_watching_a_long_video_is_not_woken_by_the_changing_picture(tmp_path, ad_at, expected):
+@pytest.mark.parametrize("ad_at,expected,frames", [(None, 3 + 90, 2 + 4), (10, 3 + 10, 2)])
+async def test_watching_a_long_video_is_not_woken_by_the_changing_picture(tmp_path, ad_at, expected, frames):
     # 视频画面一直在变：按画面比对的长等待 3 秒就醒，长视频根本看不下去
     device = VideoPhone()
     harness = Harness(
@@ -2507,8 +2517,8 @@ async def test_watching_a_long_video_is_not_woken_by_the_changing_picture(tmp_pa
     await harness.run()
     # 看满 90 秒才再问她；中途点到广告跳去了别的应用就提前醒来
     assert harness.seconds == expected
-    # 看视频期间不截图比对，只每隔几秒看一眼前台
-    assert device.frames == 2
+    # 看视频期间不按画面比对叫醒，只每隔几秒看一眼前台；另外中途均匀截 4 张留给下一步（跳去广告就不截了）
+    assert device.frames == frames
     system_text = harness.vision_messages[0][0]["content"]
     assert '{"action":"wait","seconds":20,"video":"short"}' in system_text
     assert "短视频（竖屏、一两分钟以内，一条接一条）" in system_text
@@ -3458,8 +3468,15 @@ async def test_a_black_screenshot_of_a_screen_that_is_off_is_not_sent(tmp_path):
     assert not harness.agent.frame_dark
 
 
+def no_keyframes() -> PhonePlayConfig:
+    """看视频时不在中途截图：按截图顺序出画面的测试里，一步只截一张。"""
+    config = PhonePlayConfig()
+    config.play.video_keyframes = 0
+    return config
+
+
 class ShotsPhone(FakeDevice):
-    """按截图顺序出画面（每一步截一张），用完了一直停在最后一张。"""
+    """按截图顺序出画面（每一步截一张，所以要配 no_keyframes），用完了一直停在最后一张。"""
 
     def __init__(self, pngs: List[bytes]) -> None:
         super().__init__()
@@ -3488,6 +3505,7 @@ async def test_the_picked_moment_skips_black_frames(tmp_path):
             action(action="wait", seconds=40, video="long", thought="画面黑了一下"),
             action(action="finish"),
         ],
+        config=no_keyframes(),
     )
     harness.agent._sleep = harness.fake_sleep
     await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
@@ -3505,6 +3523,7 @@ async def test_the_picked_moment_skips_black_frames(tmp_path):
             action(action="finish"),
         ],
         announce=True,
+        config=no_keyframes(),
     )
     harness.agent._sleep = harness.fake_sleep
     await harness.agent.start(trigger="chat", origin_stream="s", share_moments=True)
@@ -3637,3 +3656,278 @@ async def test_she_waits_longer_each_time_the_model_fails_instead_of_giving_up_a
     await harness.run()
     assert "请严格按格式只输出一个 JSON" in json.dumps(harness.vision_messages[-1], ensure_ascii=False)
     assert "没能决定下一步" in [log["summary"] for log in harness.agent.status()["logs"]]
+
+
+def turned_device(**kwargs: Any) -> FakeDevice:
+    """截图还是竖的（540x1200），她想的这几秒里屏幕转成了横屏。"""
+    device = FakeDevice(**kwargs)
+
+    async def screen_size():
+        return (1200, 540)
+
+    device.screen_size = screen_size
+    return device
+
+
+async def test_a_swipe_is_not_done_when_the_screen_turned_while_she_was_thinking(tmp_path):
+    # 视频、游戏这类画面读不到界面元素，之前只有点有界面元素的地方才会核对；滑动从来不看屏幕转没转
+    device = turned_device(elements=[])
+    harness = Harness(
+        tmp_path, device, [action(action="swipe", direction="up", summary="下一个"), action(action="finish")]
+    )
+    record = await harness.run()
+    assert not [call for call in device.calls if call[0] == "swipe"]
+    assert "下一个 → 没滑：滑之前画面变了，屏幕转过来了。先看看现在的画面再决定" in harness.state_texts()[1]
+    # 不是她做错了，不算出错
+    assert record.end_reason == "自己不想玩了"
+
+
+async def test_a_tap_without_ui_elements_is_not_done_when_the_screen_turned(tmp_path):
+    device = turned_device(elements=[])
+    harness = Harness(
+        tmp_path,
+        device,
+        [
+            action(action="tap", point=[500, 500], summary="点出牌"),
+            action(action="long_press", point=[500, 500], summary="长按"),
+            action(action="finish"),
+        ],
+    )
+    await harness.run()
+    assert not [call for call in device.calls if call[0] in ("tap", "long_press")]
+    states = harness.state_texts()
+    assert "点出牌 → 没点：点之前画面变了，屏幕转过来了" in states[1]
+    assert "长按 → 没长按：长按之前画面变了，屏幕转过来了" in states[2]
+
+
+async def test_she_is_told_the_screen_turned_and_taps_land_in_the_landscape_screenshot(tmp_path):
+    # 点了全屏：第二步起截图是横的（1200x540），屏幕也确实是横的，照常点，坐标按横着的截图算
+    device = ShotsPhone([make_png(), make_png(1200, 540)])
+    device.elements = []
+
+    async def screen_size():
+        return (1200, 540) if device.shots >= 2 else (540, 1200)
+
+    device.screen_size = screen_size
+    harness = Harness(
+        tmp_path,
+        device,
+        [
+            action(action="tap", point=[500, 500], summary="点全屏"),
+            action(action="tap", point=[900, 100], summary="点右上角"),
+            action(action="swipe", direction="left", summary="往回拖一点"),
+            action(action="finish"),
+        ],
+    )
+    await harness.run()
+    moves = [call for call in device.calls if call[0] in ("tap", "swipe")]
+    assert moves == [("tap", 270, 600), ("tap", 1080, 54), ("swipe", 600, 270, 120, 270)]
+    states = harness.state_texts()
+    assert "屏幕：横屏" not in states[0] and "手机转成了" not in states[0]
+    assert "屏幕：横屏" in states[1] and "第2步前：手机转成了横屏，按现在这张截图重新找要点的地方" in states[1]
+    # 一直是横屏就不再提转了
+    assert "屏幕：横屏" in states[2] and "第3步前" not in states[2]
+
+
+async def test_she_can_resume_a_video_whose_search_card_shows_a_hot_comment(tmp_path):
+    # 实测：要接着看上次看了一部分的手书，搜索结果卡片自己的文字是热评、B 站又标着「最近看过」，
+    # 插件认不出是这个视频，连拦四次判成卡住，这局 50 秒就结束了
+    harness = Harness(
+        tmp_path,
+        bilibili_phone(BILI_SEARCH_COMMENT),
+        [action(action="tap", element=3, summary="接着看祥子的手书"), action(action="finish", summary="看完了")],
+    )
+    memory = MemoryStore(tmp_path / "memory.json")
+    item = memory.remember_watched(
+        Seen("video", "【丰川祥子个人向手书】Esther Reed"), "哔哩哔哩", "long", datetime.now()
+    )
+    memory.add_watched_seconds(item.id, 796)
+    harness.agent._memory = memory
+    record = await harness.run()
+    assert [call for call in harness.device.actions() if call[0] == "tap"] == [("tap", 585, 670)]
+    assert record.end_reason == "自己不想玩了"
+
+
+async def test_a_card_bilibili_marks_as_watched_is_named_by_its_title_not_the_hot_comment(tmp_path):
+    harness = Harness(
+        tmp_path,
+        bilibili_phone(BILI_SEARCH_COMMENT),
+        [action(action="tap", element=3, summary="点开祥子的手书"), action(action="finish", summary="看完了")],
+    )
+    harness.agent._memory = MemoryStore(tmp_path / "memory.json")
+    await harness.run()
+    assert not [call for call in harness.device.actions() if call[0] == "tap"]
+    assert (
+        "→ 没点：《【丰川祥子个人向手书】Esther Reed》B 站标着「最近看过」，换一个没看过的" in harness.state_texts()[1]
+    )
+
+    # 对方点名要看的（标题在要做的事里）照样点：标题在卡片里那一行也认得出
+    harness = Harness(
+        tmp_path,
+        bilibili_phone(BILI_SEARCH_COMMENT),
+        [action(action="tap", element=3, summary="点开祥子的手书"), action(action="finish", summary="看完了")],
+    )
+    harness.agent._memory = MemoryStore(tmp_path / "memory2.json")
+    await harness.run(hint="看《【丰川祥子个人向手书】Esther Reed》")
+    assert [call for call in harness.device.actions() if call[0] == "tap"] == [("tap", 585, 670)]
+
+
+async def test_every_step_of_a_session_is_kept_on_disk_past_the_webui_limit(tmp_path):
+    # 实测想回头查横屏那两局有没有转屏：内存里只留最近 60 条，插件一重载就没了
+    from phone_play.session_logs import SessionLogStore
+
+    steps = [action(action="wait", seconds=1, thought=f"看第{index}个") for index in range(64)]
+    harness = Harness(tmp_path, FakeDevice(), [*steps, action(action="finish", summary="看完了")])
+    harness.agent._session_logs = SessionLogStore(tmp_path / "session_logs", logging.getLogger("phone_play_test"))
+    record = await harness.run()
+    await harness.agent._session_logs.flush()
+    files = list((tmp_path / "session_logs").glob("*.jsonl"))
+    assert len(files) == 1
+    lines = [json.loads(line) for line in files[0].read_text(encoding="utf-8").splitlines()]
+    assert lines[0]["type"] == "session" and lines[0]["trigger"] and lines[0]["device"]
+    logged = [line for line in lines if line["type"] == "step"]
+    assert len(harness.agent.status()["logs"]) == 60 and len(logged) > 60
+    # 内存里早就挤掉的第一步，文件里还在
+    assert logged[0]["at"].startswith("20") and any(line["thought"] == "看第0个" for line in logged)
+    assert lines[-1] == {
+        "type": "end",
+        "ended_at": lines[-1]["ended_at"],
+        "end_reason": record.end_reason,
+        "app": "哔哩哔哩",
+        "goal": record.goal,
+        "steps": record.steps,
+        "summary": record.summary,
+    }
+
+
+async def test_the_log_file_says_how_the_session_ended_when_the_plugin_unloads(tmp_path):
+    from phone_play.session_logs import SessionLogStore
+
+    deciding, gate = asyncio.Event(), asyncio.Event()
+    harness = Harness(tmp_path, FakeDevice(), [])
+
+    async def vision(messages):
+        deciding.set()
+        await gate.wait()
+        return action(action="finish")
+
+    harness.agent._vision = vision
+    harness.agent._session_logs = SessionLogStore(tmp_path / "session_logs", logging.getLogger("phone_play_test"))
+    await harness.agent.start(trigger="command")
+    await asyncio.wait_for(deciding.wait(), 5)
+    await harness.agent.shutdown()
+    lines = [
+        json.loads(line)
+        for line in next((tmp_path / "session_logs").glob("*.jsonl")).read_text(encoding="utf-8").splitlines()
+    ]
+    assert lines[-1]["type"] == "end" and lines[-1]["end_reason"] == "插件卸载"
+
+
+async def spin() -> None:
+    """让排着的任务都跑到下一个等待点（截图任务要多转几轮才真正去截）。"""
+    for _ in range(5):
+        await asyncio.sleep(0)
+
+
+class GatedPhone(FakeDevice):
+    """截图卡在门口，放开才回来；记下截了几次。"""
+
+    def __init__(self, **kwargs: Any) -> None:
+        super().__init__(**kwargs)
+        self.gate = asyncio.Event()
+        self.shots = 0
+
+    async def screenshot(self) -> bytes:
+        self.shots += 1
+        await self.gate.wait()
+        return await super().screenshot()
+
+
+async def test_people_who_only_want_to_look_share_the_screenshot_in_progress(tmp_path):
+    device = GatedPhone()
+    harness = Harness(tmp_path, device, [])
+    agent = harness.agent
+    webui = asyncio.create_task(agent.refresh_frame())
+    await spin()
+    chat = asyncio.create_task(agent.chat_screenshot())
+    await spin()
+    # WebUI 正在截，聊天要截图就等这一张，不再给手机多发一次
+    assert device.shots == 1
+    device.gate.set()
+    await webui
+    assert (await chat).startswith(b"\xff\xd8")
+    assert device.shots == 1 and agent.frame_id == 1
+    assert agent.frame_payload(0)["device"] == agent._current_device
+
+
+async def test_deciding_and_checking_before_a_tap_never_reuse_an_earlier_screenshot(tmp_path):
+    device = GatedPhone()
+    harness = Harness(tmp_path, device, [])
+    agent = harness.agent
+    webui = asyncio.create_task(agent.refresh_frame())
+    await spin()
+    # 她想完了要点：WebUI 想之前就开始截的那张不能用来核对，新截一张
+    deciding = asyncio.create_task(agent._capture(device, share=False))
+    await spin()
+    assert device.shots == 2
+    # 之后只是想看看的，等最新这张
+    looking = asyncio.create_task(agent._capture(device, share=True))
+    await spin()
+    assert device.shots == 2
+    device.gate.set()
+    await asyncio.gather(webui, deciding, looking)
+
+
+async def test_giving_up_on_a_shared_screenshot_does_not_cancel_it_for_others(tmp_path):
+    device = GatedPhone()
+    harness = Harness(tmp_path, device, [])
+    agent = harness.agent
+    # 桌宠面板等不及了（超时取消），WebUI 还在等同一张
+    impatient = asyncio.create_task(asyncio.wait_for(agent.refresh_frame(), 0.05))
+    await spin()
+    patient = asyncio.create_task(agent._capture(device, share=True))
+    with pytest.raises(asyncio.TimeoutError):
+        await impatient
+    device.gate.set()
+    image = await patient
+    assert image.size == (540, 1200) and device.shots == 1 and agent.frame_id == 1
+
+
+async def test_a_screenshot_of_the_previous_phone_is_not_shown_after_switching(tmp_path):
+    harness, phones = two_device_harness(tmp_path, [])
+    gate, shots = asyncio.Event(), []
+    original = phones["iPhone"].screenshot
+
+    async def gated() -> bytes:
+        shots.append(1)
+        await gate.wait()
+        return await original()
+
+    phones["iPhone"].screenshot = gated
+    agent = harness.agent
+    looking = asyncio.create_task(agent.refresh_frame())
+    await spin()
+    assert len(shots) == 1
+    await agent.switch_device("OPPO")
+    # 换手机前开始截的 iPhone 那张晚到了：不拿去更新画面
+    gate.set()
+    await looking
+    assert agent.frame_id == 0 and agent.frame_payload(0)["image"] is None
+
+
+async def test_she_is_told_what_netease_is_playing(tmp_path):
+    from conftest import NETEASE_PLAYER
+
+    config = PhonePlayConfig()
+    config.safety.allowed_apps = [AllowedApp(package="com.netease.cloudmusic", name="网易云音乐")]
+    device = FakeDevice(installed={"com.netease.cloudmusic"}, elements=NETEASE_PLAYER)
+    device.default_foreground = "com.netease.cloudmusic"
+    device.png = make_png(*BILI_SCREEN)
+    plan = json.dumps({"app": "com.netease.cloudmusic", "goal": "听歌", "minutes": 5}, ensure_ascii=False)
+    harness = Harness(tmp_path, device, [action(action="finish", summary="听完了")], config=config, plan=plan)
+    await harness.run()
+    state = harness.state_texts()[0]
+    # 「放某首歌」做没做到，看这一行就知道，不用猜
+    assert "网易云播放页：在放的是「蝶恋花,曹思义」（歌名,歌手），正在播放（02:58/03:43）" in state
+    assert "网易云音乐：常弹会员广告" in state
+    assert harness.agent.status()["page"] == ""  # 放下手机后不再显示页面

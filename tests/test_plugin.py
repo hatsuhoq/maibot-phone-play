@@ -128,6 +128,9 @@ async def test_components_and_lifecycle(tmp_path):
             "webui_memory_delete",
             "webui_memory_clear",
             "webui_switch_device",
+            "answer_game_wish",
+            "webui_game_wish",
+            "webui_game_remove",
         ]
     )
     # 开始、停止这些控制命令是宿主的受保护命令，谁能用在 MaiBot 后台「命令管理」里设；看状态谁都能用
@@ -150,6 +153,8 @@ async def test_components_and_lifecycle(tmp_path):
         "show_phone_screen": None,
         "remember_for_phone": None,
         "switch_phone": None,
+        # 主人回答装不装游戏时要马上能用：放在 tool_search 后面，她得先搜一轮，主人得再说一遍
+        "answer_game_wish": "visible",
     }
     # 宿主只把 description 发给模型（detailed_description 已经不用了），用法都要写在这里
     descriptions = {
@@ -493,6 +498,8 @@ async def test_chat_sees_phone_state_and_passes_requests_while_playing(tmp_path,
         assert text.startswith("【手机上的实际情况】正在用手机：哔哩哔哩") and "stop_phone" in text
         # 列的是这几步想做什么，不代表做成了
         assert "成没成要看后面几步" in text
+        # 实测对方说「看看手机截图」，她调用的是 play_phone，回了句「这就截给你」却没有图
+        assert "对方想看你手机上的画面，就用 show_phone_screen 截一张附在回复里" in text
         # 写回复时也带上；别的聊天不带
         replyer = await plugin.inject_replyer_context(extra_prompt="", session_id="stream-1")
         assert replyer["modified_kwargs"]["extra_prompt"].startswith("【手机上的实际情况】")
@@ -502,6 +509,19 @@ async def test_chat_sees_phone_state_and_passes_requests_while_playing(tmp_path,
         result = await plugin.tool_play_phone(goal="换个视频", stream_id="stream-1")
         assert result["content"].startswith("已经告诉手机上的你：换个视频。")
         assert "做到了或做不到会回到这里告诉你" in result["content"]
+        assert "接着玩不用再调用 play_phone" in result["content"]
+        # 实测换了规划模型后她隔半分钟就交一次一样的事：同一件事不再交，告诉她已经在做了
+        again = await plugin.tool_play_phone(goal="换个视频！", stream_id="stream-1")
+        assert again["content"].startswith("这件已经交给手机上的你了：「换个视频」，正在做，不用再交代。")
+        assert "show_phone_screen" in again["content"]
+        # 别的聊天里交代的事，做完回不到那里：不交过去
+        elsewhere = await plugin.tool_play_phone(goal="点个准备", stream_id="stream-2")
+        assert elsewhere["content"].startswith("你现在正在手机上玩哔哩哔哩，这会儿腾不出手接这边的事")
+        # 实测写成「是在别的聊天里拿起的」，她在群里说「提示我在别的群玩欢乐斗地主呢」：
+        # 只说她自己在干嘛，不提别的聊天，也不把那边的打算、交代的事带过来
+        assert "别的聊天里拿起" not in elsewhere["content"] and "若叶睦" not in elsewhere["content"]
+        assert "别提别的聊天或别的群，别说成收到了什么提示" in elsewhere["content"]
+        assert [request.text for request in plugin.agent._session.requests] == ["换个视频"]
         gate.set()
         await asyncio.wait_for(plugin.agent._task, 5)
         # 本来要看 30 秒，有了新要求马上醒来，下一步先照着做
@@ -1494,5 +1514,88 @@ async def test_the_agent_tells_the_owner_through_the_plugin(tmp_path, monkeypatc
     try:
         assert plugin._agent._unreachable_teller == plugin._tell_unreachable
         assert plugin._agent._charge_asker == plugin._ask_to_charge
+        assert plugin._agent._session_logs.folder == tmp_path / "data" / "session_logs"
+    finally:
+        await plugin.on_unload()
+
+
+async def test_pet_panel_actions_do_not_wait_for_a_stuck_screenshot(tmp_path, monkeypatch):
+    # 宿主执行面板操作前核对一次、做完又要回一个面板：以前两次都等截图，截图卡住时点「接管」要六秒多
+    import time
+
+    device = FakeDevice()
+    stuck = asyncio.Event()
+
+    async def slow_screenshot():
+        await stuck.wait()
+        return device.png
+
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: device)
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        assert (await plugin.on_desktop_pet_button_click("phone"))["image"]
+        device.screenshot = slow_screenshot
+        # 手上的画面是一分钟前的：下次会重新截，截图却卡住了
+        plugin.agent._frame_clock -= 60
+        started = time.monotonic()
+        await plugin.get_desktop_pet_panel("phone")
+        panel = await plugin.on_desktop_pet_panel_action("phone", "takeover")
+        assert time.monotonic() - started < 1
+        assert panel_actions(panel) == ["release", "refresh"]
+        assert panel["image"] and "画面是 1 分钟前的，点「刷新」看最新的" in panel["text"]
+        # 后台同一时间只截一张，不会每看一次面板就叠一个
+        first = plugin._pet_frame_task
+        assert first is not None and not first.done()
+        await plugin.get_desktop_pet_panel("phone")
+        assert plugin._pet_frame_task is first
+        # 截完以后再看面板就是新画面
+        stuck.set()
+        await asyncio.wait_for(first, 5)
+        assert "前的，点「刷新」" not in (await plugin.get_desktop_pet_panel("phone"))["text"]
+    finally:
+        await plugin.on_unload()
+
+
+async def test_pet_panel_without_a_frame_still_offers_its_actions(tmp_path, monkeypatch):
+    device = FakeDevice()
+
+    async def never():
+        await asyncio.Event().wait()
+
+    device.screenshot = never
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: device)
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    panel = await plugin.get_desktop_pet_panel("phone")
+    assert panel["image"] is None and "正在取画面，点「刷新」再看" in panel["text"]
+    assert panel_actions(panel) == ["start", "takeover", "refresh"]
+    task = plugin._pet_frame_task
+    # 插件卸载时后台截图跟着停下，不留任务
+    await plugin.on_unload()
+    assert task.cancelled() and plugin._pet_frame_task is None
+
+
+async def test_the_pet_panel_converts_each_frame_only_once(tmp_path, monkeypatch):
+    # 宿主做一个面板操作要取两次面板：同一张画面不再转一遍
+    monkeypatch.setattr(plugin_module, "create_device", lambda settings: FakeDevice())
+    converted: List[bytes] = []
+    original = plugin_module.panel_png_base64
+
+    def counting(jpeg, *args, **kwargs):
+        converted.append(jpeg)
+        return original(jpeg, *args, **kwargs)
+
+    monkeypatch.setattr(plugin_module, "panel_png_base64", counting)
+    plugin = make_plugin(tmp_path)
+    await plugin.on_load()
+    try:
+        first = await plugin.on_desktop_pet_button_click("phone")
+        again = await plugin.get_desktop_pet_panel("phone")
+        assert len(converted) == 1 and again["image"] == first["image"]
+        # 换了一张画面才再转
+        plugin.agent._frame_clock -= 60
+        await plugin.on_desktop_pet_panel_action("phone", "refresh")
+        assert len(converted) == 2
     finally:
         await plugin.on_unload()

@@ -94,6 +94,25 @@
               "max_length": 16
             }
           }
+        },
+        "game_wish": {
+          "api": "webui_game_wish",
+          "parameters": {
+            "approved": {
+              "type": "boolean",
+              "required": true
+            }
+          }
+        },
+        "game_remove": {
+          "api": "webui_game_remove",
+          "parameters": {
+            "package": {
+              "type": "string",
+              "required": true,
+              "max_length": 200
+            }
+          }
         }
       }
     }

@@ -450,3 +450,17 @@ async def test_android_screen_viewable_follows_wakefulness_and_keyguard(state, e
 
     device._lock_state = lock_state
     assert await device.screen_viewable() is expected
+
+
+def test_android_screen_size_follows_rotation():
+    from phone_play.devices import parse_android_screen_size
+
+    # 按安卓 dumpsys window displays 的格式：init 是竖着的物理尺寸，cur 跟着屏幕方向转
+    landscape = (
+        "WINDOW MANAGER DISPLAY CONTENTS (dumpsys window displays)\n"
+        "  Display: mDisplayId=0 rootTasks=[]\n"
+        "    init=1080x2400 440dpi base=1080x2400 440dpi cur=2400x1080 app=2400x1013 rng=1080x980-2400x2290\n"
+    )
+    assert parse_android_screen_size(landscape) == (2400, 1080)
+    assert parse_android_screen_size(landscape.replace("cur=2400x1080", "cur=1080x2400")) == (1080, 2400)
+    assert parse_android_screen_size("没有屏幕信息") is None

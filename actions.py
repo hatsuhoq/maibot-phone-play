@@ -79,6 +79,8 @@ REQUEST_RESULTS = ("done", "failed")
 _REQUEST_NOTE_LIMIT = 60
 # 找人帮忙时说清楚卡在哪、要对方做什么，一句话；实测 40 个字把「再交还给我」截成了「再交」
 _HELP_TEXT_LIMIT = 60
+# 她写的「这段看到的」：一两句话，聊天里说起时要用，太长的截断
+_SAW_LIMIT = 120
 
 
 @dataclass(frozen=True)
@@ -125,6 +127,8 @@ class PhoneAction:
     request: Optional[RequestReport] = None
     # 这一刻看到特别喜欢、特别好笑、特别想给对方看的：桌宠开心一下，记下这张画面
     moment: bool = False
+    # 刚看完一段视频、插件给了她中途的几张画面时，她写下这段画面和字幕上真有的内容；没写是空
+    saw: str = ""
 
     def describe(self) -> str:
         label = _ACTION_LABELS[self.kind]
@@ -261,6 +265,7 @@ def parse_action(response: str) -> PhoneAction:
         video=video,
         request=_parse_request(data.get("request")),
         moment=data.get("moment") is True,
+        saw=" ".join(str(data.get("saw") or "").split())[:_SAW_LIMIT],
     )
 
 

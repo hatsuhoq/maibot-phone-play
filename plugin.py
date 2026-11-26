@@ -1,7 +1,7 @@
 """刷会儿手机：让 Bot 用安卓手机、模拟器或 iPhone 自己刷视频、逛帖子、听歌、看小说。"""
 
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Set, cast
+from typing import Any, Dict, List, Optional, Set, Tuple, cast
 from uuid import uuid4
 
 import asyncio
@@ -20,6 +20,7 @@ from maibot_sdk.types import ErrorPolicy, HookMode, HookOrder, ToolParameterInfo
 
 from .agent import (
     REQUEST_LABELS,
+    TRIGGER_LABELS,
     AgentError,
     ModelReply,
     PhoneAgent,
@@ -30,6 +31,7 @@ from .agent import (
 )
 from .devices import Battery, DeviceError, create_device
 from .diagnostics import DiagnosticStore
+from .games import GameStore, GameWish, WishRefused
 from .memory import MemoryStore
 from .imaging import jpeg_data_url, panel_png_base64, to_base64
 from .life import (
@@ -47,6 +49,7 @@ from .life import (
 from .prompts import Persona
 from .report import CARD_WIDTH, report_html
 from .settings import PhonePlayConfig
+from .session_logs import SessionLogStore
 from .store import SessionRecord, UsageStore, place_and_goal
 
 _HELP_TEXT = (
@@ -67,6 +70,9 @@ _LIFE_REFRESH_SECONDS = 60.0
 _PET_BUTTON = "phone"
 # 桌宠的按钮和面板回调限时 8 秒，截图最多等这么久，超时就用上一张
 _PET_SCREENSHOT_SECONDS = 3.0
+# 桌宠面板不等截图时，后台那次截图最多等多久；画面比这个秒数还旧时，面板上说一声是多久前的
+_PET_BACKGROUND_SCREENSHOT_SECONDS = 20.0
+_PET_FRAME_STALE_SECONDS = 15.0
 # 面板上的操作：ID → 按钮文字
 _PET_ACTION_LABELS: Dict[str, str] = {
     "start": "开始玩",
@@ -89,9 +95,22 @@ _CONTROL_PATTERN = rf"^/手机\s*(?P<sub>{_CONTROL_SUBS})(?:\s+(?P<arg>.+?))?\s*
 _END_MARKS = "。．.！!？?，,、；;：: "
 # 聊天中叫她去玩手机时，等她决定好玩什么再回话，这样她能说出具体打算
 _PLAN_WAIT_SECONDS = 30.0
+# 玩着的时候又调用 play_phone：实测换了规划模型后她隔半分钟就叫一次自己「接着玩」，对方要看截图也调用它
+_KEEP_PLAYING_NOTE = (
+    "你已经在玩了，接着玩不用再调用 play_phone；对方想看手机画面就用 show_phone_screen 截一张附在回复里。"
+)
 # Maisaka 默认把插件工具放进 tool_search 后面，实测她要先搜一轮才会去玩，对方得催一句。
 # 去玩、问近况、叫停这三个要立刻能用，所以一直放在她的工具列表里；看屏幕不常用，仍按需搜索
 _ALWAYS_VISIBLE = "visible"
+
+
+def _ago_text(seconds: float) -> str:
+    """「20 秒」「3 分钟」「2 小时」：面板上说画面是多久前截的。"""
+    if seconds < 60:
+        return f" {int(seconds)} 秒"
+    if seconds < 3600:
+        return f" {int(seconds // 60)} 分钟"
+    return f" {int(seconds // 3600)} 小时"
 
 
 def _first_clause(text: str, limit: int) -> str:
@@ -180,6 +199,24 @@ def _finish_reason_text(end_reason: str) -> str:
     return "被叫停了"
 
 
+def _download_intent(record: SessionRecord) -> str:
+    """去应用商店装游戏这局结束后请她说的话：装好了道个谢，没装上照实说。"""
+    name = record.end_reason.removeprefix("装好了") if record.end_reason.startswith("装好了") else ""
+    if name:
+        return (
+            f"主人同意后，你刚在手机的应用商店里装好了游戏{name}，下次自己想玩时就能打开它。"
+            "用你平时说话的语气跟对方说一声装好了、谢谢对方，一两句就好；你还没开始玩，别编玩起来怎么样。"
+            "不要用通知、汇报的口吻，也不要提插件、步数这些。"
+        )
+    seen = record.summary.rstrip(_END_MARKS)
+    return (
+        f"主人同意后，你刚去手机的应用商店装游戏（{record.goal.rstrip(_END_MARKS)}），没装上"
+        f"（{_finish_reason_text(record.end_reason)}；你当时看到的：{seen}）。"
+        "用你平时说话的语气照实跟对方说一声，一两句就好；要付费、要输密码这类原因照实说，别说装好了。"
+        "不要用通知、汇报的口吻，也不要提插件、步数这些。"
+    )
+
+
 class PhonePlayPlugin(MaiBotPlugin):
     """刷会儿手机插件。"""
 
@@ -192,9 +229,15 @@ class PhonePlayPlugin(MaiBotPlugin):
         self._agent: Optional[PhoneAgent] = None
         self._diagnostics: Optional[DiagnosticStore] = None
         self._memory: Optional[MemoryStore] = None
+        # 她想装、装好的游戏（主人同意后她自己去应用商店装的）
+        self._games: Optional[GameStore] = None
         self._bot_nickname = ""
         # 桌宠面板上点了「停止」：收尾（回桌面、锁屏）可能超过回调的 8 秒，放到后台
         self._pet_tasks: Set[asyncio.Task[bool]] = set()
+        # 桌宠面板的后台截图（同一时间只有一个）
+        self._pet_frame_task: Optional[asyncio.Task[None]] = None
+        # 桌宠面板上最近一张画面转好的图（画面编号，图）
+        self._pet_image: Optional[Tuple[int, str]] = None
 
     @property
     def settings(self) -> PhonePlayConfig:
@@ -221,6 +264,10 @@ class PhonePlayPlugin(MaiBotPlugin):
         await self._memory.load()
         if self._memory.recovered:
             self.ctx.logger.warning(self._memory.recovered)
+        self._games = GameStore(self.ctx.paths.data_dir / "games.json")
+        await self._games.load()
+        if self._games.recovered:
+            self.ctx.logger.warning(self._games.recovered)
         self._agent = PhoneAgent(
             config=lambda: self.settings,
             device_factory=create_device,
@@ -240,11 +287,20 @@ class PhonePlayPlugin(MaiBotPlugin):
             help_notifier=self._notify_help,
             charge_asker=self._ask_to_charge,
             unreachable_teller=self._tell_unreachable,
+            # 每局的操作记录也存一份文件：留最近 30 局，插件重载、MaiBot 重启后也翻得到
+            session_logs=SessionLogStore(self.ctx.paths.data_dir / "session_logs", self.ctx.logger),
+            games=self._games,
+            wish_asker=self._ask_owner_for_game,
         )
         self._agent.restart_auto_play()
 
     async def on_unload(self) -> None:
         """停止正在进行的会话和自动玩调度。"""
+        if self._pet_frame_task is not None:
+            # 桌宠面板的后台截图要在关掉设备连接之前停下
+            self._pet_frame_task.cancel()
+            await asyncio.wait({self._pet_frame_task})
+            self._pet_frame_task = None
         if self._agent is not None:
             await self._agent.shutdown()
             self._agent = None
@@ -405,9 +461,20 @@ class PhonePlayPlugin(MaiBotPlugin):
             )
         undone = "；".join(f"「{item['text']}」" for item in record.requests if item["status"] == "unfinished")
         did += f"对方交代你在手机上做的{undone}没做完你就放下了手机，提的时候照实说。" if undone else ""
+        if record.trigger == TRIGGER_LABELS["download"]:
+            result = await self.ctx.maisaka.proactive.trigger(stream_id, _download_intent(record), reason="装游戏结束")
+            if not result.get("success"):
+                raise RuntimeError(f"请她主动聊天失败：{result.get('error')}")
+            return
+        saw = (
+            f"看视频时画面、字幕上真看到的：{'；'.join(record.saw)}。说到视频里的内容只按这些说，没看到的别编，"
+            "没有字幕的不知道里面说了什么。"
+            if record.saw
+            else ""
+        )
         intent = (
             f"你刚放下手机。这次{place}，{_finish_reason_text(record.end_reason)}。"
-            f"玩的时候的感受：{record.summary.rstrip(_END_MARKS)}。{did}"
+            f"玩的时候的感受：{record.summary.rstrip(_END_MARKS)}。{saw}{did}"
             "如果合适，就用你平时说话的语气在这里随口提一两句刚才在手机上看到的东西；不想说也可以不说。"
             "不要用通知、汇报的口吻，也不要提插件、步数这些。"
         )
@@ -467,8 +534,68 @@ class PhonePlayPlugin(MaiBotPlugin):
             "手机连不上",
         )
 
-    async def _tell_owner(self, bubble: str, template: str, intent: str, reason: str) -> None:
-        """她自己想玩时遇到要主人帮忙的事：桌宠上冒 ``bubble``，再去主人的私聊里说。
+    async def _ask_owner_for_game(self, wish: GameWish) -> None:
+        """她想装一款没装的游戏：桌宠上冒一句，再去主人的私聊里问能不能让她自己装；记下在哪个聊天问的。
+
+        主人在那个聊天里回答时，她每一轮都会看到自己在等回答（见 ``_wish_note``），用 answer_game_wish 记下；
+        WebUI「手机实时画面」里也能直接点同意、不装。
+        """
+        reason = f"（{wish.reason}）" if wish.reason else ""
+        stream_id = await self._tell_owner(
+            f"🎮 想玩《{wish.name}》，能帮我装一下吗？",
+            f"想玩《{wish.name}》{reason}，手机上没装，能让我自己去应用商店装吗？只装免费的。回我「可以」或「不装」就好",
+            f"你想玩手机游戏《{wish.name}》{reason}，可手机上没装。用你平时说话的语气问问对方，"
+            "能不能让你自己去应用商店装这款（只装免费的），一两句就好；你这次还没在手机上看任何东西，"
+            "别编刚才在手机上做了什么；不要用通知的口吻，也不要提插件。",
+            "想装个游戏",
+        )
+        if stream_id and self._games is not None:
+            wish.stream_id = stream_id
+            await self._games.save()
+
+    def _wish_note(self, stream_id: str) -> str:
+        """在问主人的那个聊天里，还在等回答时每一轮提醒她一句。"""
+        if self._games is None or not stream_id:
+            return ""
+        wish = self._games.open_wish(datetime.now())
+        if wish is None or wish.stream_id != stream_id:
+            return ""
+        return (
+            f"【在等回答】你问过对方能不能让你自己去应用商店装游戏《{wish.name}》，还没得到答复。"
+            "对方同意（可以、装吧）或拒绝（不行、别装）时，用 answer_game_wish 记下；"
+            "对方没提这事就不用管，也别反复追问。"
+        )
+
+    async def _answer_wish(self, approved: bool, stream_id: str) -> str:
+        """主人回答了能不能装：同意就马上去应用商店装，不同意记下来 30 天内不再问这款。
+
+        Raises:
+            WishRefused: 没有在等回答的游戏，或者现在开始不了（已经在玩、额度用完）时抛出，原因写在异常里。
+        """
+        if self._games is None:
+            raise WishRefused("插件还没加载完")
+        now = datetime.now()
+        wish = self._games.open_wish(now)
+        if wish is None:
+            raise WishRefused("现在没有在等主人回答的游戏")
+        if not approved:
+            self._games.answer(wish, False, now)
+            await self._games.save()
+            return f"记下了：主人说不装《{wish.name}》，30 天内不会再问这款。"
+        try:
+            await self.agent.start(
+                trigger="download", origin_stream=stream_id, download=wish.name, download_wish=wish.id
+            )
+        except PlayRefused as exc:
+            # 还在等回答：等会儿主人再说一次，或者在 WebUI 里点同意
+            raise WishRefused(f"现在去装不了：{exc.chat_text or exc}") from exc
+        # start 只是在后台排上了会话，这里还没让出事件循环，下载这局不会先结束把状态改掉
+        self._games.answer(wish, True, now)
+        await self._games.save()
+        return f"主人同意了，你拿起手机去应用商店装《{wish.name}》（只装免费的），装好会说一声。"
+
+    async def _tell_owner(self, bubble: str, template: str, intent: str, reason: str) -> str:
+        """她自己想玩时遇到要主人帮忙的事：桌宠上冒 ``bubble``，再去主人的私聊里说，返回在哪个聊天说的（没说是空的）。
 
         主人是 admin_user_ids 里的第一个；没有、或者没和她私聊过找不到聊天时只冒桌宠气泡。私聊的说法跟着 finish_notice：
         template 发 ``template``，maisaka 请她照着 ``intent`` 自己说，off 不说。
@@ -478,18 +605,19 @@ class PhonePlayPlugin(MaiBotPlugin):
         style = self.settings.play.finish_notice
         owner = next(iter(self.settings.plugin.admin_user_ids), "")
         if style == "off" or not owner:
-            return
+            return ""
         stream = await self.ctx.chat.get_stream_by_user_id(owner)
         if not isinstance(stream, dict) or not stream.get("session_id"):
-            return
+            return ""
         stream_id = str(stream["session_id"])
         if style == "template":
             name = await self._bot_name()
             await self.ctx.send.text(f"📱 {name}：{template}", stream_id)
-            return
+            return stream_id
         result = await self.ctx.maisaka.proactive.trigger(stream_id, intent, reason=reason)
         if not result.get("success"):
             raise RuntimeError(f"请她主动聊天失败：{result.get('error')}")
+        return stream_id
 
     async def _notify_request(self, request: PhoneRequest, stream_id: str) -> None:
         """对方交给手机上的她的事做到了或做不到：回发起的聊天说一声，说法跟着 finish_notice。"""
@@ -555,6 +683,9 @@ class PhonePlayPlugin(MaiBotPlugin):
             lines.append(f"自动玩：已开启{next_check}")
             if status["life"]:
                 lines.append(f"生活联动：{status['life']['text']}")
+        asking = next((wish for wish in status["games"]["wishes"] if wish["status"] == "asking"), None)
+        if asking:
+            lines.append(f"🎮 想装《{asking['name']}》，在等主人回（WebUI「手机实时画面」里能点同意、不装）")
         if status["last_error"]:
             lines.append(f"⚠ 最近的错误：{status['last_error']}")
         lines.append("发送 /手机 帮助 查看全部命令")
@@ -769,6 +900,26 @@ class PhonePlayPlugin(MaiBotPlugin):
         """聊天中去玩手机；等她决定好玩什么再返回，方便她说出具体打算。"""
         del kwargs
         if self.agent.state != "idle":
+            origin = self.agent.origin_stream
+            if origin and stream_id and stream_id != origin:
+                # 交代的事做完回到拿起手机的那个聊天说；实测她在群里自己反复调用，结果都会跑到私聊去。
+                # 只说她自己在干嘛：实测写成「是在别的聊天里拿起的」，她在群里说「提示我在别的群玩欢乐斗地主呢」，
+                # 像在念系统消息，还把私聊里的事说了出去；另一个聊天里的打算、交代的事也不给这边看
+                app = self.agent.current_app_name
+                return {
+                    "success": True,
+                    "content": (
+                        f"你现在正{f'在手机上玩{app}' if app else '在玩手机'}，这会儿腾不出手接这边的事，"
+                        "不用再调用 play_phone。像平时那样随口说你在玩、晚点再说就行；"
+                        "别提别的聊天或别的群，别说成收到了什么提示，也别编你刚做了什么。"
+                    ),
+                }
+            same = self.agent.open_request_like(goal)
+            if same is not None:
+                return {
+                    "success": True,
+                    "content": f"这件已经交给手机上的你了：「{same.text}」，正在做，不用再交代。{_KEEP_PLAYING_NOTE}",
+                }
             # 实测玩的时候对方在聊天里说「退出房间」「点准备」，她嘴上说做了，手机上的她根本不知道
             request = self.agent.add_request(goal, minutes, replace=replace)
             if request is not None:
@@ -778,9 +929,10 @@ class PhonePlayPlugin(MaiBotPlugin):
                     "content": (
                         f"已经告诉手机上的你：{request.text}{dropped}。手机上的你下一步会先去做，"
                         "做到了或做不到会回到这里告诉你；在那之前只能说正在弄，别说已经做好了。"
+                        f"{_KEEP_PLAYING_NOTE}"
                     ),
                 }
-            return {"success": True, "content": f"你已经在玩手机了。{self.agent.activity_text()}"}
+            return {"success": True, "content": f"你已经在玩手机了。{self.agent.activity_text()}{_KEEP_PLAYING_NOTE}"}
         if not self.settings.play.allow_chat_trigger:
             return {"success": False, "error": "插件配置不允许在聊天中自己去玩手机"}
         try:
@@ -974,6 +1126,36 @@ class PhonePlayPlugin(MaiBotPlugin):
         return {"success": True, "content": self.agent.activity_text()}
 
     @Tool(
+        "answer_game_wish",
+        description=(
+            "记下主人对「能不能让你自己装那款游戏」的回答。你问过对方能不能装某款手机游戏、对方回答了时使用："
+            "同意（可以、装吧）approved 填 true，你会马上拿起手机去应用商店装；拒绝 approved 填 false。"
+            "只有管理员的回答算数；没在等回答时不用调用。"
+        ),
+        parameters=[
+            ToolParameterInfo(
+                name="approved",
+                param_type=ToolParamType.BOOLEAN,
+                description="对方同意你装就填 true，不同意填 false",
+                required=True,
+            )
+        ],
+        visibility=_ALWAYS_VISIBLE,
+    )
+    async def tool_answer_game_wish(
+        self, approved: bool = False, stream_id: str = "", user_id: str = "", **kwargs: Any
+    ) -> Dict[str, Any]:
+        """主人在聊天里回答能不能装游戏；和截图、换手机一样只认管理员（user_id 是宿主按会话注入的）。"""
+        del kwargs
+        if not self._is_admin(user_id, False):
+            return {"success": False, "error": "只有主人（管理员）能决定装不装，对方的话不算；照常聊就好"}
+        try:
+            content = await self._answer_wish(bool(approved), stream_id)
+        except WishRefused as exc:
+            return {"success": False, "error": str(exc)}
+        return {"success": True, "content": content}
+
+    @Tool(
         "stop_phone",
         description="放下手机，不玩了。有人让你别玩手机了、叫你过来聊天，或者你自己不想玩了时使用。",
         visibility=_ALWAYS_VISIBLE,
@@ -1001,7 +1183,7 @@ class PhonePlayPlugin(MaiBotPlugin):
     async def inject_planner_context(self, **kwargs: Any) -> Dict[str, Any]:
         """追加在请求最后，不改前面的消息，聊天记录的提示词缓存照样命中。"""
         items = kwargs.get("items")
-        text = self._agent.chat_context(str(kwargs.get("session_id") or "")) if self._agent else ""
+        text = self._chat_note(str(kwargs.get("session_id") or ""))
         if not text or not isinstance(items, list):
             return {"action": "continue"}
         note = {
@@ -1027,10 +1209,17 @@ class PhonePlayPlugin(MaiBotPlugin):
     async def inject_replyer_context(self, **kwargs: Any) -> Dict[str, Any]:
         """规划时只定下回复的方向，具体说什么由 replyer 写，实测「点到了，已经退出来了」这类话就是这一步编的。"""
         extra = kwargs.get("extra_prompt")
-        text = self._agent.chat_context(str(kwargs.get("session_id") or "")) if self._agent else ""
+        text = self._chat_note(str(kwargs.get("session_id") or ""))
         if not text or not isinstance(extra, str):
             return {"action": "continue"}
         return {"action": "continue", "modified_kwargs": {**kwargs, "extra_prompt": f"{extra}\n{text}".strip()}}
+
+    def _chat_note(self, session_id: str) -> str:
+        """这个聊天这一轮要告诉她的：手机上的实际情况（见 PhoneAgent.chat_context），在等主人回答装游戏时再提醒一句。"""
+        if self._agent is None:
+            return ""
+        parts = (self._agent.chat_context(session_id), self._wish_note(session_id))
+        return "\n".join(part for part in parts if part)
 
     # ===== 桌宠 =====
     # 宿主内置桌宠（MaiBot 1.4）：「插件扩展」菜单里的「手机」按钮、点开后的面板，以及玩手机时冒的气泡
@@ -1086,28 +1275,42 @@ class PhonePlayPlugin(MaiBotPlugin):
         return {_PET_BUTTON: DesktopPetButtonState(visible=visible, text=self._pet_button_text() if visible else "")}
 
     async def on_desktop_pet_button_click(self, button_id: str) -> Dict[str, Any]:
-        return await self.get_desktop_pet_panel(button_id)
+        # 打开面板是来看画面的：等一张新截图（最多几秒）
+        return await self.get_desktop_pet_panel(button_id, fresh=True)
 
-    async def get_desktop_pet_panel(self, button_id: str, notice: str = "") -> Dict[str, Any]:
+    async def get_desktop_pet_panel(self, button_id: str, notice: str = "", fresh: bool = False) -> Dict[str, Any]:
         """桌宠里的面板：她在玩什么、此刻的想法、手机截图，以及按现在的状态能做的操作。
 
-        宿主每次执行面板操作前也会调一次这里来核对操作还在不在，所以截图复用最短刷新间隔内的那张。
+        ``fresh`` 时（打开面板、点「刷新」）等一张新截图，最多 _PET_SCREENSHOT_SECONDS 秒。别的时候不等：
+        宿主每次执行面板操作前都会调这里核对操作还在不在，操作做完又要回一个面板，以前两次都等截图，
+        截图卡住时点「停止」「接管」要等六秒多才有反应。不等时用手上那张，新截图放到后台，下次打开、刷新时就是新的；
+        宿主不会在后台截完后自己刷新已经打开的面板。能做的操作每次按她现在的状态算，不跟着画面缓存。
         """
         if button_id != _PET_BUTTON:
             raise ValueError(f"没有这个桌宠按钮：{button_id}")
         agent = self.agent
-        try:
-            await asyncio.wait_for(agent.refresh_frame(), _PET_SCREENSHOT_SECONDS)
-            stale = False
-        except TimeoutError:
-            stale = True
+        stale = False
+        if fresh:
+            try:
+                await asyncio.wait_for(agent.refresh_frame(), _PET_SCREENSHOT_SECONDS)
+            except TimeoutError:
+                stale = True
+        else:
+            self._refresh_pet_frame_later()
         jpeg, frame_error = agent.latest_frame()
+        age = agent.frame_age()
         status = agent.status()
         # 她没在玩、屏幕关着（锁屏、熄屏）时截出来是黑的：不放黑图，说一句屏幕关着
         screen_off = agent.frame_dark and status["state"] == "idle" and status["controller"] == "bot"
         image = None
         if jpeg is not None and not screen_off:
-            image = await asyncio.to_thread(panel_png_base64, jpeg)
+            # 宿主做一个面板操作要取两次面板：同一张画面转好的图留着，不再转一遍（只留最新那张）
+            frame_id = agent.frame_id
+            if self._pet_image is not None and self._pet_image[0] == frame_id:
+                image = self._pet_image[1]
+            else:
+                image = await asyncio.to_thread(panel_png_base64, jpeg)
+                self._pet_image = (frame_id, image)
         lines = [notice] if notice else []
         lines.extend(_pet_panel_lines(status))
         if screen_off:
@@ -1120,6 +1323,11 @@ class PhonePlayPlugin(MaiBotPlugin):
             lines.append("⚠ 截图超时，这是上一张")
         elif frame_error:
             lines.append(f"⚠ 截图失败：{_first_clause(frame_error, 24)}")
+        elif image is None and not screen_off:
+            # 还没截到画面：操作照样能点，画面点「刷新」再看
+            lines.append("正在取画面，点「刷新」再看")
+        elif age is not None and age >= _PET_FRAME_STALE_SECONDS:
+            lines.append(f"画面是{_ago_text(age)}前的，点「刷新」看最新的")
         name = await self._bot_name()
         return {
             "title": f"{name or '她'}的手机"[:64],
@@ -1158,7 +1366,29 @@ class PhonePlayPlugin(MaiBotPlugin):
             notice = "交还给她了，她会先看看现在的画面再接着玩"
         elif action_id != "refresh":
             raise ValueError(f"没有这个操作：{action_id}")
-        return await self.get_desktop_pet_panel(button_id, notice)
+        # 点「刷新」是来看新画面的，等一张；停止、接管这些不等截图
+        return await self.get_desktop_pet_panel(button_id, notice, fresh=action_id == "refresh")
+
+    def _refresh_pet_frame_later(self) -> None:
+        """在后台截一张新图，给下次打开、刷新面板用；已经在截就不再叠一个。"""
+        if self._pet_frame_task is not None and not self._pet_frame_task.done():
+            return
+        self._pet_frame_task = asyncio.create_task(self._refresh_pet_frame(), name="phone_play_pet_frame")
+        self._pet_frame_task.add_done_callback(self._pet_frame_done)
+
+    async def _refresh_pet_frame(self) -> None:
+        # 截图的协程在任务真正跑起来时才建：任务还没开始就被取消（插件卸载）时不会留下没等过的协程
+        await asyncio.wait_for(self.agent.refresh_frame(), _PET_BACKGROUND_SCREENSHOT_SECONDS)
+
+    def _pet_frame_done(self, task: "asyncio.Task[None]") -> None:
+        if task.cancelled():
+            return
+        error = task.exception()
+        # 截图失败（DeviceError）在 refresh_frame 里记成画面错误，面板上会显示；这里只剩超时和意外错误
+        if isinstance(error, TimeoutError):
+            self.ctx.logger.warning(f"桌宠面板后台截图 {_PET_BACKGROUND_SCREENSHOT_SECONDS:g} 秒还没截完，这次放弃")
+        elif error is not None:
+            self.ctx.logger.error(f"桌宠面板后台截图出错：{error!r}")
 
     def _pet_task_done(self, task: "asyncio.Task[bool]") -> None:
         self._pet_tasks.discard(task)
@@ -1239,6 +1469,26 @@ class PhonePlayPlugin(MaiBotPlugin):
         cleared = self._memory.clear(kind)
         await self._memory.save()
         return {"cleared": cleared}
+
+    @API("webui_game_wish", description="WebUI：回答能不能装她想玩的游戏", version="1")
+    async def webui_game_wish(self, approved: bool = False) -> Dict[str, Any]:
+        """在 WebUI 里点同意、不装：同意的在她问的那个聊天里说装好没（没问出去就不说）。"""
+        wish = self._games.open_wish(datetime.now()) if self._games else None
+        try:
+            content = await self._answer_wish(bool(approved), wish.stream_id if wish else "")
+        except WishRefused as exc:
+            raise ValueError(str(exc)) from exc
+        return {"answered": True, "content": content}
+
+    @API("webui_game_remove", description="WebUI：从她自己装的游戏里去掉一款", version="1")
+    async def webui_game_remove(self, package: str = "") -> Dict[str, Any]:
+        """只是以后不打开它，手机上的应用不删。"""
+        if self._games is None:
+            raise ValueError("插件还没加载完")
+        if not self._games.remove_game(package):
+            raise ValueError("这款游戏已经不在了")
+        await self._games.save()
+        return {"removed": package}
 
     @API("webui_switch_device", description="WebUI：换一台设备", version="1")
     async def webui_switch_device(self, name: str = "") -> Dict[str, Any]:

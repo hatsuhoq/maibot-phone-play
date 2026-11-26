@@ -357,3 +357,12 @@ async def test_ui_elements_are_in_screenshot_pixels():
 def test_wda_url_must_be_http():
     with pytest.raises(ValueError, match="wda_url"):
         DeviceSettings(wda_url="127.0.0.1:8100")
+
+
+async def test_screen_size_follows_rotation_in_screenshot_pixels():
+    # 实测 iPhone 14：竖屏 390x844 点、横屏 844x390 点，倍率 3，截图分别是 1170x2532、2532x1170
+    fake = FakeWda()
+    device = make_device(fake)
+    assert await device.screen_size() == (1170, 2532)
+    fake.screen_size = {"width": 844, "height": 390}
+    assert await device.screen_size() == (2532, 1170)

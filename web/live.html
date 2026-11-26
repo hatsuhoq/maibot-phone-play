@@ -1,6 +1,9 @@
 <style>
   body { margin: 0; padding: 20px; font: 14px/1.6 var(--maibot-font-body, system-ui, "Microsoft YaHei", sans-serif); }
   .layout { display: grid; grid-template-columns: minmax(240px, 360px) minmax(0, 1fr); gap: 20px; align-items: start; }
+  /* 横屏（全屏视频、横屏游戏）时画面占满一行，信息放到下面，不然 360 宽只剩一条 */
+  .layout.landscape { grid-template-columns: minmax(0, 1fr); }
+  .layout.landscape .screen-column { max-width: 820px; }
   @media (max-width: 760px) {
     .layout { grid-template-columns: minmax(0, 1fr); }
     body { padding: 12px; }
@@ -167,6 +170,16 @@
       <ul id="history" class="history"></ul>
     </section>
 
+    <section id="gamesCard" class="maibot-card" hidden>
+      <div class="maibot-card-header">她想装的游戏</div>
+      <div id="wishBox"></div>
+      <ul id="games" class="memory"></ul>
+      <details class="watched-box">
+        <summary>问过主人的</summary>
+        <ul id="wishes" class="history"></ul>
+      </details>
+    </section>
+
     <section class="maibot-card">
       <div class="maibot-card-header">
         <span>她记得的</span>
@@ -191,14 +204,46 @@
   const $ = id => document.getElementById(id);
   // 宿主只给页面内容、不给 body 加类：套上它的页面样式，背景、文字颜色、字体和复古主题的底纹才跟着后台走
   document.body.classList.add('maibot-page');
-  // 宿主同一时间最多允许 2 个请求：轮询只占 1 个，按钮、看诊断、刷新记忆共用另 1 个（busy 时不发）
+  // 宿主同一时间最多允许 2 个请求（第三个直接报错）：画面轮询独占 1 个；状态轮询、按钮、看诊断、刷新记忆
+  // 共用另 1 个，排队一个一个发（serial）。这样状态不用等慢截图，加起来也不会超过 2 个
   const FRAME_DELAY_MS = 1000;
-  const STATUS_EVERY = 2;
+  const STATUS_DELAY_MS = 2000;
   let frameId = 0;
-  let tick = 0;
+  // 换了手机就加一：换之前发出去、换完才回来的画面是上一台的，不显示
+  let frameEpoch = 0;
   let busy = false;
   let lastStatus = null;
+  let lane = Promise.resolve();
+  const sleepers = new Set();
   const openDiagnostics = new Map();
+
+  // 第二个名额：按调用顺序一个一个发，先发的先回来，旧状态不会盖掉刚做完操作后的新状态
+  function serial(task) {
+    const result = lane.then(task, task);
+    lane = result.catch(() => {});
+    return result;
+  }
+
+  // 能提前叫醒的等待：页面重新看得见、重新勾上实时刷新时马上刷新，不用等满这一轮
+  function nap(ms) {
+    return new Promise(resolve => {
+      const wake = () => {
+        clearTimeout(timer);
+        sleepers.delete(wake);
+        resolve();
+      };
+      const timer = setTimeout(wake, ms);
+      sleepers.add(wake);
+    });
+  }
+
+  function wakeAll() {
+    for (const wake of [...sleepers]) wake();
+  }
+
+  function pageVisible() {
+    return document.visibilityState === 'visible';
+  }
 
   document.body.classList.add('maibot-page');
 
@@ -305,7 +350,7 @@
     if (busy) return;
     busy = true;
     try {
-      const data = await maibot.query('diagnostic', { id });
+      const data = await serial(() => maibot.query('diagnostic', { id }));
       openDiagnostics.set(id, data);
       renderDiagnostic(box, data);
       box.hidden = false;
@@ -401,6 +446,7 @@
     // 生活联动：自动玩按麦生活的日程决定时，写出最近一次查到的这一段和能不能玩
     $('life').textContent = data.life ? `生活联动（${data.life.checked_at} 查看）：${data.life.text}` : '';
     $('lastError').textContent = data.last_error ? `最近的错误：${data.last_error}` : '';
+    if (data.games) renderGames(data.games);
 
     const history = $('history');
     history.replaceChildren();
@@ -418,6 +464,51 @@
   }
 
   const VIDEO_FORMS = { short: '短视频', long: '长视频' };
+
+  // 她想装、装好的游戏：状态每两秒刷一次，内容没变就不重画，免得正要点的按钮被换掉
+  let gamesKey = '';
+
+  function renderGames(games) {
+    const key = JSON.stringify(games);
+    if (key === gamesKey) return;
+    gamesKey = key;
+    $('gamesCard').hidden = !games.enabled && !games.games.length && !games.wishes.length;
+    const asking = games.wishes.find(wish => wish.status === 'asking');
+    const box = $('wishBox');
+    box.replaceChildren();
+    if (asking) {
+      const line = text('p', `🎮 想装《${asking.name}》${asking.reason ? `（${asking.reason}）` : ''}，在等你回答`);
+      const yes = text('button', '同意，去装', 'maibot-button small-button');
+      yes.onclick = () => run('game_wish', { approved: true });
+      const no = text('button', '不装', 'maibot-button small-button');
+      no.onclick = () => run('game_wish', { approved: false });
+      box.append(line, yes, no);
+      box.append(text('p', '同意后她马上打开应用商店，只装这一款免费的；要输密码、确认时会停下来请你帮忙。说不装的 30 天内不再问这款。', 'meta-line maibot-muted'));
+    }
+    const list = $('games');
+    list.replaceChildren();
+    if (!games.games.length) list.append(text('li', '还没有自己装的游戏', 'maibot-muted'));
+    for (const game of games.games) {
+      const item = document.createElement('li');
+      const body = document.createElement('div');
+      body.append(
+        text('div', `《${game.name}》`),
+        text('div', `${game.device} · ${game.package} · ${game.installed_at.replace('T', ' ')} 装的`, 'meta-line maibot-muted'),
+      );
+      const remove = text('button', '不让她玩了', 'maibot-button small-button');
+      remove.title = '只是以后不打开它，手机上的应用不删';
+      remove.onclick = () => { if (confirm(`以后不让她打开《${game.name}》？手机上的应用不会删，要卸载请在手机上删。`)) run('game_remove', { package: game.package }); };
+      item.append(body, remove);
+      list.append(item);
+    }
+    const wishes = $('wishes');
+    wishes.replaceChildren();
+    if (!games.wishes.length) wishes.append(text('li', '还没问过', 'maibot-muted'));
+    for (const wish of games.wishes) {
+      const note = wish.status === 'failed' && wish.note ? `：${wish.note}` : '';
+      wishes.append(text('li', `${wish.asked_at.slice(5, 16).replace('T', ' ')}　《${wish.name}》 ${wish.label}${note}`));
+    }
+  }
 
   function memoryRow(memory) {
     const item = document.createElement('li');
@@ -462,19 +553,23 @@
   }
 
   async function loadMemory() {
-    renderMemory((await maibot.query('memory')).items);
+    renderMemory((await serial(() => maibot.query('memory'))).items);
   }
 
   function renderFrame(data) {
     $('frameError').textContent = data.error ? `画面获取失败：${data.error}` : '';
     if (!data.frame_id) {
+      // 还没有画面（刚换了手机、连不上）：别继续挂着上一张
       $('placeholder').textContent = data.error ? '没有画面' : '正在获取画面…';
+      $('placeholder').style.display = '';
+      $('screen').style.display = 'none';
       return;
     }
     frameId = data.frame_id;
     $('frameTime').textContent = `画面时间 ${data.captured_at}`;
     // 按真实屏幕比例显示，模拟器常见 9:16，全面屏手机更窄
     document.querySelector('.phone').style.aspectRatio = `${data.width} / ${data.height}`;
+    document.querySelector('.layout').classList.toggle('landscape', data.width > data.height);
     if (data.image) {
       $('screen').src = data.image;
       $('screen').style.display = 'block';
@@ -482,28 +577,48 @@
     }
   }
 
-  async function poll() {
+  // 画面：只在勾着实时刷新、页面看得见时取；一次只发一个，截图慢就等它回来，不会越堆越多。
+  // 画面和状态分开报错：画面每秒刷新会重写 frameError，状态错误单独显示才不会被冲掉
+  async function frameLoop() {
     for (;;) {
-      if ($('live').checked && document.visibilityState === 'visible') {
-        // 画面和状态分开捕获错误：画面每秒刷新会重写 frameError，状态错误要单独显示才不会被冲掉
+      if ($('live').checked && pageVisible()) {
+        const epoch = frameEpoch;
         try {
-          renderFrame(await maibot.query('frame', { since: frameId }));
+          const data = await maibot.query('frame', { since: frameId });
+          if (epoch === frameEpoch) renderFrame(data);
         } catch (error) {
           $('frameError').textContent = error.message;
         }
-        if (tick % STATUS_EVERY === 0) {
-          try {
-            renderStatus(await maibot.query('status'));
-            $('statusError').textContent = '';
-          } catch (error) {
-            $('statusError').textContent = `状态刷新失败：${error.message}`;
-          }
-        }
-        tick += 1;
       }
-      await new Promise(resolve => setTimeout(resolve, FRAME_DELAY_MS));
+      await nap(FRAME_DELAY_MS);
     }
   }
+
+  async function refreshStatus() {
+    try {
+      renderStatus(await serial(() => maibot.query('status')));
+      $('statusError').textContent = '';
+    } catch (error) {
+      $('statusError').textContent = `状态刷新失败：${error.message}`;
+    }
+  }
+
+  // 状态：页面看得见就刷新，关掉实时画面也照常（控制者、重连进度、按钮能不能点都靠它）；
+  // 以前画面和状态在同一个循环里，截图慢状态就跟着慢，关掉实时刷新连状态都不更新了
+  async function statusLoop() {
+    for (;;) {
+      // 按钮正在用第二个名额时跳过这一轮：按钮做完自己会刷新一次
+      if (pageVisible() && !busy) await refreshStatus();
+      await nap(STATUS_DELAY_MS);
+    }
+  }
+
+  document.addEventListener('visibilitychange', () => {
+    if (pageVisible()) wakeAll();
+  });
+  $('live').addEventListener('change', () => {
+    if ($('live').checked) wakeAll();
+  });
 
   async function run(name, args, reloadMemory) {
     if (busy) return;
@@ -511,12 +626,19 @@
     $('actionError').textContent = '';
     if (lastStatus) setButtons(lastStatus);
     try {
-      await maibot.action(name, args);
+      await serial(() => maibot.action(name, args));
       if (name === 'start') $('goalInput').value = '';
       if (name === 'clear_diagnostics') openDiagnostics.clear();
+      if (name === 'switch_device') {
+        // 换了手机：上一台的画面不再显示，等新画面
+        frameEpoch += 1;
+        frameId = 0;
+        renderFrame({ frame_id: 0, error: '' });
+        wakeAll();
+      }
       if (reloadMemory) await loadMemory();
-      // 刷新状态也算在这一个名额里，等它回来再放开按钮，免得和轮询加起来超过 2 个
-      renderStatus(await maibot.query('status'));
+      // 刷新状态也走第二个名额，等它回来再放开按钮
+      renderStatus(await serial(() => maibot.query('status')));
     } catch (error) {
       $('actionError').textContent = error.message;
     } finally {
@@ -551,12 +673,13 @@
 
   maibot.ready.then(async () => {
     try {
-      renderStatus(await maibot.query('status'));
+      renderStatus(await serial(() => maibot.query('status')));
       await loadMemory();
     } catch (error) {
       $('actionError').textContent = error.message;
     }
-    void poll();
+    void frameLoop();
+    void statusLoop();
   });
 })();
 </script>

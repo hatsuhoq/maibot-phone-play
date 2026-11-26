@@ -2,11 +2,11 @@
 
 from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 from .actions import extract_json_object, find_app
 from .life import LifeActivity
-from .pages import BILI_DETAIL, BILI_PLAYER, BILIBILI_PACKAGES
+from .pages import BILI_DETAIL, BILI_PLAYER, BILIBILI_PACKAGES, FANQIE_PACKAGES, NETEASE_MUSIC_PACKAGES
 from .settings import AllowedApp
 from .store import SessionRecord
 from .ui_tree import UIElement
@@ -16,6 +16,15 @@ _WEEKDAYS = ("星期一", "星期二", "星期三", "星期四", "星期五", "�
 
 class PlanDeclined(ValueError):
     """想做的事用手机上能打开的应用做不到；消息是模型给出的原因。"""
+
+
+class WishedGame(Exception):
+    """她自己想玩时，想先装一款手机上没有的游戏（只有规划时允许许愿才认）。"""
+
+    def __init__(self, name: str, reason: str) -> None:
+        super().__init__(name)
+        self.name = name
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -97,13 +106,27 @@ class DecisionContext:
     skip_watched: bool = True
     # 这次已经标过的「这一刻」她在想什么；没标过是空的
     moment: str = ""
+    # 截图是横着的（横屏游戏、全屏视频）
+    landscape: bool = False
+    # 认出来的页面上手机实际是什么样（网易云在放哪首、番茄小说第几页），见 pages.page_state
+    page_state: str = ""
+    # 这次是主人同意后去应用商店装的游戏名；不是下载时是空的
+    download: str = ""
+    # 刚看完一段视频时中途截的几张：（看到第几秒，只截了视频那块的图片 data URL），从早到晚；没有是空
+    keyframes: Sequence[Tuple[int, str]] = ()
+    # 当前应用是哪一类（见 app_kind）：只带这一类用得上的规则；空是认不出或在桌面上，全带上
+    app_kind: str = ""
+    # watched 只是画面上的那几个（B 站详情页上推荐视频的标题都读得到），不是这个应用里看过的全部
+    watched_on_screen: bool = False
 
 
 # 实测 iPhone 上的 B 站（2026 年 11 月）：首页推荐点开的进竖屏播放器，搜索结果点开的进视频详情页，两种页面操作不一样
 _BILIBILI_TIPS = (
     "B 站：首页、搜索结果里视频卡片的右下角写着时长，卡片上标着「最近看过」的是看过的。"
     "首页推荐点开的视频进竖屏播放器（上滑换下一个推荐）；搜索结果、相关推荐、UP 主主页点开的进视频详情页"
-    "（上面播放器、下面简介和评论，上滑不换视频）。插件认出是哪种页面时会告诉你。别点全屏按钮，手机会转成横屏。"
+    "（上面播放器、下面简介和评论，上滑不换视频）。插件认出是哪种页面时会告诉你。"
+    "长视频想看大一点可以点播放器上的全屏按钮，手机会转成横屏；全屏时上下滑会调亮度、音量，左右滑会拖进度，"
+    "要换视频、看简介评论先退出全屏：按钮几秒就自己收起，先点一下画面中间调出来，再点左上角的返回。"
 )
 _BILIBILI_PAGE_TIPS: Dict[str, str] = {
     BILI_PLAYER: (
@@ -122,11 +145,54 @@ _BILIBILI_PAGE_TIPS: Dict[str, str] = {
 }
 
 
+# 实测 iPhone 上的网易云音乐、番茄小说（2026 年 11 月）：打开、切页面时常弹会员广告、优惠券、开启通知的框，
+# 在播放页上弹出来时会盖住暂停、上一首这些按钮；点错了会进开通会员、系统设置这些页面
+_NETEASE_TIPS = (
+    "网易云音乐：常弹会员广告（开通会员、立即续费、立即开通），点广告右上角的 × 关掉，别点开通、续费。"
+    "播放页中间的大按钮是暂停/播放，两边是上一首、下一首；插件认出播放页时会告诉你在放哪首、放没放、放到哪。"
+)
+_FANQIE_TIPS = (
+    "番茄小说：常弹福利、优惠券、开启通知的框，点 × 关掉，别点「开心收下」，也别去开启通知。"
+    "阅读页点屏幕右边翻到下一页，点中间调出菜单（上一章、下一章、目录），再点中间收起；"
+    "插件认出阅读页时会告诉你在哪一章、页码多少，翻没翻过去看页码变没变。"
+)
+
+
 def app_tips(package: str, page: str = "") -> str:
     """当前应用、当前页面专门的说明；没有就是空字符串。"""
-    if package not in BILIBILI_PACKAGES:
-        return ""
-    return _BILIBILI_PAGE_TIPS.get(page, _BILIBILI_TIPS)
+    if package in BILIBILI_PACKAGES:
+        return _BILIBILI_PAGE_TIPS.get(page, _BILIBILI_TIPS)
+    if package in NETEASE_MUSIC_PACKAGES:
+        return _NETEASE_TIPS
+    if package in FANQIE_PACKAGES:
+        return _FANQIE_TIPS
+    return ""
+
+
+# 当前应用是哪一类，只带这一类用得上的规则。实测（2026 年 11 月）B 站一步的输入约 4400 token，系统规则占一半，
+# 其中讲视频怎么看的在斗地主里用不上，讲联机房间怎么等的在 B 站里用不上。认不出的应用、在桌面上时全带上
+APP_VIDEO = "video"
+APP_READING = "reading"
+APP_GAME = "game"
+_APP_KINDS: Dict[str, str] = {
+    **dict.fromkeys(BILIBILI_PACKAGES, APP_VIDEO),
+    "com.ss.iphone.ugc.Aweme": APP_VIDEO,
+    "com.ss.android.ugc.aweme": APP_VIDEO,
+    "com.xingin.discover": APP_VIDEO,
+    "com.xingin.xhs": APP_VIDEO,
+    **dict.fromkeys(NETEASE_MUSIC_PACKAGES | FANQIE_PACKAGES, APP_READING),
+    "com.google.chrome.ios": APP_READING,
+    "com.android.chrome": APP_READING,
+    "com.tencent.ioshlddz": APP_GAME,
+    # 实测 iPhone 上保卫萝卜的 Bundle ID
+    "cairot": APP_GAME,
+}
+
+
+def app_kind(package: str) -> str:
+    """认得的应用是哪一类：``APP_VIDEO`` 刷视频、看笔记，``APP_READING`` 听歌、看小说、看网页，``APP_GAME`` 游戏；
+    认不出是空字符串。"""
+    return _APP_KINDS.get(package, "")
 
 
 def format_apps(apps: Sequence[AllowedApp]) -> str:
@@ -151,8 +217,13 @@ def build_plan_prompt(
     memories: Sequence[str] = (),
     life: Optional[LifeActivity] = None,
     slack: bool = False,
+    wish: bool = False,
+    declined_wishes: Sequence[str] = (),
 ) -> str:
     """让文本模型决定这次打开哪个应用、做什么、玩多久。
+
+    ``wish`` 时（她自己想玩、开了 game_wishes、今天还没问过）还可以不玩，先说想装哪款没装的游戏，插件去问主人；
+    ``declined_wishes`` 是主人最近说过不装的。
 
     ``interaction`` 表示开启了用她自己的账号互动；``memories`` 是她记得的内容（看过的、对方说过的、上次没做完的）；
     ``life`` 是麦生活日程里现在这一段（自动玩时才有，``remaining_seconds`` 已经换算到现在），
@@ -211,6 +282,17 @@ def build_plan_prompt(
             )
         else:
             life_text += "\n挑适合这会儿的内容，别玩到这段结束以后。\n"
+    wish_text = ""
+    if wish:
+        # 实测实时塔防跟不上：保卫萝卜开局 3 秒出怪、20 秒走到终点，她放一个塔要两步、二十多秒
+        wish_text = (
+            "如果你特别想玩一款手机上还没装的游戏，这次也可以先不玩，输出 "
+            '{"wish": "游戏名", "reason": "为什么想玩，一句话"}，会替你去问主人能不能帮你装；'
+            "挑节奏慢、回合制或者竖屏的（打牌、下棋、消除、模拟经营这类），实时动作、塔防这类太快，你跟不上。"
+            "没有特别想玩的就照常选上面的应用。\n"
+        )
+        if declined_wishes:
+            wish_text += f"这些主人说过不装，别再问：{'、'.join(f'《{name}》' for name in declined_wishes)}。\n"
     return (
         f"{_identity(persona)}\n\n"
         f"现在是 {now:%Y-%m-%d %H:%M}（{_WEEKDAYS[now.weekday()]}），{opener}\n"
@@ -220,20 +302,25 @@ def build_plan_prompt(
         f"{memory_text}"
         f"{hint_text}\n"
         f"{interact_text}"
+        f"{wish_text}"
         f"请决定这次打开哪个应用、想做什么、玩多久（1~{max_minutes} 分钟）。\n"
         "只输出一个 JSON 对象，不要输出其它内容，例如：\n"
         f'{{"app": "{apps[0].package}", "goal": "想做的事，一句话", "minutes": {min(10, max_minutes)}}}'
     )
 
 
-def parse_plan(response: str, apps: Sequence[AllowedApp], max_minutes: int) -> Plan:
+def parse_plan(response: str, apps: Sequence[AllowedApp], max_minutes: int, allow_wish: bool = False) -> Plan:
     """解析并校验玩手机的打算。
 
     Raises:
+        WishedGame: 允许许愿时，她想先装一款没装的游戏。
         PlanDeclined: 模型认为这些应用做不到想做的事时抛出。
         ValueError: 回复格式不对或选了不允许的应用时抛出。
     """
     data = extract_json_object(response)
+    wish = str(data.get("wish") or "").strip().strip("《》")
+    if allow_wish and wish:
+        raise WishedGame(wish[:40], str(data.get("reason") or "").strip()[:80])
     app_value = str(data.get("app") or "").strip()
     if not app_value:
         reason = str(data.get("reason") or "").strip()[:80]
@@ -290,10 +377,24 @@ def _rules(context: DecisionContext) -> str:
             "只使用下面列出的应用。不要进入设置、应用商店；不要付款、充值、下单；不要发弹幕、私信，不要回复别人的评论；"
             "不要加好友；不要登录、注册或修改账号。"
         )
+    install_rule = "不要下载或保存文件，不要安装应用。"
+    if context.download:
+        boundary = (
+            f"这次是主人同意你装游戏《{context.download}》：只在应用商店里找这一款并安装，别的都别动。"
+            "搜索结果里标着「广告」「Ad」的那条是广告，名字再像也跳过，往下找名字对得上的那条。"
+            "只装免费的：按钮写着「获取」「安装」「Get」「Install」才点（旁边写着「App 内购买」「In-App Purchases」"
+            "只是说游戏里能买东西，照样能装）；按钮写着价格（¥…、$…）、「购买」「订阅」「Buy」的不点，这次就算了，"
+            "用 finish 说明原因。点了以后弹出要输 Apple ID 密码、「连按两次以安装」「Double Click to Install」"
+            "（要按侧边按钮确认）、登录或实名认证时，用 ask_help 请对方帮忙（对方接管手机确认好再交还给你），"
+            "你自己绝不输入账号、密码、验证码。按钮变成转圈的下载进度时用 wait 等一会儿。"
+            "装好后按钮变成「打开」「Open」，点它把游戏打开，插件看到游戏打开就算装好了；"
+            "找不到这款、装不了就用 finish 说明原因。不要付款、充值、下单，不要评分、写评论。"
+        )
+        install_rule = "除了这一款游戏，别下载、安装别的东西，也不要保存文件。"
     rules = [
         boundary,
         text_rule,
-        "不要下载或保存文件，不要安装应用。遇到登录、付款、权限申请、下载推广、求好评之类的弹窗，"
+        f"{install_rule}遇到登录、付款、权限申请、下载推广、求好评之类的弹窗，"
         "点关闭、拒绝、跳过、下次再说或返回；"
         "关不掉、返回也绕不开、必须有人处理才能接着玩时（要登录或重新登录、验证码或滑块验证、"
         "只能点允许的系统权限、强制更新），用 ask_help 请对方帮忙，自己绝不输入账号、密码、验证码；"
@@ -307,32 +408,45 @@ def _rules(context: DecisionContext) -> str:
         "找到喜欢的歌曲、文章，用 wait 停下来看一会儿；"
         "点开后发现不感兴趣（带货、广告、营销号、和你的兴趣不沾边的），别硬看：短视频直接划走，长视频、笔记、文章返回列表换一个。"
         "玩够了或想结束时用 finish。",
-        "看视频分短视频和长视频，wait 要带上 video。"
-        "短视频（竖屏、一两分钟以内，一条接一条）：一眼看出不感兴趣就直接上滑，不用等；"
-        '感兴趣就用 {"action":"wait","seconds":20,"video":"short"} 看完它'
-        "（一次 10~40 秒，按视频长短定），看完上滑看下一条。"
-        "长视频（横屏、几分钟以上）：先用 video 为 long 的 wait 看 20~30 秒，判断喜不喜欢，不喜欢就上滑或返回换一个；"
-        "喜欢就一次看 60~120 秒、一段一段接着看，不用每隔几秒就看一眼；"
-        "十几分钟以上的长视频看到喜欢的部分、看够几分钟就可以换。"
-        "看视频的时候画面一直在变，插件不会因为画面变了叫醒你，看完你定的时间才会再问你。"
-        "长视频如果是点开后上面播放器、下面简介和评论的页面，上滑只会翻简介和评论，不会换视频；"
-        "不想看了就返回到视频列表（首页、搜索结果）点别的，或者点下面推荐的视频。",
-        "看视频时在 seen 里写上画面上的视频标题，插件会记下你看过哪些、看到哪了"
-        + (
-            "；看过的视频不要再点开，刷到了就直接划走，除非对方在聊天里点名要你再看；"
-            "上次只看了一部分的长视频可以点开接着看。"
-            if context.skip_watched
-            else "。"
-        )
-        + "画面上看得出视频、歌已经播完（出现重播按钮、进度条到头、已经自动从头开始下一轮）时，"
-        + 'seen 里加 "progress":"finished"；'
-        '不感兴趣、要划走或返回的视频，seen 里加 "skip":true。只看了一会儿、没看到结尾的不要写看完。',
-        "留意最近的操作：同一件事已经做了两三次、画面却没有变化，就换个做法，或者去看别的内容。"
-        "一直黑屏或转圈加载时不要干等：往上划到下一个、返回再进或换个入口，实在不行就结束。",
-        # 实测和群友打斗地主好友房，她觉得「没等到人」就结束，群友一喊又重开，一上午十一次斗地主有八次这样
-        "在联机游戏的房间里（好友房、组队房间）等别人进来、等开局、等匹配时，用长一点的 wait 等着，"
-        "不要 finish，也不要退出房间：别人可能正在进来。等了好几分钟还是没人来，再结束。",
     ]
+    kind = context.app_kind
+    if kind in ("", APP_VIDEO):
+        rules.append(
+            "看视频分短视频和长视频，wait 要带上 video。"
+            "短视频（竖屏、一两分钟以内，一条接一条）：一眼看出不感兴趣就直接上滑，不用等；"
+            '感兴趣就用 {"action":"wait","seconds":20,"video":"short"} 看完它'
+            "（一次 10~40 秒，按视频长短定），看完上滑看下一条。"
+            "长视频（横屏、几分钟以上）：先用 video 为 long 的 wait 看 20~30 秒，判断喜不喜欢，"
+            "不喜欢就上滑或返回换一个；"
+            "喜欢就一次看 60~120 秒、一段一段接着看，不用每隔几秒就看一眼；"
+            "十几分钟以上的长视频看到喜欢的部分、看够几分钟就可以换。"
+            "看视频的时候画面一直在变，插件不会因为画面变了叫醒你，看完你定的时间才会再问你。"
+            "长视频如果是点开后上面播放器、下面简介和评论的页面，上滑只会翻简介和评论，不会换视频；"
+            "不想看了就返回到视频列表（首页、搜索结果）点别的，或者点下面推荐的视频。"
+        )
+    if kind != APP_GAME:
+        rules.append(
+            "看视频时在 seen 里写上画面上的视频标题，插件会记下你看过哪些、看到哪了"
+            + (
+                "；看过的视频不要再点开，刷到了就直接划走，除非对方在聊天里点名要你再看；"
+                "上次只看了一部分的长视频可以点开接着看。"
+                if context.skip_watched
+                else "。"
+            )
+            + "画面上看得出视频、歌已经播完（出现重播按钮、进度条到头、已经自动从头开始下一轮）时，"
+            + 'seen 里加 "progress":"finished"；'
+            '不感兴趣、要划走或返回的视频，seen 里加 "skip":true。只看了一会儿、没看到结尾的不要写看完。'
+        )
+    rules.append(
+        "留意最近的操作：同一件事已经做了两三次、画面却没有变化，就换个做法，或者去看别的内容。"
+        "一直黑屏或转圈加载时不要干等：往上划到下一个、返回再进或换个入口，实在不行就结束。"
+    )
+    if kind in ("", APP_GAME):
+        # 实测和群友打斗地主好友房，她觉得「没等到人」就结束，群友一喊又重开，一上午十一次斗地主有八次这样
+        rules.append(
+            "在联机游戏的房间里（好友房、组队房间）等别人进来、等开局、等匹配时，用长一点的 wait 等着，"
+            "不要 finish，也不要退出房间：别人可能正在进来。等了好几分钟还是没人来，再结束。"
+        )
     if context.interaction is not None:
         rules.append(_interaction_rule(context.interaction))
         if context.interaction.likes:
@@ -378,6 +492,9 @@ def _interaction_guide(context: DecisionContext) -> str:
     return guide
 
 
+_LANDSCAPE_NOTE = (
+    "屏幕：横屏（截图是横着的）。坐标照样按这张截图算，[0,0] 是你看到的左上角；上滑、下滑也是按这张截图的上下。\n"
+)
 _ACTION_INTRO = (
     '坐标：用 "point":[x,y] 表示，x、y 都是 0~1000 的相对坐标，[0,0] 是屏幕左上角，[1000,1000] 是右下角。'
     "截图上画了编号框时，点击对应元素优先填写 element 编号。\n"
@@ -394,18 +511,29 @@ _ACTION_GUIDE = (
 _BACK_GUIDE = '{"action":"back"}：返回\n'
 _IOS_BACK_GUIDE = (
     '{"action":"back"}：返回（iPhone 没有返回键，这个操作是从屏幕左边缘往右滑；'
-    "有的页面不支持这个手势，那就点左上角的返回或关闭按钮）\n"
+    "有的页面不支持这个手势，那就点左上角的返回或关闭按钮；"
+    "实测 B 站全屏播放时这个手势没用，要先点一下画面调出按钮再点左上角的返回）\n"
 )
-_APP_GUIDE = (
-    '{"action":"home"}：回到桌面\n'
-    '{"action":"launch","app":"包名"}：打开应用\n'
-    '{"action":"wait","seconds":20}：停下来看一会儿（1~120 秒）。'
-    "在游戏房间里等人进来、等开局、等匹配时可以一次等 60~120 秒，"
-    "有人进来、开局了或聊天里有新要求会提前叫醒你；轮到你操作、有倒计时的时候别等这么久\n"
+_APP_GUIDE = '{"action":"home"}：回到桌面\n{"action":"launch","app":"包名"}：打开应用\n'
+_WAIT_GUIDE = '{"action":"wait","seconds":20}：停下来看一会儿（1~120 秒）'
+_ROOM_WAIT_GUIDE = (
+    "。在游戏房间里等人进来、等开局、等匹配时可以一次等 60~120 秒，"
+    "有人进来、开局了或聊天里有新要求会提前叫醒你；轮到你操作、有倒计时的时候别等这么久"
+)
+_VIDEO_WAIT_GUIDE = (
     '{"action":"wait","seconds":20,"video":"short"}：看视频。'
     "video 写 short（短视频，一次最多 60 秒）或 long（长视频，最多 120 秒），"
     "看的时候画面变了不会叫醒你，聊天里有新要求或跳到了别的应用才会\n"
 )
+
+
+def _app_guide(kind: str) -> str:
+    """回桌面、打开应用和等一会儿：游戏房间里怎么等只跟游戏说，看视频的 wait 只跟视频应用说。"""
+    room = _ROOM_WAIT_GUIDE if kind in ("", APP_GAME) else ""
+    video = _VIDEO_WAIT_GUIDE if kind in ("", APP_VIDEO) else ""
+    return f"{_APP_GUIDE}{_WAIT_GUIDE}{room}\n{video}"
+
+
 _WAIT_TURN_GUIDE = '{"action":"wait_turn"}：等对方操作（对方操作完、画面变了才继续，等待时不用你做什么）\n'
 _HELP_GUIDE = (
     '{"action":"ask_help","text":"小红书要重新登录才能看笔记"}：请对方帮忙，'
@@ -417,15 +545,27 @@ _ACTION_OUTRO = (
     "每个 JSON 还必须包含：\n"
     '"thought"：你此刻真实的内心想法，一句话，用你自己的口吻；\n'
     '"summary"：这一步在做什么，十个字左右，例如「点开猫猫视频」（finish 除外，见上）。\n'
+)
+# 游戏里用不上
+_SEEN_GUIDE = (
     '可以加 "seen"：正在看、读、听的内容在画面上清楚写着名字时（书名、视频标题、歌名）才写，下次能接着看；'
     "看视频的 wait 能看清标题就都带上，插件靠它记住看过哪些视频，"
     '例如 {"type":"novel","title":"画面上原样的书名","detail":"第12章","certain":true}；'
     "type 是 novel、video、music 之一，detail 只写画面上明确写着的章节或集数，没有就不写；看不清、靠猜的不要写；"
     '视频还可以加 "progress":"finished"（画面上看得出播完了）或 "skip":true（不感兴趣）。\n'
+)
+_MOMENT_GUIDE = (
     # 实测写成「特别喜欢才写、普通的好看不用写」时，一局安静的弹琴视频看下来一次都没标
     '可以加 "moment":true：这次玩手机里你最喜欢、最想给对方看的那一下（很可爱、很好笑、很惊艳、很戳你的画面）'
     "标一次，真没有喜欢的就不标；之后遇到更喜欢的可以再标，插件只留最后一次的画面。\n"
     '示例：{"thought":"这只橘猫好圆，点开看看","summary":"点开猫猫视频","action":"tap","element":5}'
+)
+# 刚看完一段视频、给了她中途几张画面时才说。实测（2026 年 11 月，B 站三个视频各 90 秒）只给画面不让她写，
+# 她的想法照旧只说眼前这一下；让她写 saw 时能记下三四个真有的要点，没有字幕的延时摄影也没编出解说
+_SAW_GUIDE = (
+    '这一步加 "saw"：一两句话写刚才这段视频里画面上、字幕上实际出现的内容（谁在做什么、讲到了什么），'
+    "不写感受。只截到了几张，没截到的部分别猜；没有字幕就是不知道里面说了什么，别编对白和情节；"
+    "弹幕是观众发的评论，视频标题、封面也都不算你看到的内容。\n"
 )
 # 对方交给她的事：做没做成要靠这一步的截图说话，点了一下、页面还在加载都不算
 _REQUEST_GUIDE = (
@@ -445,10 +585,13 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
         f"这次想做的事：{context.goal}\n"
         f"可以打开的应用：\n{format_apps(context.apps)}\n\n"
         f"{_rules(context)}\n\n"
-        f"{_ACTION_INTRO}{_ACTION_GUIDE}{_IOS_BACK_GUIDE if context.ios else _BACK_GUIDE}{_APP_GUIDE}"
+        f"{_ACTION_INTRO}{_ACTION_GUIDE}{_IOS_BACK_GUIDE if context.ios else _BACK_GUIDE}"
+        f"{_app_guide(context.app_kind)}"
         f"{_interaction_guide(context)}"
         f"{_WAIT_TURN_GUIDE if context.together else ''}{_HELP_GUIDE}{_ACTION_OUTRO}"
+        f"{_SEEN_GUIDE if context.app_kind != APP_GAME else ''}{_MOMENT_GUIDE}"
         f"{chr(10) + _REQUEST_GUIDE if context.requests or context.earlier_requests else ''}"
+        f"{chr(10) + _SAW_GUIDE if context.keyframes else ''}"
     )
 
     history_text = "\n".join(context.history) if context.history else "（刚开始）"
@@ -478,7 +621,10 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
         video_text += f"正在看：{context.watching}\n"
     if context.watched:
         titles = "、".join(f"《{title}》" for title in context.watched)
-        video_text += f"这个应用里你最近看过这些视频，再刷到就直接划走，列表里看到也别点开：{titles}\n"
+        if context.watched_on_screen:
+            video_text += f"画面上这几个视频你最近看过，别点开：{titles}\n"
+        else:
+            video_text += f"这个应用里你最近看过这些视频，再刷到就直接划走，列表里看到也别点开：{titles}\n"
     if context.resumable:
         video_text += f"这个应用里上次只看了一部分的长视频，想看可以接着看：{'、'.join(context.resumable)}\n"
     request_text = ""
@@ -501,6 +647,8 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
         f"已经玩了 {context.elapsed_minutes:.0f} 分钟（打算玩 {context.max_minutes} 分钟），"
         f"这是第 {context.step}/{context.max_steps} 步。\n"
         f"当前前台：{context.foreground or '无法判断'}\n"
+        f"{context.page_state + chr(10) if context.page_state else ''}"
+        f"{_LANDSCAPE_NOTE if context.landscape else ''}"
         f"{video_text}"
         f"{unchanged_text}"
         f"{quota_text}"
@@ -508,13 +656,18 @@ def build_decision_messages(context: DecisionContext) -> List[Dict[str, Any]]:
         f"{elements_text}\n\n"
         "请看截图，输出下一步操作的 JSON。"
     )
-    return [
-        {"role": "system", "content": system_text},
-        {
-            "role": "user",
-            "content": [
-                {"type": "text", "text": state_text},
-                {"type": "image_url", "image_url": {"url": context.image_url}},
-            ],
-        },
-    ]
+    content: List[Dict[str, Any]] = [{"type": "text", "text": state_text}]
+    if context.keyframes:
+        content.append(
+            {
+                "type": "text",
+                "text": "你刚才看视频的时候，插件每隔一会儿替你截了一下视频那块（从早到晚，只截了视频，"
+                "最后是现在的整个屏幕）。你在这段里看到的就是这些画面和上面的字幕。",
+            }
+        )
+        for at, url in context.keyframes:
+            content.append({"type": "text", "text": f"这段的第 {at} 秒："})
+            content.append({"type": "image_url", "image_url": {"url": url}})
+        content.append({"type": "text", "text": "现在的整个屏幕："})
+    content.append({"type": "image_url", "image_url": {"url": context.image_url}})
+    return [{"role": "system", "content": system_text}, {"role": "user", "content": content}]
